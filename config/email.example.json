@@ -1,0 +1,26 @@
+{
+  "_说明": [
+    "邮件 API 配置模板。**这个文件只是模板，程序不读它。**",
+    "把本文件复制成 config/email.json 再填真实值；那个文件已在 .gitignore 里。",
+    "程序真正读的位置是 %LOCALAPPDATA%\\SGMS\\email.json（见 core/email_recovery.py）。",
+    "★ 本阶段（2026-09）只预留接口，填了也不会发信。"
+  ],
+  "_状态": "未接入 —— 等用户选定的邮件 API",
+
+  "provider": "",
+  "_provider_说明": "厂商标识，例如 smtp / resend / sendgrid / aliyun / tencent",
+
+  "endpoint": "",
+  "_endpoint_说明": "API 基地址；SMTP 则填 host:port",
+
+  "api_key": "",
+  "_api_key_说明": "★ 密钥。绝不提交到 git，绝不写进日志。留空表示未配置。",
+
+  "sender": "",
+  "_sender_说明": "发信人地址，多数厂商要求与已验证域名一致",
+
+  "sender_name": "成绩单透镜",
+
+  "extra": {},
+  "_extra_说明": "厂商特有字段的逃生舱，避免每接一家就改 dataclass"
+}

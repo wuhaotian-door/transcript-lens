@@ -1,18 +1,47 @@
-# Build and Release Folders
-bin-debug/
-bin-release/
-[Oo]bj/
-[Bb]in/
+# ============ 数据：打死不进仓库 ============
+data/
+*.db
+*.enc
+*.sqlite
+*.db-journal
 
-# Other files and folders
-.settings/
+# ============ 真实成绩：绝不在仓库出现 ============
+*.xls
+*.xlsx
+# 例外：仅允许测试假数据
+!tests/fixtures/fake_*.xlsx
 
-# Executables
-*.swf
-*.air
-*.ipa
-*.apk
+# ============ 密钥与真实配置 ============
+config/activation.json
+config/rules.json
+config/ai_settings.json
+config/email.json
+.env
+*.key
+*.pem
+*.p12
 
-# Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
-# should NOT be excluded as they contain compiler settings and other important
-# information for Eclipse / Flash Builder.
+# ============ 打包产物 ============
+build/
+dist/
+__pycache__/
+*.pyc
+*.spec
+*.exe
+
+# ============ 测试与工具缓存 ============
+.pytest_cache/
+pytest-cache-files-*/
+tests/_tmp_exports/
+.mypy_cache/
+.ruff_cache/
+
+# ============ 日志 ============
+logs/
+*.log
+
+# ============ 编辑器与系统 ============
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

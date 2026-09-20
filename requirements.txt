@@ -1,0 +1,12 @@
+# transcript-lens 依赖（Spec 第 4 章）
+#
+# 阶段一只用到前两个；cryptography / requests 是后续阶段的依赖，先锁定在这里。
+# 红线 1：加权算术全部由本地确定性逻辑完成，不用任何大模型 SDK。
+pandas>=2.0
+openpyxl>=3.1
+cryptography>=42.0
+requests>=2.31
+ttkbootstrap>=1.10
+
+# 开发期测试（可选）：python tests/test_calc.py 不装 pytest 也能跑
+pytest>=7.4
