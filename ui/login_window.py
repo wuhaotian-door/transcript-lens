@@ -1,42 +1,53 @@
-"""登录窗：左侧品牌区 + 右侧表单，登录 / 注册在同一窗口里翻页。
+"""登录 / 注册窗 —— 左侧深色品牌区 + 右侧表单，同一窗口里翻页。
 
-布局::
-
-    +----------------------+--------------------------------+
-    |  成绩单透镜           |  账号  [ 下拉，只读 ]           |
-    |  transcript-lens v1  |  密码  [ ●●●● ]                |
-    |  slogan              |  ☐ 7天内自动登录    [登录]      |
-    |  本地离线 · 不上传    |  还没有账户？[去注册]           |
-    +----------------------+--------------------------------+
+     +--------------------+--------------------------------------+
+     |  成绩单透镜         |  登录                                 |
+     |  transcript-lens   |  账号  [ 可输入 + 历史用户名下拉 ]     |
+     |  v1.0              |  密码  [ ●●●● ]                       |
+     |  把成绩单，变成      |  ☐ 7 天内自动登录                     |
+     |  能坐下来谈的东西    |  [登录] [去注册]                      |
+     +--------------------+--------------------------------------+
 
 ★ 三件必须说清楚的事
 
 1. **账号下拉里只有用户名**，从 ``users.json`` 读；**没有密码，也没有密码提示**。
 2. **「7 天内自动登录」默认不勾。** 勾上会在 AppData 写一个 ``session.enc``，
    它能让人**免密码**进程序（这正是自动登录的定义）。这种事必须是用户明确选的，
-   不能默认替他选 —— 所以默认不勾。
-3. **登录成功不在这里算任何东西。** 本窗口只做身份确认，然后把
-   ``show_main(user_id)`` 叫起来。算术在智育分析页，且全在本地。
+   不能默认替他选。
+3. **登录成功不在这里算任何东西。** 本窗口只做身份确认，然后发 ``logged_in``
+   信号；算术在智育分析页，且全在本地。
 
-★ 找回密码的状态（2026-09 阶段）
+★ 找回密码：**走邮箱里的找回码**
 
-**本阶段没有任何找回途径**，这是产品决定，不是没做完：
+* 注册**必须填邮箱并验证**（6 位验证码，10 分钟有效）。
+* 注册成功后，程序生成一串**找回码**，本地存一份"用它包起来的库密钥"，
+  并把码寄到邮箱。这封邮件是忘密码时唯一的出路。
+* 登录页「忘记密码？」→ 填账号 + 找回码 + 新密码即可重设，成绩一条不丢。
 
-* 恢复码已按决定**整体删除**（``core/crypto_store.py`` 里一行不剩）。
-* 邮箱找回**只预留了接口**（``core/email_recovery.py``），不会真的发信。
-* 「忘记密码？」按钮**已经摆出来**，点开只会说明现状 ——
-  下一阶段的邮箱流程会长在那上面。
+⚠️ **为什么不是"发个新验证码就能重置"**：库密钥只在本地、只被密码包裹。
+忘密码那天它已经解不开了，"现在发一封邮件"发不出任何有用的东西 ——
+能解开它的只有注册时生成、并已用它包好密钥的那一串码。
 
-登录页和注册页各有**一处明确提示**，把"忘了就打不开了"这句话说到用户脸上。
-不能让用户以为还有后路。
+★ 关于无边框：Spec 允许保留系统标题栏，铁律九也写明「不做无边框拖拽自绘」。
+   所以这里**保留系统标题栏**，圆角 12px 做在内部卡片上。
 """
 
 from __future__ import annotations
 
-import tkinter as tk
-from tkinter import messagebox, ttk
-
-import ttkbootstrap as ttkb
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
 
 from core.crypto_store import (
     CryptoError,
@@ -45,10 +56,22 @@ from core.crypto_store import (
     UnknownUserError,
     WrongPasswordError,
 )
+from core.email_recovery import send_recovery_mail, send_verification_mail
+from core.recovery import (
+    EMAIL_CODE_LENGTH,
+    EMAIL_CODE_TTL_MINUTES,
+    EmailCodeError,
+    RecoveryError,
+    check_email_code,
+    enable_recovery,
+    issue_email_code,
+    normalize_email,
+)
 from core.session_token import AUTO_LOGIN_DAYS, clear_token, save_token, token_info
-from ui.main_window import APP_NAME, THEME, show_main
+from ui.anim import window_fade_in, window_fade_out
+from ui.workers import run_async
 
-__all__ = ["APP_VERSION", "LoginWindow", "run_login"]
+__all__ = ["APP_VERSION", "MIN_PASSWORD_LENGTH", "SLOGAN", "LoginWindow"]
 
 #: 版本号（显示在左栏）
 APP_VERSION = "v1.0"
@@ -56,423 +79,584 @@ APP_VERSION = "v1.0"
 #: slogan
 SLOGAN = "把成绩单，变成能坐下来谈的东西"
 
-#: 左栏宽度
-_BRAND_WIDTH = 260
-
-#: 窗口最小尺寸。实际尺寸由 :meth:`LoginWindow._fit_to_content` 按内容算 ——
-#: **不要**再手写 ``geometry("820x500")``，那样加内容会被静默截断。
-_MIN_WIDTH = 820
-_MIN_HEIGHT = 500
-
-_MUTED = "#6c757d"
-_TITLE_FONT = ("Microsoft YaHei UI", 20, "bold")
-_BRAND_FONT = ("Microsoft YaHei UI", 15, "bold")
-
-#: 口令最短长度（和 core.crypto_store 一脉相承：本地单机，不做复杂度评分）
+#: 密码最短长度（本地单机工具，不做复杂度评分）
 MIN_PASSWORD_LENGTH = 8
 
+_BRAND_WIDTH = 300
 
-class LoginWindow(ttkb.Window):
-    """登录 / 注册窗口。"""
+
+class LoginWindow(QWidget):
+    """登录 / 注册窗口。
+
+    Signals:
+        logged_in(str): 身份确认成功，参数是用户名。
+            主程序接住它去起主窗口 —— **本窗口不负责起主窗口**，
+            这样它自己可以先淡出再让位。
+    """
+
+    logged_in = Signal(str)
 
     def __init__(self, store: CryptoStore | None = None, root: str | None = None) -> None:
-        super().__init__(themename=THEME)
+        super().__init__()
         #: 数据根目录。``None`` = 默认 AppData/Local/SGMS；
         #: 自检时指向临时目录，避免往真实 AppData 里写东西。
-        #:
-        #: ★ 名字**不能**叫 ``self._root``：``tk.Misc`` 自己有个 ``_root()`` 方法
-        #:   （返回根 widget），拿一个 str 覆盖它之后，任何 ``tk.StringVar()``
-        #:   都会在 ``master._root()`` 上炸 ``'str' object is not callable``。
-        #:   这个坑第一次跑窗口就中了 —— 静态检查一点都看不出来。
         self._data_root = root
         self._store = store if store is not None else CryptoStore(root)
-        #: 登录成功后的用户名（给 :meth:`run` 返回用；也便于自检）
-        self.entered_user: str | None = None
 
-        self.title(f"{APP_NAME}　—　登录")
-        self.minsize(_MIN_WIDTH, _MIN_HEIGHT)
-        self.resizable(False, False)
+        self.setWindowTitle("成绩单透镜 · 登录")
+        self.setMinimumSize(880, 560)
+        self.resize(920, 580)
+        self.setWindowOpacity(0.0)
+        #: 防止淡出过程中被再次触发登录
+        self._leaving = False
 
-        self._build_layout()
-        self._build_brand()
-        self._build_login_page()
-        self._build_register_page()
-        self.show_login_page()
+        self._build()
         self._refresh_usernames()
+        self._hint_about_token()
 
-        # ★ 必须**在所有控件建完之后**再定尺寸（见 _fit_to_content 的说明）
-        self._autofit_on_switch = True
-        self._fit_to_content()
+    # ---------------------------------------------------------------- 搭界面
+    def _build(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(18, 18, 18, 18)
 
-    def _fit_to_content(self) -> None:
-        """按内容实际需要的大小定窗口尺寸。
+        card = QFrame()
+        card.setObjectName("LoginCard")
+        outer.addWidget(card)
 
-        ★ 这里原先写死 ``self.geometry("820x500")``，而且
-          ``resizable(False, False)`` 让它改不了。后来登录页加了一个
-          「忘记密码？」按钮和两行说明，内容长到 **639px**，窗口却还是 500px：
+        row = QHBoxLayout(card)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
 
-          * 按钮被切在可视区之外 —— **控件树里查得到、用户看不见**；
-          * 分配高度被挤成 3px（同一个按钮单独量是正常的 44px）。
+        row.addWidget(self._build_brand())
 
-        「写死尺寸 + 禁用缩放」的界面，每加一行字都得重新手量一遍，而漏量的
-        后果是静默截断。改成按需计算之后，以后再加内容会自动撑开。
-        """
-        self.update_idletasks()
-        width = max(_MIN_WIDTH, self.winfo_reqwidth())
-        height = max(_MIN_HEIGHT, self.winfo_reqheight())
-        self.geometry(f"{width}x{height}")
+        right = QWidget()
+        right_box = QVBoxLayout(right)
+        right_box.setContentsMargins(38, 34, 38, 30)
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._build_login_page())
+        self._stack.addWidget(self._build_register_page())
+        right_box.addWidget(self._stack)
+        row.addWidget(right, 1)
 
-    # ------------------------------------------------------------------ 搭
+    def _build_brand(self) -> QFrame:
+        brand = QFrame()
+        brand.setObjectName("LoginBrand")
+        brand.setFixedWidth(_BRAND_WIDTH)
 
-    def _build_layout(self) -> None:
-        self._brand = ttk.Frame(self, width=_BRAND_WIDTH)
-        self._brand.pack(side="left", fill="y")
-        self._brand.pack_propagate(False)     # 固定宽度
+        box = QVBoxLayout(brand)
+        box.setContentsMargins(26, 34, 26, 30)
 
-        ttk.Separator(self, orient="vertical").pack(side="left", fill="y")
+        title = QLabel("成绩单透镜")
+        title.setObjectName("LoginBrandTitle")
+        box.addWidget(title)
 
-        self._right = ttk.Frame(self, padding=(34, 30))
-        self._right.pack(side="left", fill="both", expand=True)
+        sub = QLabel(f"transcript-lens　{APP_VERSION}")
+        sub.setObjectName("LoginBrandSub")
+        box.addWidget(sub)
 
-    def _build_brand(self) -> None:
-        brand = ttk.Frame(self._brand, padding=(22, 30))
-        brand.pack(fill="both", expand=True)
+        box.addSpacing(26)
 
-        ttk.Label(brand, text="成绩单透镜", font=_BRAND_FONT).pack(anchor="w")
-        ttk.Label(
-            brand, text=f"transcript-lens {APP_VERSION}", foreground=_MUTED,
-        ).pack(anchor="w", pady=(2, 18))
+        slogan = QLabel(SLOGAN)
+        slogan.setObjectName("LoginSlogan")
+        slogan.setWordWrap(True)
+        box.addWidget(slogan)
 
-        ttk.Label(
-            brand, text=SLOGAN, wraplength=_BRAND_WIDTH - 50, justify="left",
-            font=("Microsoft YaHei UI", 11),
-        ).pack(anchor="w")
+        box.addSpacing(22)
 
-        ttk.Separator(brand).pack(fill="x", pady=18)
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setStyleSheet("color:#334155;")
+        box.addWidget(line)
 
-        for line in (
+        box.addSpacing(16)
+
+        for text in (
             "本地离线运行",
             "不上传、不联网",
             "加权算术全部本地完成",
             "成绩只存加密文件",
         ):
-            ttk.Label(brand, text=f"· {line}", foreground=_MUTED).pack(
-                anchor="w", pady=1
-            )
+            item = QLabel(f"· {text}")
+            item.setObjectName("BrandBullet")
+            box.addWidget(item)
+
+        box.addStretch(1)
+        return brand
 
     # --- 登录页 ---
-    def _build_login_page(self) -> None:
-        page = ttk.Frame(self._right)
-        self._login_page = page
+    def _build_login_page(self) -> QWidget:
+        page = QWidget()
+        box = QVBoxLayout(page)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(0)
 
-        ttk.Label(page, text="登录", font=_TITLE_FONT).pack(anchor="w")
-        ttk.Label(
-            page, text="选择本机已有的账户，输入密码。", foreground=_MUTED,
-        ).pack(anchor="w", pady=(4, 20))
+        title = QLabel("登录")
+        title.setObjectName("H1")
+        box.addWidget(title)
 
-        ttk.Label(page, text="账号").pack(anchor="w")
-        self._user_var = tk.StringVar()
-        self._user_box = ttk.Combobox(
-            page, textvariable=self._user_var, state="readonly", width=34,
+        sub = QLabel("选择本机已有的账户，输入密码。")
+        sub.setObjectName("Muted")
+        box.addWidget(sub)
+        box.addSpacing(22)
+
+        box.addWidget(self._label("账号"))
+        self._user_box = QComboBox()
+        self._user_box.setEditable(True)          # Spec：可编辑可输入
+        self._user_box.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._user_box.setMinimumHeight(38)
+        box.addWidget(self._user_box)
+        box.addSpacing(14)
+
+        box.addWidget(self._label("密码"))
+        self._pass_edit = QLineEdit()
+        self._pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._pass_edit.setMinimumHeight(38)
+        self._pass_edit.returnPressed.connect(self._do_login)
+        box.addWidget(self._pass_edit)
+        box.addSpacing(14)
+
+        self._remember = QCheckBox(f"{AUTO_LOGIN_DAYS} 天内自动登录")
+        self._remember.setChecked(False)          # ★ 默认不勾，见模块开头第 2 条
+        box.addWidget(self._remember)
+
+        note = QLabel(
+            f"勾选后本机会保存一个免密码凭证（{AUTO_LOGIN_DAYS} 天有效）。\n"
+            "共用电脑上请不要勾。"
         )
-        self._user_box.pack(anchor="w", pady=(4, 12))
+        note.setObjectName("Muted")
+        box.addWidget(note)
+        box.addSpacing(18)
 
-        ttk.Label(page, text="密码").pack(anchor="w")
-        self._pass_var = tk.StringVar()
-        pass_entry = ttk.Entry(
-            page, textvariable=self._pass_var, show="●", width=36,
+        buttons = QHBoxLayout()
+        login_btn = QPushButton("登  录")
+        login_btn.setObjectName("Primary")
+        login_btn.setMinimumHeight(40)
+        login_btn.setMinimumWidth(130)
+        login_btn.clicked.connect(self._do_login)
+        buttons.addWidget(login_btn)
+
+        to_register = QPushButton("去注册")
+        to_register.setObjectName("Ghost")
+        to_register.setMinimumHeight(40)
+        to_register.setMinimumWidth(110)
+        to_register.clicked.connect(lambda: self._goto_page(1))
+        buttons.addWidget(to_register)
+        buttons.addStretch(1)
+        box.addLayout(buttons)
+        box.addSpacing(16)
+
+        forgot = QPushButton("忘记密码？")
+        forgot.setObjectName("Link")
+        forgot.clicked.connect(self._do_forgot_password)
+        box.addWidget(forgot)
+
+        warn = QLabel(
+            "忘了密码？用注册时寄到邮箱的那串「找回码」重设，成绩不会丢。\n"
+            "但找回码只有那一封邮件里有 —— 删了就真打不开了。"
         )
-        pass_entry.pack(anchor="w", pady=(4, 12))
-        pass_entry.bind("<Return>", lambda _e: self._do_login())
+        warn.setObjectName("Muted")
+        warn.setWordWrap(True)
+        box.addWidget(warn)
 
-        self._remember_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            page, text=f"{AUTO_LOGIN_DAYS} 天内自动登录", variable=self._remember_var,
-        ).pack(anchor="w", pady=(2, 0))
-        ttk.Label(
-            page,
-            text=f"勾选后本机会保存一个免密码凭证（{AUTO_LOGIN_DAYS} 天有效）。\n"
-                 "共用电脑上请不要勾。",
-            foreground=_MUTED, justify="left",
-        ).pack(anchor="w", pady=(2, 16))
-
-        buttons = ttk.Frame(page)
-        buttons.pack(anchor="w")
-        ttkb.Button(
-            buttons, text="登录", bootstyle="primary", width=12,
-            command=self._do_login,
-        ).pack(side="left")
-        ttkb.Button(
-            buttons, text="去注册", bootstyle="secondary-outline", width=12,
-            command=self.show_register_page,
-        ).pack(side="left", padx=(10, 0))
-
-        # --- 找回密码：按钮先摆出来，逻辑下一阶段接邮箱 API 时再填 ---
-        # 刻意把话说全：现在点它**什么也找不回**，不能让用户以为还有出路。
-        ttkb.Button(
-            page, text="忘记密码？", bootstyle="link",
-            command=self._do_forgot_password,
-        ).pack(anchor="w", pady=(14, 0))
-        ttk.Label(
-            page,
-            text="本地不存密码，也没有任何找回途径。\n"
-                 "忘了密码，这台电脑上的成绩库就打不开了。",
-            foreground=_MUTED, wraplength=400, justify="left",
-        ).pack(anchor="w", pady=(2, 0))
-
-        self._login_status = ttk.Label(page, text="", foreground=_MUTED)
-        self._login_status.pack(anchor="w", pady=(16, 0))
+        box.addStretch(1)
+        self._login_status = QLabel("")
+        self._login_status.setObjectName("Muted")
+        self._login_status.setWordWrap(True)
+        box.addWidget(self._login_status)
+        return page
 
     # --- 注册页 ---
-    def _build_register_page(self) -> None:
-        page = ttk.Frame(self._right)
-        self._register_page = page
+    def _build_register_page(self) -> QWidget:
+        page = QWidget()
+        box = QVBoxLayout(page)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(0)
 
-        ttk.Label(page, text="注册", font=_TITLE_FONT).pack(anchor="w")
-        ttk.Label(
-            page,
-            text="账户只建在这台电脑上。密码用 PBKDF2 派生，"
-                 "磁盘上只留随机盐和校验值。",
-            foreground=_MUTED, wraplength=420, justify="left",
-        ).pack(anchor="w", pady=(4, 8))
+        title = QLabel("注册")
+        title.setObjectName("H1")
+        box.addWidget(title)
 
-        # ★ 唯一能提前警告用户的时机。等他把密码忘了再说就晚了。
-        ttk.Label(
-            page,
-            text="⚠ 请记住这个密码。本地不保存它，当前版本也没有任何找回途径，"
-                 "忘了就打不开成绩库了。",
-            foreground="#9B1C1C", wraplength=420, justify="left",
-        ).pack(anchor="w", pady=(0, 20))
-
-        ttk.Label(page, text="账号").pack(anchor="w")
-        self._new_user_var = tk.StringVar()
-        ttk.Entry(page, textvariable=self._new_user_var, width=36).pack(
-            anchor="w", pady=(4, 12)
+        sub = QLabel(
+            "账户只建在这台电脑上。密码用 PBKDF2 派生，磁盘上只留随机盐和校验值。"
         )
+        sub.setObjectName("Muted")
+        sub.setWordWrap(True)
+        box.addWidget(sub)
+        box.addSpacing(12)
 
-        ttk.Label(page, text="密码").pack(anchor="w")
-        self._new_pass_var = tk.StringVar()
-        ttk.Entry(page, textvariable=self._new_pass_var, show="●", width=36).pack(
-            anchor="w", pady=(4, 12)
+        warn = QLabel(
+            "⚠ 请记住这个密码，并填一个能收信的邮箱。\n"
+            "注册成功后会往这个邮箱寄一串「找回码」—— 忘了密码时它是唯一的出路。"
         )
+        warn.setObjectName("Warn")
+        warn.setWordWrap(True)
+        box.addWidget(warn)
+        box.addSpacing(16)
 
-        ttk.Label(page, text="确认密码").pack(anchor="w")
-        self._new_pass2_var = tk.StringVar()
-        entry2 = ttk.Entry(
-            page, textvariable=self._new_pass2_var, show="●", width=36,
+        box.addWidget(self._label("账号"))
+        self._new_user = QLineEdit()
+        self._new_user.setMinimumHeight(38)
+        box.addWidget(self._new_user)
+        box.addSpacing(12)
+
+        # --- 邮箱 + 发送验证码（Spec：注册必须验证邮箱真实可靠）---
+        box.addWidget(self._label("邮箱"))
+        mail_row = QHBoxLayout()
+        mail_row.setSpacing(8)
+        self._new_email = QLineEdit()
+        self._new_email.setPlaceholderText("用来接收找回码，例如 you@163.com")
+        self._new_email.setMinimumHeight(38)
+        mail_row.addWidget(self._new_email, 1)
+
+        self._send_code_btn = QPushButton("发送验证码")
+        self._send_code_btn.setObjectName("Ghost")
+        self._send_code_btn.setMinimumHeight(38)
+        self._send_code_btn.setMinimumWidth(120)
+        self._send_code_btn.clicked.connect(self._do_send_code)
+        mail_row.addWidget(self._send_code_btn)
+        box.addLayout(mail_row)
+        box.addSpacing(12)
+
+        box.addWidget(self._label("邮箱验证码"))
+        self._new_code = QLineEdit()
+        self._new_code.setPlaceholderText(f"{EMAIL_CODE_LENGTH} 位数字，10 分钟内有效")
+        self._new_code.setMinimumHeight(38)
+        box.addWidget(self._new_code)
+        box.addSpacing(12)
+
+        box.addWidget(self._label("密码"))
+        self._new_pass = QLineEdit()
+        self._new_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        self._new_pass.setMinimumHeight(38)
+        box.addWidget(self._new_pass)
+        box.addSpacing(12)
+
+        box.addWidget(self._label("确认密码"))
+        self._new_pass2 = QLineEdit()
+        self._new_pass2.setEchoMode(QLineEdit.EchoMode.Password)
+        self._new_pass2.setMinimumHeight(38)
+        self._new_pass2.returnPressed.connect(self._do_register)
+        box.addWidget(self._new_pass2)
+        box.addSpacing(18)
+
+        buttons = QHBoxLayout()
+        self._register_btn = QPushButton("注  册")
+        self._register_btn.setObjectName("Primary")
+        self._register_btn.setMinimumHeight(40)
+        self._register_btn.setMinimumWidth(130)
+        self._register_btn.clicked.connect(self._do_register)
+        buttons.addWidget(self._register_btn)
+
+        back = QPushButton("返回登录")
+        back.setObjectName("Ghost")
+        back.setMinimumHeight(40)
+        back.setMinimumWidth(110)
+        back.clicked.connect(lambda: self._goto_page(0))
+        buttons.addWidget(back)
+        buttons.addStretch(1)
+        box.addLayout(buttons)
+
+        box.addStretch(1)
+        self._register_status = QLabel(
+            f"密码至少 {MIN_PASSWORD_LENGTH} 位。先填邮箱点「发送验证码」。"
         )
-        entry2.pack(anchor="w", pady=(4, 12))
-        entry2.bind("<Return>", lambda _e: self._do_register())
+        self._register_status.setObjectName("Muted")
+        self._register_status.setWordWrap(True)
+        box.addWidget(self._register_status)
+        return page
 
-        buttons = ttk.Frame(page)
-        buttons.pack(anchor="w", pady=(6, 0))
-        ttkb.Button(
-            buttons, text="注册", bootstyle="primary", width=12,
-            command=self._do_register,
-        ).pack(side="left")
-        ttkb.Button(
-            buttons, text="返回登录", bootstyle="secondary-outline", width=12,
-            command=self.show_login_page,
-        ).pack(side="left", padx=(10, 0))
+    @staticmethod
+    def _label(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("H3")
+        return label
 
-        ttk.Label(
-            page,
-            text=f"密码至少 {MIN_PASSWORD_LENGTH} 位。\n"
-                 "本程序没有服务器，密码不保存在任何地方 —— "
-                 "当前版本也没有可用的找回途径。",
-            foreground=_MUTED, wraplength=420, justify="left",
-        ).pack(anchor="w", pady=(16, 0))
+    def _goto_page(self, index: int) -> None:
+        """翻页。**必须同步把窗口尺寸重算一遍**（注册页比登录页高）。"""
+        self._stack.setCurrentIndex(index)
+        self._ensure_page_fits()
+        if index == 0:
+            self._pass_edit.setFocus()
+        else:
+            self._new_user.setFocus()
 
-    # ------------------------------------------------------------- 翻页
-
-    #: 翻页时要不要跟着重算窗口大小。
-    #: ``__init__`` 里建控件的过程中会翻一次页，那时窗口还没定位，
-    #: 提前 geometry() 会让窗口在屏幕角落闪一下 —— 所以先关掉，
-    #: 等 ``_fit_to_content()`` 在构造末尾统一算一次。
-    _autofit_on_switch = False
-
-    def show_login_page(self) -> None:
-        self._register_page.pack_forget()
-        self._login_page.pack(fill="both", expand=True)
-        self._hint_about_token()
-        self._refit_if_switching()
-
-    def show_register_page(self) -> None:
-        self._login_page.pack_forget()
-        self._register_page.pack(fill="both", expand=True)
-        self._refit_if_switching()
-
-    def _refit_if_switching(self) -> None:
-        """两页高度不一样，翻页后要按当前页重算窗口高度。
-
-        登录页和注册页的控件数量不同（注册页多一个「确认密码」和一段警告），
-        而窗口是 ``resizable(False, False)``。**只在构造时算一次是不够的** ——
-        切到更高的那一页，底部照样会被切掉。
-        """
-        if self._autofit_on_switch:
-            self._fit_to_content()
+    # ---------------------------------------------------------------- 状态
+    def _set_status(self, text: str, *, error: bool = False) -> None:
+        self._login_status.setObjectName("Danger" if error else "Muted")
+        self._login_status.setText(text)
+        # 换了 objectName 要重新应用样式表，否则颜色不变
+        self._login_status.style().unpolish(self._login_status)
+        self._login_status.style().polish(self._login_status)
 
     def _refresh_usernames(self) -> None:
         """把本机已有的用户名填进下拉框（**只有用户名**）。"""
         try:
             index = self._store.load_users()
         except StoreCorruptError as exc:
-            self._login_status.configure(text=f"读不到账户列表：{exc}", foreground="#9B1C1C")
+            self._set_status(f"读不到账户列表：{exc}", error=True)
             return
         names = [record.username for record in index]
-        self._user_box.configure(values=names)
+        self._user_box.clear()
+        self._user_box.addItems(names)
         if names:
-            self._user_var.set(names[0])
+            self._user_box.setCurrentText(names[0])
         else:
-            self._login_status.configure(
-                text="这台电脑上还没有账户，请先点「去注册」。", foreground=_MUTED
-            )
+            self._set_status("这台电脑上还没有账户，请先点「去注册」。")
 
     def _hint_about_token(self) -> None:
-        """如果上次的自动登录失效了，说一句为什么又让输密码。"""
-        if self._user_var.get():
+        """上次的自动登录要是失效了，说一句为什么又让输密码。"""
+        if self._user_box.currentText():
             return
         info = token_info(self._data_root)
         if info["reason"] == "expired":
-            self._login_status.configure(
-                text=f"上次的自动登录已过期（{AUTO_LOGIN_DAYS} 天），请重新登录。",
-                foreground=_MUTED,
+            self._set_status(
+                f"上次的自动登录已过期（{AUTO_LOGIN_DAYS} 天），请重新登录。"
             )
         elif info["reason"] in {"corrupt", "bad_payload"}:
-            self._login_status.configure(
-                text="自动登录凭证已失效（文件损坏），请重新登录。", foreground=_MUTED
-            )
+            self._set_status("自动登录凭证已失效（文件损坏），请重新登录。")
 
-    def _status(self, text: str, *, error: bool = False) -> None:
-        self._login_status.configure(
-            text=text, foreground="#9B1C1C" if error else _MUTED
-        )
-        self.update_idletasks()
-
-    # ------------------------------------------------------------- 动作
-
+    # ---------------------------------------------------------------- 动作
     def _do_forgot_password(self) -> None:
-        """「忘记密码？」——**本阶段故意什么都不做**。
+        """「忘记密码？」→ 打开找回对话框（用邮件里的找回码重设密码）。
 
-        这个按钮是**提前摆出来的位置**：下一阶段接邮箱 API 之后，流程会长在这里
-        （注册时把一份恢复材料寄到邮箱 → 忘密码时凭它解出库密钥 → 设新密码）。
-
-        ★ 现在绝不能假装"已经受理"。本地不存密码、不存库密钥明文，
-          本阶段**确实没有任何找回途径** —— 用户此刻最需要知道的恰恰是这个，
-          而不是一句会让他在几天后才发现上当的"请稍候"。
+        ★ 这里**延迟 import** ``ui.recover_dialog``：那个模块要 import 本模块的
+          ``MIN_PASSWORD_LENGTH``，写在文件头上就成环了。
         """
-        messagebox.showinfo(
-            "找回密码：尚未开放",
-            "本功能还在开发中，当前版本没有任何找回密码的途径。\n\n"
-            "原因：密码不保存在任何地方，成绩库的密钥只由它派生。\n"
-            "本地没有、云端也没有，所以谁也「重置」不了它。\n\n"
-            "后续版本会支持「用注册邮箱找回」。届时需要在注册时就绑定邮箱 ——\n"
-            "事到临头再绑定是来不及的。\n\n"
-            "在此之前，请务必记住密码。",
-            parent=self,
-        )
-        self._status("找回密码功能尚未开放。")
+        from ui.recover_dialog import RecoverDialog
+
+        dialog = RecoverDialog(self._store, self._data_root, parent=self)
+        if dialog.exec() == RecoverDialog.DialogCode.Accepted and dialog.username:
+            self._user_box.setCurrentText(dialog.username)
+            self._pass_edit.clear()
+            self._set_status(
+                f"「{dialog.username}」的密码已重设，请用新密码登录。"
+            )
+            if not self._remember.isChecked():
+                clear_token(self._data_root)
 
     def _do_login(self) -> None:
-        name = self._user_var.get().strip()
-        password = self._pass_var.get()
+        if self._leaving:
+            return
+        name = self._user_box.currentText().strip()
+        password = self._pass_edit.text()
         if not name or not password:
-            messagebox.showwarning("还差一点", "账号和密码都要填。", parent=self)
+            QMessageBox.warning(self, "还差一点", "账号和密码都要填。")
             return
 
-        self._status("正在校验密码（PBKDF2 派生中，约 0.3 秒）…")
+        self._set_status("正在校验密码（PBKDF2 派生中，约 0.3 秒）…")
         try:
             session = self._store.login(name, password)
         except UnknownUserError:
-            messagebox.showwarning(
+            QMessageBox.warning(
+                self,
                 "没有这个账号",
                 f"本机没有账户「{name}」。如果这是第一次用，请点「去注册」。",
-                parent=self,
             )
-            self._status("登录失败：没有这个账号。", error=True)
+            self._set_status("登录失败：没有这个账号。", error=True)
             return
         except WrongPasswordError:
-            messagebox.showerror(
+            QMessageBox.critical(
+                self,
                 "密码错误",
                 "密码不对，请重新输入。\n\n"
                 "本程序不存密码，当前版本也没有找回途径 —— "
                 "密码想不起来，成绩库就打不开了。",
-                parent=self,
             )
-            self._status("登录失败：密码错误。", error=True)
+            self._set_status("登录失败：密码错误。", error=True)
             return
         except CryptoError as exc:
-            messagebox.showerror("登录失败", str(exc), parent=self)
-            self._status(f"登录失败：{exc}", error=True)
+            QMessageBox.critical(self, "登录失败", str(exc))
+            self._set_status(f"登录失败：{exc}", error=True)
             return
 
         self._handle_remember(session.username)
-
-        self.entered_user = session.username
-        self.destroy()
-        show_main(session.username)
+        self._leave(session.username)
 
     def _handle_remember(self, username: str) -> None:
         """记 / 不记自动登录。失败不拦登录 —— 那只是便利功能。"""
         try:
-            if self._remember_var.get():
+            if self._remember.isChecked():
                 save_token(username, root=self._data_root)
             else:
-                # 没勾就顺手清掉旧的：否则上次的残留会让人"明明没勾却还是免密码进来"
+                # 没勾就顺手清掉旧的：否则上次的残留会让人
+                # "明明没勾却还是免密码进来"
                 clear_token(self._data_root)
         except (CryptoError, ValueError) as exc:
-            messagebox.showwarning(
+            QMessageBox.warning(
+                self,
                 "自动登录没能设置",
                 f"{exc}\n\n这次仍然正常登录，只是下次还需要输入密码。",
-                parent=self,
             )
 
+    def _leave(self, username: str) -> None:
+        """淡出自己，然后把 ``logged_in`` 发出去。
+
+        ★ 先淡出再让位：直接 ``hide()`` 会"啪"地一下消失，
+          而 Spec 要求登录窗淡出 + 主窗淡入的连贯转场。
+        """
+        self._leaving = True
+        self._set_status(f"欢迎回来，{username}。正在进入…")
+
+        def _after() -> None:
+            self.hide()
+            self.logged_in.emit(username)
+
+        window_fade_out(self, 220, _after)
+
+    # ------------------------------------------------------------ 发送验证码
+    def _do_send_code(self) -> None:
+        """把验证码寄到用户填的邮箱。
+
+        ★ 网络请求走后台线程（见 :mod:`ui.workers`）—— 在按钮回调里直接
+          ``sendmail()`` 的话，网络不通时窗口会冻满 15 秒超时。
+        """
+        try:
+            email = normalize_email(self._new_email.text())
+        except EmailCodeError as exc:
+            QMessageBox.warning(self, "邮箱不对", str(exc))
+            return
+
+        self._send_code_btn.setEnabled(False)
+        self._send_code_btn.setText("发送中…")
+        self._set_register_status(f"正在往 {email} 发送验证码…")
+
+        def _work() -> str:
+            code = issue_email_code(email, purpose="注册", root=self._data_root)
+            send_verification_mail(
+                email, code, purpose="注册", root=self._data_root
+            )
+            return email
+
+        def _done(target: str) -> None:
+            self._send_code_btn.setText("重新发送")
+            self._send_code_btn.setEnabled(True)
+            self._set_register_status(
+                f"验证码已发到 {target}，{EMAIL_CODE_TTL_MINUTES} 分钟内有效。"
+                "没收到就看一眼垃圾邮件。"
+            )
+            self._new_code.setFocus()
+
+        def _failed(exc: BaseException) -> None:
+            self._send_code_btn.setText("发送验证码")
+            self._send_code_btn.setEnabled(True)
+            message = str(exc)
+            self._set_register_status(f"发送失败：{message}", error=True)
+            QMessageBox.critical(self, "验证码没能发出", message)
+
+        run_async(self, _work, on_done=_done, on_error=_failed)
+
+    # ---------------------------------------------------------------- 注册
     def _do_register(self) -> None:
-        name = self._new_user_var.get().strip()
-        password = self._new_pass_var.get()
+        name = self._new_user.text().strip()
+        password = self._new_pass.text()
+        again = self._new_pass2.text()
+        raw_email = self._new_email.text().strip()
+        code = self._new_code.text().strip()
+
         if not name:
-            messagebox.showwarning("请填账号", "账号不能为空。", parent=self)
+            QMessageBox.warning(self, "还差一点", "请填账号。")
+            return
+        try:
+            email = normalize_email(raw_email)
+        except EmailCodeError:
+            QMessageBox.warning(
+                self, "要填邮箱", "注册必须填一个能收信的邮箱 —— 找回码要寄到那里。"
+            )
+            return
+        if not code:
+            QMessageBox.warning(
+                self, "还没验证邮箱", "请先点「发送验证码」，再把收到的 6 位数字填进来。"
+            )
             return
         if len(password) < MIN_PASSWORD_LENGTH:
-            messagebox.showwarning(
-                "密码太短",
-                f"至少 {MIN_PASSWORD_LENGTH} 位。这是唯一能打开加密数据的钥匙。",
-                parent=self,
+            QMessageBox.warning(
+                self, "密码太短", f"密码至少 {MIN_PASSWORD_LENGTH} 位。"
             )
             return
-        if password != self._new_pass2_var.get():
-            messagebox.showwarning("两次密码不一致", "请重新输入确认密码。", parent=self)
+        if password != again:
+            QMessageBox.warning(self, "两次密码不一致", "请重新输入确认密码。")
             return
 
-        try:
-            self._store.register(name, password)
-        except CryptoError as exc:
-            messagebox.showerror("注册失败", str(exc), parent=self)
+        self._register_btn.setEnabled(False)
+        self._register_btn.setText("创建中…")
+        self._set_register_status("正在校验验证码…")
+
+        def _work() -> str:
+            # ① 验证码（不对就抛，账户不会建）
+            check_email_code(email, code, root=self._data_root)
+            # ② 建账户
+            session = self._store.register(name, password)
+            # ③ ★ 立刻生成找回码并寄出 —— 库密钥此刻还在手里，
+            #    这是唯一能埋下"第二把钥匙"的时机。
+            recovery_code = enable_recovery(session, email, store=self._store)
+            send_recovery_mail(
+                email, recovery_code, username=name, root=self._data_root
+            )
+            return email
+
+        def _done(target: str) -> None:
+            self._register_btn.setEnabled(True)
+            self._register_btn.setText("注  册")
+            for widget in (self._new_user, self._new_email, self._new_code,
+                           self._new_pass, self._new_pass2):
+                widget.clear()
+            self._refresh_usernames()
+            self._user_box.setCurrentText(name)
+            self._pass_edit.clear()
+            self._stack.setCurrentIndex(0)
+            self._set_status(f"账户「{name}」已建好，请输入密码登录。")
+            QMessageBox.information(
+                self,
+                "注册成功 —— 请保留那封邮件",
+                f"账户「{name}」已建好，找回码已经寄到：\n{target}\n\n"
+                "那封邮件里有你的「找回码」，忘了密码时唯一的出路就是它。\n"
+                "建议现在就把它星标或加个标签，别让它躺在垃圾邮件里。",
+            )
+
+        def _failed(exc: BaseException) -> None:
+            self._register_btn.setEnabled(True)
+            self._register_btn.setText("注  册")
+            if isinstance(exc, EmailCodeError):
+                message = str(exc)
+                self._set_register_status(f"邮箱验证没过：{message}", error=True)
+                QMessageBox.warning(self, "邮箱验证没过", message)
+                return
+            message = str(exc)
+            if not isinstance(exc, (CryptoError, ValueError, RecoveryError)):
+                message = f"{type(exc).__name__}: {exc}"
+            self._set_register_status(f"注册失败：{message}", error=True)
+            QMessageBox.critical(self, "注册失败", message)
+
+        run_async(self, _work, on_done=_done, on_error=_failed)
+
+    def _set_register_status(self, text: str, *, error: bool = False) -> None:
+        self._register_status.setObjectName("Danger" if error else "Muted")
+        self._register_status.setText(text)
+        self._register_status.style().unpolish(self._register_status)
+        self._register_status.style().polish(self._register_status)
+        self._ensure_page_fits()
+
+    # ---------------------------------------------------------------- 尺寸
+    def _ensure_page_fits(self) -> None:
+        """翻页后保证窗口装得下当前页。
+
+        ★ 教训（tkinter 版栽过一次）：登录窗是**固定尺寸**、注册页比登录页高。
+          只在构造时定一次尺寸的话，切到注册页底部就会被切掉 ——
+          控件树里查得到、用户看不见。这里每次翻页都按当前页的
+          ``sizeHint()`` 重新量一遍，不够就把窗口撑大。
+        """
+        current = self._stack.currentWidget()
+        if current is None:
             return
+        hint = current.sizeHint()
+        margins = self.layout().contentsMargins()
+        need_w = hint.width() + margins.left() + margins.right() + _BRAND_WIDTH + 40
+        need_h = hint.height() + margins.top() + margins.bottom() + 40
+        if need_w > self.width() or need_h > self.height():
+            self.resize(max(need_w, self.width()), max(need_h, self.height()))
 
-        self._new_pass_var.set("")
-        self._new_pass2_var.set("")
-        self._new_user_var.set("")
-        self._refresh_usernames()
-        self._user_var.set(name)
-        self.show_login_page()
-        self._status(f"账户「{name}」已创建，请输入密码登录。")
-        messagebox.showinfo(
-            "注册成功",
-            f"已在本机创建账户「{name}」。\n\n"
-            "磁盘上只写了随机盐和校验值，没有密码明文，也没有任何上传。\n"
-            "接下来请输入密码登录。",
-            parent=self,
-        )
-
-    # ------------------------------------------------------------- 入口
-
-    def run(self) -> str | None:
-        """开窗并阻塞到关闭。返回登录成功的用户名（直接关窗则返回 ``None``）。"""
-        self.mainloop()
-        return self.entered_user
-
-
-def run_login(root: str | None = None) -> str | None:
-    """开一个登录窗。"""
-    return LoginWindow(root=root).run()
+    # ---------------------------------------------------------------- 起窗
+    def run(self) -> None:
+        """显示并淡入。"""
+        self.show()
+        window_fade_in(self, 240)

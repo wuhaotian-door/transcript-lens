@@ -95,6 +95,11 @@ $Common = @(
     '--add-data', 'tests/fixtures/fake_grades.xlsx;tests/fixtures',
     '--add-data', 'tests/fixtures/fake_grades_with_anchor.xlsx;tests/fixtures',
 
+    # ★ 全局样式表也必须进包 —— 它同样**不是 .py**，是数据文件。
+    #   漏了的话 exe 里窗口能开、界面全白（main.load_stylesheet 读不到会返回空串，
+    #   自检里有一条专门查这个文件在不在）。
+    '--add-data', 'ui/styles.qss;ui',
+
     # pandas 是延迟 import openpyxl 的，静态分析看不到，必须显式带上
     '--hidden-import', 'openpyxl',
     '--hidden-import', 'openpyxl.styles',
@@ -123,18 +128,14 @@ $Common = @(
     '--collect-submodules', 'core',
     '--collect-submodules', 'ai',
 
-    # ★ ttkbootstrap **必须用 --collect-all**（不能只 collect-submodules）：
-    #   它的主题和控件素材是**数据文件**，不是 .py ——
-    #     assets/icons/bootstrap.ttf / glyphmap.json
-    #     assets/elements/*.png / manifest.json
-    #     assets/app_icons/ttkbootstrap.png
-    #   少一个，exe 里就会变成"窗口能开、主题报错"或者图标全变豆腐块。
-    #   --collect-all = submodules + data + binaries，一次说清。
-    '--collect-all', 'ttkbootstrap',
-    # ttkbootstrap 的图标/图片走 Pillow
-    '--hidden-import', 'PIL',
-    '--hidden-import', 'PIL.Image',
-    '--hidden-import', 'PIL.ImageTk',
+    # ★ PySide6 用 PyInstaller 自带的 hook 就够了（它知道 Qt 插件在哪）。
+    #   曾经这里写的是 `--collect-all ttkbootstrap` —— 那是 tkinter 时代的遗留，
+    #   换成 PySide6 之后整块删掉。
+    #
+    # ★★ 但有个**致命**的坑：下面 --exclude-module 那一串里原本排掉了 PySide6
+    #    （因为当时界面是 tkinter，Qt 是废重量）。换成 PySide6 之后如果忘了删那条，
+    #    PyInstaller 会把整个 Qt 排除掉，打出来的 exe 一启动就 ModuleNotFoundError,
+    #    **而源码自检照样全绿** —— 因为自检跑的是源码不是包。已经删掉了。
 
     # 明确排掉的东西。这一长串不是洁癖，是**必须**的：
     #
@@ -193,18 +194,20 @@ $Common = @(
     '--exclude-module', 'tables',
     '--exclude-module', 'imageio',
     '--exclude-module', 'cv2',
-    # ★ PIL / Pillow 曾经在这里被排掉（那时它只是 pandas 的闲置邻居）。
-    #   换成 ttkbootstrap 之后**必须放行**：它的复选框/开关/图标素材都是 PNG，
-    #   走 Pillow 加载。排掉的话 exe 里会变成"窗口能开、控件素材全缺"。
-    #   代价是 exe 大几 MB，认了。
+    # ★ PIL / Pillow 曾经被排掉、后来又放行（ttkbootstrap 时代它要加载 PNG 素材）。
+    #   现在换成 PySide6，Pillow 不再是界面依赖 —— 但**不再排它**：
+    #   排掉它收益很小（几 MB），而 pandas 的某些可选路径会 import 它，
+    #   排掉之后可能变成运行时才炸的 ImportError。留着不动。
 
-    # 界面：tkinter 之外都不需要
+    # 界面：**只用 PySide6**（铁律九）。别的 GUI 框架一律不进包。
+    #   ⚠ 这里**绝对不能**再出现 PySide6 —— 那会把整个 Qt 排除，
+    #     打出来的 exe 一启动就 ModuleNotFoundError。
     '--exclude-module', 'qtpy',
     '--exclude-module', 'PyQt5',
-    '--exclude-module', 'PyQt6',
+    '--exclude-module', 'PyQt6',        # 铁律：不引入 PyQt6，只用 PySide6
     '--exclude-module', 'PySide2',
-    '--exclude-module', 'PySide6',
     '--exclude-module', 'wx',
+    '--exclude-module', 'tkinter',      # 旧界面已全部删除，不再需要
 
     # 网络：不打包 = 物理上发不出请求
     '--exclude-module', 'requests',

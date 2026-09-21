@@ -49,12 +49,21 @@
 
 然后把它接进 :func:`get_sender` 的分支即可。**其余代码不需要改动** ——
 调用方只认 :class:`MailMessage` 和 ``send()``，与本模块选择的厂商无关。
+
+**2026-09 更新：已接通网易 163 SMTP。** 见 :class:`SmtpSender`。
+凭据存在 ``%LOCALAPPDATA%\\SGMS\\email.json``（**仓库外**），
+本模块任何函数都**不会**把授权码写进日志、异常消息或返回值。
 """
 
 from __future__ import annotations
 
 import json
+import smtplib
+import ssl
 from dataclasses import dataclass, field
+from email.header import Header
+from email.mime.text import MIMEText
+from email.utils import formataddr, formatdate
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -62,19 +71,32 @@ from core.crypto_store import CryptoError, default_root
 
 __all__ = [
     "CONFIG_FILENAME",
+    "DEFAULT_SSL_PORT",
+    "DEFAULT_STARTTLS_PORT",
     "EmailNotConfiguredError",
     "EmailSendError",
     "EmailSender",
     "MailConfig",
     "MailMessage",
     "NotImplementedSender",
+    "SmtpSender",
     "config_example_path",
     "config_path",
     "get_sender",
     "load_config",
     "save_config",
     "send_recovery_mail",
+    "send_verification_mail",
 ]
+
+#: 隐式 SSL 的默认端口（163 / QQ 都用 465）
+DEFAULT_SSL_PORT = 465
+#: STARTTLS 的默认端口
+DEFAULT_STARTTLS_PORT = 587
+
+#: 连服务器 / 发一封信的超时。**必须有** —— 没有超时的话，
+#: 网络不通时界面会直接冻死在这里（Qt 主线程被阻塞）。
+SMTP_TIMEOUT = 15.0
 
 
 #: 配置文件名。**放在 AppData，不在仓库里** —— API key 是密钥，
@@ -208,6 +230,142 @@ class NotImplementedSender:
         )
 
 
+class SmtpSender:
+    """用标准库 ``smtplib`` 直接发信 —— **不引入任何第三方邮件 SDK**。
+
+    已实测可用的是网易 163：
+
+    ==================  ==========================================
+    ``endpoint``        ``smtp.163.com:465``
+    ``api_key``         **授权码**（不是登录密码）
+    ``sender``          必须与账号一致，163 会拒收伪造发件人
+    ==================  ==========================================
+
+    端口决定加密方式：**465 走隐式 SSL，其它端口走 STARTTLS 升级**。
+    两种都失败就报错，**绝不降级成明文发信** —— 那等于把授权码和
+    恢复码一起裸奔在网络上。
+
+    ★ 安全约定：本类任何异常消息里**都不含授权码**。``smtplib`` 自己抛的
+      异常可能带上账号，所以这里统一换成自己的消息再往上抛。
+    """
+
+    def __init__(self, config: MailConfig) -> None:
+        self._config = config
+
+    # ------------------------------------------------------------------ 内部
+    def _split_endpoint(self) -> tuple[str, int]:
+        """``"smtp.163.com:465"`` → ``("smtp.163.com", 465)``。"""
+        raw = (self._config.endpoint or "").strip()
+        if not raw:
+            raise EmailNotConfiguredError("还没填 SMTP 服务器地址（endpoint）")
+        host, _, port_text = raw.partition(":")
+        host = host.strip()
+        if not host:
+            raise EmailNotConfiguredError(f"SMTP 地址不对：{raw!r}")
+        try:
+            port = int(port_text) if port_text.strip() else DEFAULT_SSL_PORT
+        except ValueError as exc:
+            raise EmailNotConfiguredError(f"SMTP 端口不是数字：{port_text!r}") from exc
+        return host, port
+
+    def _build_message(self, message: MailMessage) -> MIMEText:
+        """拼一封 UTF-8 的纯文本邮件。"""
+        body = MIMEText(message.body, "plain", "utf-8")
+        body["Subject"] = Header(message.subject, "utf-8")
+        # 发件人显示名也要用 Header 编码，否则中文名在客户端里是乱码
+        body["From"] = formataddr(
+            (str(Header(self._config.sender_name, "utf-8")), self._config.sender)
+        )
+        body["To"] = message.to
+        body["Date"] = formatdate(localtime=True)
+        return body
+
+    # ------------------------------------------------------------------ 发送
+    def send(self, message: MailMessage) -> None:
+        """发一封信。失败抛 :class:`EmailSendError`（消息里不含授权码）。"""
+        config = self._config
+        if not config.sender:
+            raise EmailNotConfiguredError("还没填发件人地址（sender）")
+        if not config.api_key:
+            raise EmailNotConfiguredError("还没填 SMTP 授权码（api_key）")
+
+        host, port = self._split_endpoint()
+        payload = self._build_message(message)
+        context = ssl.create_default_context()
+
+        try:
+            if port == DEFAULT_SSL_PORT:
+                server = smtplib.SMTP_SSL(
+                    host, port, timeout=SMTP_TIMEOUT, context=context
+                )
+            else:
+                server = smtplib.SMTP(host, port, timeout=SMTP_TIMEOUT)
+        except (OSError, ssl.SSLError) as exc:
+            raise EmailSendError(
+                f"连不上邮件服务器 {host}:{port} —— {type(exc).__name__}: {exc}\n\n"
+                "请检查网络，以及服务器地址和端口是否填对（163 用 smtp.163.com:465）。"
+            ) from exc
+
+        try:
+            with server:
+                if port != DEFAULT_SSL_PORT:
+                    try:
+                        server.starttls(context=context)
+                    except (OSError, smtplib.SMTPException) as exc:
+                        raise EmailSendError(
+                            f"STARTTLS 握手失败：{exc}。已中止，不会用明文发信。"
+                        ) from exc
+                try:
+                    server.login(config.sender, config.api_key)
+                except smtplib.SMTPAuthenticationError as exc:
+                    raise EmailSendError(
+                        "邮箱认证失败。163 要求用**授权码**而不是登录密码；"
+                        "并在邮箱设置里确认已开启 SMTP 服务。\n"
+                        f"（服务器返回码 {exc.smtp_code}）"
+                    ) from exc
+                server.sendmail(config.sender, [message.to], payload.as_string())
+        except smtplib.SMTPRecipientsRefused as exc:
+            raise EmailSendError(f"收件人被拒：{message.to}（地址可能不存在）") from exc
+        except smtplib.SMTPSenderRefused as exc:
+            raise EmailSendError(
+                f"发件人被拒：{config.sender}。163 要求发件人与登录账号一致。"
+            ) from exc
+        except smtplib.SMTPException as exc:
+            raise EmailSendError(f"发信失败：{type(exc).__name__}: {exc}") from exc
+        except OSError as exc:
+            raise EmailSendError(
+                f"发信过程中网络中断：{type(exc).__name__}: {exc}"
+            ) from exc
+
+    def verify(self) -> str:
+        """连一次服务器并登录，确认配置可用。**不发信。**
+
+        给"设置 → 测试邮件配置"用：不想为了试配置就往用户邮箱里塞垃圾邮件。
+        """
+        host, port = self._split_endpoint()
+        config = self._config
+        context = ssl.create_default_context()
+        try:
+            if port == DEFAULT_SSL_PORT:
+                server = smtplib.SMTP_SSL(host, port, timeout=SMTP_TIMEOUT, context=context)
+            else:
+                server = smtplib.SMTP(host, port, timeout=SMTP_TIMEOUT)
+        except (OSError, ssl.SSLError) as exc:
+            raise EmailSendError(f"连不上 {host}:{port} —— {exc}") from exc
+        try:
+            with server:
+                if port != DEFAULT_SSL_PORT:
+                    server.starttls(context=context)
+                server.login(config.sender, config.api_key)
+        except smtplib.SMTPAuthenticationError as exc:
+            raise EmailSendError(
+                f"认证失败（{exc.smtp_code}）。163 要用授权码，不是登录密码。"
+            ) from exc
+        except (smtplib.SMTPException, OSError) as exc:
+            raise EmailSendError(f"验证失败：{type(exc).__name__}: {exc}") from exc
+        return f"{host}:{port} 连接与登录都正常（{config.sender}）"
+
+
 # ---------------------------------------------------------------------------
 # 配置读写
 # ---------------------------------------------------------------------------
@@ -260,21 +418,22 @@ def save_config(config: MailConfig, root: str | Path | None = None) -> Path:
 def get_sender(root: str | Path | None = None) -> EmailSender:
     """拿到当前的发信实现。
 
-    本阶段：**永远**返回 :class:`NotImplementedSender`，不论配置里填了什么。
-    下一阶段在这里按 ``config.provider`` 分派到具体实现，例如::
+    按 ``config.provider`` 分派。目前支持：
 
-        config = load_config(root)
-        if not config.configured:
-            return NotImplementedSender()
-        if config.provider == "resend":
-            return ResendSender(config)
-        ...
+    * ``"smtp"`` —— :class:`SmtpSender`（标准库，已实测网易 163 可用）
+    * 空 / 其它 —— :class:`NotImplementedSender`（明确报错，不假装成功）
+
+    想接别家（Resend / SendGrid / 阿里云……）就在下面加一个分支，
+    **其余代码一处都不用改** —— 调用方只认 ``MailMessage`` 和 ``send()``。
     """
+    config = load_config(root)
+    if config.provider == "smtp" and config.configured:
+        return SmtpSender(config)
     return NotImplementedSender()
 
 
 # ---------------------------------------------------------------------------
-# 业务入口（下一阶段实现）
+# 业务入口
 # ---------------------------------------------------------------------------
 
 
@@ -285,24 +444,69 @@ def send_recovery_mail(
     username: str = "",
     root: str | Path | None = None,
 ) -> None:
-    """把恢复材料寄到用户邮箱。**本阶段必定抛异常。**
+    """把恢复码寄到用户邮箱。
 
-    ⚠️ 调用时机是**注册时**（或用户主动'绑定邮箱'时），不是忘密码时 ——
-       原因见模块开头。忘密码那天已经解不开库密钥了，没东西可寄。
+    ⚠️ 调用时机是**注册成功时**（或用户主动"重新生成恢复码"时），
+       **不是**忘密码时 —— 忘密码那天已经解不开库密钥了，没东西可寄。
 
-    下一阶段接入时，这个函数体只需要做三件事：
+    ★ 出网的内容只有：收件地址 + 称呼 + 那一串恢复码。
+      **不含姓名、不含学号、不含任何成绩**（Spec 红线 11）。
 
-    1. 把 ``recovery_secret`` 拼成一段人话（正文/链接）；
-    2. ``get_sender(root).send(MailMessage(to=..., ...))``；
-    3. **不要**把 ``recovery_secret`` 写进任何日志、异常消息或返回值。
-
-    注意 ``username`` 只用于称呼，**不要**把姓名、学号、成绩写进邮件 ——
-    出网的只有收件地址和那一个随机 token（Spec 红线 11）。
+    ★ ``recovery_secret`` 不写日志、不进异常消息、不作为返回值。
     """
-    raise EmailNotConfiguredError(
-        "邮箱找回密码尚未实现（本阶段只有接口）。\n\n"
-        "需要先决定并接入邮件 API；接入前，忘记密码没有任何找回途径。"
+    who = f"{username}　" if username else ""
+    message = MailMessage(
+        to=to,
+        subject="【成绩单透镜】密码找回码 —— 请长期保留这封邮件",
+        body=(
+            f"{who}你好：\n\n"
+            "这是「成绩单透镜」的密码找回码。将来忘记密码时，它是唯一能\n"
+            "打开你成绩库的东西。\n\n"
+            "────────────  找回码  ────────────\n"
+            f"{recovery_secret}\n"
+            "──────────────────────────────────\n\n"
+            "怎么用：\n"
+            "  1. 打开「成绩单透镜」，在登录页点「忘记密码？」\n"
+            "  2. 填账号，把这串找回码粘进去\n"
+            "  3. 设一个新密码，原来的成绩一条都不会丢\n\n"
+            "请务必：\n"
+            "  · 不要删除这封邮件（建议星标或加标签）\n"
+            "  · 不要把找回码发给任何人 —— 拿到它的人就能打开你的成绩库\n\n"
+            "说明：本程序不保存你的密码，也没有服务器。找回码在注册时就已生成，\n"
+            "只有这封邮件里有。丢了它，忘记密码时数据就再也打不开了。\n\n"
+            "—— 成绩单透镜（本邮件由程序自动发出，请勿回复）"
+        ),
     )
+    get_sender(root).send(message)
+
+
+def send_verification_mail(
+    to: str,
+    code: str,
+    *,
+    purpose: str = "注册",
+    minutes: int = 10,
+    root: str | Path | None = None,
+) -> None:
+    """把邮箱验证码寄给用户，用来确认这个邮箱真的存在。
+
+    ``purpose`` 只影响文案（"注册" / "重新生成找回码"）。
+
+    ★ 验证码是**短时效**的一次性凭据，但它同样不该出现在日志里 ——
+      这里和 :func:`send_recovery_mail` 一个规矩。
+    """
+    message = MailMessage(
+        to=to,
+        subject=f"【成绩单透镜】{purpose}验证码",
+        body=(
+            f"你的{purpose}验证码是：\n\n"
+            f"        {code}\n\n"
+            f"（{minutes} 分钟内有效，请勿转发给任何人）\n\n"
+            "如果不是你本人操作，忽略本邮件即可，不会产生任何影响。\n\n"
+            "—— 成绩单透镜（本邮件由程序自动发出，请勿回复）"
+        ),
+    )
+    get_sender(root).send(message)
 
 
 def _mask_address(address: str) -> str:

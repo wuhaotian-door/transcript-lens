@@ -1,203 +1,301 @@
-"""主窗口：左侧固定 180px 侧边栏 + 右侧内容区。
+"""主界面 —— 深色侧栏 + 顶部窄条 + QStackedWidget 内容区。
 
-结构
-----
-``MainWindow`` 是 :class:`ttkbootstrap.Window`（``themename="cosmo"``），
-最小尺寸 1000×650。
+     +--------+--------------------------------------------------+
+     | 成绩单  |  张老师            ● 已激活                       |  ← 顶部窄条
+     | 透镜    +--------------------------------------------------+
+     |        |                                                  |
+     | 📊 智育 |                                                  |
+     | 🎯 侧写 |              当前页面（QStackedWidget）           |
+     | 📈 档案 |                                                  |
+     | 💰 奖学 |                                                  |
+     | ⚙️ 设置 |                                                  |
+     | 👤 个人 |                                                  |
+     +--------+--------------------------------------------------+
 
-* **侧边栏** 固定 180px（``pack_propagate(False)`` 撑住宽度），竖排导航按钮
-* **内容区** 只有一个 Frame；切页 = 先把旧的 ``pack_forget()``，再 pack 新的
-* 默认首页 = 智育分析
-
-六个页面各自是 ``ui/page_*.py`` 里的一个 ``build_xxx_page(parent_frame)`` 函数，
-本模块只负责"把它们挂进来 + 切来切去"，不含任何业务逻辑。
-
-★ 侧边栏底部的「退出登录」不在你的页面清单里，是我加的，理由见
-:meth:`MainWindow._do_logout` 的说明 —— 没有它，勾了自动登录就再也取消不掉。
+★ 切页动画走 :class:`ui.anim.StackSwitcher`：淡出旧页 → setCurrentIndex →
+  淡入新页，单次 ≤250ms，并带 ``_busy`` 锁防连点（Spec 四）。
+★ 侧栏选中态由 QSS 的 ``QPushButton#NavButton:checked`` 负责 ——
+  左侧 4px 蓝线 + 半透明浅蓝底。
 """
 
 from __future__ import annotations
 
-import tkinter as tk
-from tkinter import messagebox, ttk
-from typing import Callable
-
-import ttkbootstrap as ttkb
-
-from ui.page_academic import build_academic_page
-from ui.page_scholarship import build_scholarship_page
-from ui.page_stubs import (
-    build_archive_page,
-    build_outline_page,
-    build_profile_page,
-    build_settings_page,
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QButtonGroup,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QPushButton,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
 )
 
-__all__ = ["MainWindow", "NAV_ITEMS", "SIDEBAR_WIDTH", "THEME", "show_main"]
-
-#: ttkbootstrap 主题名
-THEME = "cosmo"
-
-#: 侧边栏固定宽度（像素）
-SIDEBAR_WIDTH = 180
-
-#: 窗口标题
-APP_NAME = "成绩单透镜 transcript-lens"
-
-#: 导航项：``(key, 显示名, 页面构造函数)`` —— 顺序即侧边栏顺序
-NAV_ITEMS: tuple[tuple[str, str, Callable[[tk.Misc], ttk.Frame]], ...] = (
-    ("academic", "智育分析", build_academic_page),
-    ("archive", "档案", build_archive_page),
-    ("scholarship", "奖学金测算", build_scholarship_page),
-    ("outline", "谈话提纲", build_outline_page),
-    ("settings", "设置", build_settings_page),
-    ("profile", "个人中心", build_profile_page),
+from core.activation import load_state
+from core.crypto_store import CryptoStore
+from ui.anim import StackSwitcher, window_fade_in
+from ui.intentions import load_intentions
+from ui.pages import (
+    AccountPage,
+    AnalysisPage,
+    ArchivePage,
+    ProfilePage,
+    ScholarshipPage,
+    SettingsPage,
 )
 
-#: 默认首页
-DEFAULT_PAGE = "academic"
+__all__ = ["APP_NAME", "MainWindow", "NAV_ITEMS"]
 
-_SELECTED_STYLE = "secondary-outline"
-_NORMAL_STYLE = "light"
-_MUTED = "#6c757d"
+#: 程序名（侧栏顶部）
+APP_NAME = "成绩单透镜"
+
+#: 侧栏宽度（Spec 四：固定 190px）
+SIDEBAR_WIDTH = 190
+
+#: 导航项：``(键, 图标+文字, 页面类名)``。顺序即侧栏顺序。
+NAV_ITEMS: tuple[tuple[str, str], ...] = (
+    ("analysis", "📊  智育分析"),
+    ("profile", "🎯  侧写辅导"),
+    ("archive", "📈  成长档案"),
+    ("scholarship", "💰  奖学金测算"),
+    ("settings", "⚙️  设置"),
+    ("account", "👤  个人中心"),
+)
+
+#: 默认落在哪一页（Spec 四：默认首页 = 智育分析）
+DEFAULT_PAGE = 0
 
 
-class MainWindow(ttkb.Window):
-    """主窗口。"""
+class MainWindow(QMainWindow):
+    """主窗口。
 
-    def __init__(self, user_id: str = "") -> None:
-        super().__init__(themename=THEME)
-        self.user_id = user_id or ""
+    Signals:
+        switch_account(): 用户在个人中心点了「切换账号」。
+            主程序接住它去清令牌 + 起登录窗。
+    """
 
-        self.title(f"{APP_NAME}　—　{self.user_id}" if self.user_id else APP_NAME)
-        self.minsize(1000, 650)
-        self.geometry("1180x720")
+    switch_account = Signal()
 
-        self._pages: dict[str, ttk.Frame] = {}
-        self._nav_buttons: dict[str, ttkb.Button] = {}
-        self._current: str = ""
+    def __init__(self, store: CryptoStore | None = None, root: str | None = None) -> None:
+        super().__init__()
+        self._store = store if store is not None else CryptoStore(root)
+        self._data_root = root
+        self._username = ""
 
-        self._build_sidebar()
-        self._build_content()
-        self.show_page(DEFAULT_PAGE)
+        self.setWindowTitle(f"{APP_NAME} · transcript-lens")
+        self.setMinimumSize(1100, 700)
+        self.resize(1240, 780)
+        self.setWindowOpacity(0.0)
 
-    # ------------------------------------------------------------------ 搭
+        self._build()
+        self._wire()
 
-    def _build_sidebar(self) -> None:
-        sidebar = ttk.Frame(self, width=SIDEBAR_WIDTH)
-        sidebar.pack(side="left", fill="y")
-        # ★ 固定宽度：不加这一句，Frame 会被里面的按钮撑大，
-        #   width=180 就成了"建议值"而不是"固定值"。
-        sidebar.pack_propagate(False)
-        self._sidebar = sidebar
+    # ---------------------------------------------------------------- 搭界面
+    def _build(self) -> None:
+        central = QWidget()
+        self.setCentralWidget(central)
 
-        brand = ttk.Frame(sidebar)
-        brand.pack(fill="x", padx=14, pady=(18, 16))
-        ttk.Label(brand, text="成绩单透镜",
-                  font=("Microsoft YaHei UI", 13, "bold")).pack(anchor="w")
-        ttk.Label(brand, text="transcript-lens", foreground=_MUTED).pack(anchor="w")
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
-        # 底部先占位（pack side=bottom 要在导航按钮之前，否则会被挤没）
-        footer = ttk.Frame(sidebar)
-        footer.pack(side="bottom", fill="x", padx=12, pady=12)
-        ttk.Label(
-            footer,
-            text=f"当前账户：{self.user_id or '—'}",
-            foreground=_MUTED, wraplength=SIDEBAR_WIDTH - 28, justify="left",
-        ).pack(anchor="w", pady=(0, 8))
-        ttkb.Button(
-            footer, text="退出登录", bootstyle="danger-outline",
-            command=self._do_logout, width=16,
-        ).pack(fill="x")
+        outer.addWidget(self._build_topbar())
 
-        nav = ttk.Frame(sidebar)
-        nav.pack(side="top", fill="x", padx=10)
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        body.addWidget(self._build_sidebar())
 
-        for key, label, _builder in NAV_ITEMS:
-            button = ttkb.Button(
-                nav, text=label, bootstyle=_NORMAL_STYLE, width=16,
-                command=lambda k=key: self.show_page(k),
-            )
-            button.pack(fill="x", pady=3)
-            self._nav_buttons[key] = button
+        self._stack = QStackedWidget()
+        self._stack.setObjectName("Content")
+        body.addWidget(self._stack, 1)
+        outer.addLayout(body, 1)
 
-    def _build_content(self) -> None:
-        self._content = ttk.Frame(self)
-        self._content.pack(side="left", fill="both", expand=True)
+        # --- 六个页面 ---
+        self.analysis_page = AnalysisPage()
+        self.profile_page = ProfilePage(self._store)
+        self.archive_page = ArchivePage()
+        self.scholarship_page = ScholarshipPage()
+        self.settings_page = SettingsPage(self._store, self._data_root)
+        self.account_page = AccountPage(self._store, self._data_root)
 
-    # ------------------------------------------------------------- 切页
-
-    def show_page(self, key: str) -> bool:
-        """切到某一页：先 forget 旧的，再 pack 新的。"""
-        if key == self._current:
-            return True
-
-        builders = {item[0]: item[2] for item in NAV_ITEMS}
-        if key not in builders:
-            return False
-
-        old = self._pages.get(self._current)
-        if old is not None:
-            old.pack_forget()
-
-        page = self._pages.get(key)
-        if page is None:
-            page = builders[key](self._content)
-            self._pages[key] = page
-        page.pack(fill="both", expand=True)
-
-        self._current = key
-        self._sync_nav()
-        return True
-
-    def _sync_nav(self) -> None:
-        """选中态换 bootstyle —— 这一页用 Outline 样式高亮。"""
-        for key, button in self._nav_buttons.items():
-            button.configure(
-                bootstyle=_SELECTED_STYLE if key == self._current else _NORMAL_STYLE
-            )
-
-    # ------------------------------------------------------------- 退出
-
-    def _do_logout(self) -> None:
-        """清掉「7 天内自动登录」，回到登录窗。
-
-        ★ 为什么这个按钮必须存在（它不在你给的页面清单里）：
-
-        ``session.enc`` 是**免密码进入**的凭证。如果界面上没有清除入口，
-        用户勾了一次自动登录之后，除非自己去翻 AppData 删文件，否则**永远
-        取消不掉** —— 那是个真坑，不是洁癖。
-
-        它只删令牌，**不删任何成绩数据、不删账户、不删激活状态**。
-        """
-        from core.crypto_store import CryptoError
-        from core.session_token import clear_token
-
-        if not messagebox.askyesno(
-            "退出登录",
-            "将清除「7 天内自动登录」，下次启动需要重新输入密码。\n\n"
-            "不会删除任何成绩数据、账户或激活状态。",
-            parent=self,
+        for page in (
+            self.analysis_page,
+            self.profile_page,
+            self.archive_page,
+            self.scholarship_page,
+            self.settings_page,
+            self.account_page,
         ):
-            return
+            self._stack.addWidget(page)
 
+        # --- 切页动画（淡出 → 换 index → 淡入，带防连点锁）---
+        self._switcher = StackSwitcher(self._stack, self)
+        self._switcher.on_switched(self._sync_nav)
+
+    def _build_sidebar(self) -> QFrame:
+        side = QFrame()
+        side.setObjectName("Sidebar")
+        side.setFixedWidth(SIDEBAR_WIDTH)
+
+        box = QVBoxLayout(side)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(0)
+
+        # 品牌区
+        brand = QWidget()
+        brand_box = QVBoxLayout(brand)
+        brand_box.setContentsMargins(18, 20, 14, 16)
+        brand_box.setSpacing(2)
+        title = QLabel(APP_NAME)
+        title.setObjectName("BrandTitle")
+        brand_box.addWidget(title)
+        sub = QLabel("transcript-lens")
+        sub.setObjectName("BrandSub")
+        brand_box.addWidget(sub)
+        box.addWidget(brand)
+
+        # 导航
+        self._nav_group = QButtonGroup(self)
+        self._nav_group.setExclusive(True)
+        self._nav_buttons: list[QPushButton] = []
+        for index, (_key, text) in enumerate(NAV_ITEMS):
+            button = QPushButton(text)
+            button.setObjectName("NavButton")
+            button.setCheckable(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setMinimumHeight(44)
+            button.clicked.connect(lambda _=False, i=index: self.goto(i))
+            self._nav_group.addButton(button, index)
+            self._nav_buttons.append(button)
+            box.addWidget(button)
+
+        box.addStretch(1)
+
+        foot = QLabel("本地离线 · 成绩不出这台电脑")
+        foot.setObjectName("BrandSub")
+        foot.setWordWrap(True)
+        foot.setContentsMargins(18, 8, 14, 16)
+        box.addWidget(foot)
+        return side
+
+    def _build_topbar(self) -> QFrame:
+        bar = QFrame()
+        bar.setObjectName("TopBar")
+        bar.setFixedHeight(54)
+
+        box = QHBoxLayout(bar)
+        box.setContentsMargins(22, 0, 22, 0)
+        box.setSpacing(10)
+
+        self._user_label = QLabel("（未登录）")
+        self._user_label.setObjectName("TopUser")
+        box.addWidget(self._user_label)
+
+        box.addWidget(self._sep())
+        self._dot = QLabel()
+        self._dot.setFixedSize(10, 10)
+        box.addWidget(self._dot)
+
+        self._act_label = QLabel("激活状态未知")
+        self._act_label.setObjectName("TopMeta")
+        box.addWidget(self._act_label)
+
+        box.addStretch(1)
+
+        self._page_title = QLabel("")
+        self._page_title.setObjectName("TopMeta")
+        box.addWidget(self._page_title)
+        return bar
+
+    @staticmethod
+    def _sep() -> QLabel:
+        line = QLabel("|")
+        line.setObjectName("TopMeta")
+        return line
+
+    # ---------------------------------------------------------------- 接线
+    def _wire(self) -> None:
+        # 智育分析页双击/点「侧写」→ 带着学生数据跳到侧写辅导
+        self.analysis_page.student_selected.connect(self._open_profile)
+        # 个人中心「切换账号」
+        self.account_page.switch_account.connect(self.switch_account.emit)
+        # 设置页导出用的数据来自智育分析页（不复制数据，只给个取值函数）
+        self.settings_page.set_export_provider(self.analysis_page.export_records)
+
+    # ---------------------------------------------------------------- 对外
+    def set_user(self, username: str) -> None:
+        """设置当前用户，并把六个页面各自的用户相关状态刷新一遍。"""
+        self._username = username or ""
+        self._user_label.setText(self._username or "（未登录）")
+        self.profile_page.set_user(self._username)
+        self.settings_page.set_user(self._username)
+        self.account_page.set_user(self._username)
+        self._refresh_activation()
+
+    def goto(self, index: int) -> None:
+        """切到第 ``index`` 页（带动画）。"""
+        if not self._switcher.switch(index):
+            # 被 _busy 锁吃掉或本来就在这页 —— 把选中态拨回去，别让界面说谎
+            self._sync_nav(self._stack.currentIndex())
+
+    def show_and_fade_in(self, username: str) -> None:
+        """显示窗口 + 淡入。登录窗淡出之后由主程序调这个。"""
+        self.set_user(username)
+        self._stack.setCurrentIndex(DEFAULT_PAGE)
+        self._sync_nav(DEFAULT_PAGE)
+        self.show()
+        window_fade_in(self, 260)
+
+    # ---------------------------------------------------------------- 内部
+    def _open_profile(self, payload: dict) -> None:
+        """从智育分析页跳侧写辅导。"""
+        self.profile_page.show_student(payload)
+        index = next(i for i, (key, _t) in enumerate(NAV_ITEMS) if key == "profile")
+        self._switcher.switch(index)
+
+    def _sync_nav(self, index: int) -> None:
+        """把侧栏选中态和顶部标题对齐到当前页。"""
+        for position, button in enumerate(self._nav_buttons):
+            button.setChecked(position == index)
+        if 0 <= index < len(NAV_ITEMS):
+            self._page_title.setText(NAV_ITEMS[index][1].replace("  ", " "))
+
+    def _refresh_activation(self) -> None:
+        """顶部那个小圆点：绿=已激活，灰=未激活（Spec 四）。"""
         try:
-            clear_token()
-        except CryptoError as exc:
-            messagebox.showerror("清除失败", str(exc), parent=self)
-            return
+            state = load_state(self._data_root)
+        except Exception:  # noqa: BLE001 - 读不到就当未激活，不拦界面
+            state = None
+        activated = bool(getattr(state, "activated", False))
+        color = "#22C55E" if activated else "#CBD5E1"
+        self._dot.setStyleSheet(f"background:{color}; border-radius:5px;")
+        if activated:
+            self._act_label.setText(
+                f"已激活（版本 {state.active_version}，{state.activated_year} 年）"
+            )
+        else:
+            self._act_label.setText("未激活")
 
-        self.destroy()
-        show_login()
+    # ---------------------------------------------------------------- 自检用
+    @property
+    def nav_count(self) -> int:
+        return len(self._nav_buttons)
 
+    @property
+    def page_count(self) -> int:
+        return self._stack.count()
 
-def show_main(user_id: str = "") -> None:
-    """打开主窗口并阻塞到它关闭。登录窗和 ``main.py`` 都调这个。"""
-    MainWindow(user_id).mainloop()
+    @property
+    def current_index(self) -> int:
+        return self._stack.currentIndex()
 
+    @property
+    def switching(self) -> bool:
+        return self._switcher.busy
 
-def show_login() -> None:
-    """回到登录窗（退出登录后用）。函数内 import，避免两个窗口互相 import。"""
-    from ui.login_window import LoginWindow
-
-    LoginWindow().run()
+    def intentions_of_current_user(self) -> dict[str, str]:
+        """给自检用：当前用户已登记的发展意愿。"""
+        return load_intentions(self._store, self._username)
