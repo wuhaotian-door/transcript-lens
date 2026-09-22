@@ -98,6 +98,11 @@ CHECK_MODULES: tuple[str, ...] = (
     "core.archival",
     "core.activation",
     "core.crypto_store",
+    "core.user_store",
+    "core.scholarship",
+    "core.ai",
+    "core.ai.local_assistant",
+    "core.ai.cloud_adapter",
     "core.email_recovery",
     "core.recovery",
     "core.library",
@@ -292,16 +297,27 @@ def _selfcheck_report() -> tuple[bool, str]:
         failures.append("锚点校验")
         lines.append(f"FAIL  锚点校验\n          {exc.__class__.__name__}: {exc}")
 
-    # --- 红线自检：打包里不许有能发网络请求的东西 -------------------------
-    if getattr(sys, "frozen", False):
-        for banned in ("requests", "urllib3", "httpx", "aiohttp", "openai", "anthropic"):
-            try:
-                __import__(banned)
-            except ImportError:
-                lines.append(f"ok    {'未打包 ' + banned:<32} 物理上发不出请求")
-            else:
-                failures.append(f"打包里混进了 {banned}")
-                lines.append(f"FAIL  打包里混进了 {banned} —— 与「不联网」铁律冲突")
+    # --- 联网红线（v1.6 更新版）-------------------------------------------
+    #
+    # charter 第 3 章把红线改成了**有条件放行**：
+    #
+    #   ✅ SMTP 发邮件（仅找回密码流程，用户主动点「发送验证码」）
+    #   ✅ 辅导员手动启用的云端大模型（手动开 + 手动填 Key + 只在点「深度评估」时调）
+    #   ❌ 自动更新检查 / telemetry / 崩溃上报 / 静默请求
+    #   ❌ requests / httpx 用于**非** SMTP、**非**用户主动 AI 的场景
+    #
+    # 所以这里不再是"见到 requests 就 FAIL"。真正的守卫换成两条更准的：
+    #
+    #   1. **AI 适配器的源码里不许出现任何 HTTP 客户端**（静态扫描）——
+    #      现在它们是骨架，一行网络代码都不该有；
+    #   2. 云端传出去的 payload 必须过脱敏白名单。
+    #
+    # 原来的"打包里有没有 requests"仍然查，但语义变了：
+    # 它们**现在**确实不在包里（骨架期），在包里说明有人偷偷加了依赖。
+    for line in _network_policy_report():
+        lines.append(line)
+        if line.startswith("FAIL"):
+            failures.append("联网红线检查")
 
     # --- 所有模块能否 import（不创建窗口）----------------------------------
     for name in CHECK_MODULES:
@@ -313,6 +329,161 @@ def _selfcheck_report() -> tuple[bool, str]:
     else:
         lines.append("RESULT: ALL OK")
     return not failures, "\n".join(lines)
+
+
+def _network_policy_report() -> list[str]:
+    """v1.6 联网红线（charter 第 3 章）—— 返回 ``["ok ..."]`` / ``["FAIL ..."]``。
+
+    ★ 为什么不再"见到 requests 就 FAIL"
+    ---------------------------------
+
+    charter 把红线改成了**有条件放行**：SMTP（用户主动点发验证码）和
+    "辅导员手动启用的云端大模型"是允许的；禁止的是**自动更新、telemetry、
+    静默请求**，以及"拿 requests/httpx 干别的"。
+
+    所以守卫要落在**行为**上，不能落在"这个包在不在"上。
+    真正的三条：
+
+    1. **AI 适配器源码里不许有任何 HTTP 客户端** —— 现在它们是骨架，
+       静态扫一遍就够，而且比"看包里有没有 requests"精确得多
+       （后者只能查打包版，源码版什么都查不到）。
+    2. **云端出口必须过脱敏白名单** —— 直接调 ``redact_student`` 试一把，
+       看姓名/学号会不会漏出去。
+    3. **非白名单的联网库不该被打进包** —— 保留原检查，但语义改成
+       "在包里说明有人偷偷加了依赖"，不再是铁律冲突。
+    """
+    import re as _re
+
+    lines: list[str] = []
+
+    # --- 1. AI 适配器源码静态扫描 -----------------------------------------
+    banned_imports = (
+        "requests", "httpx", "urllib.request", "urllib3",
+        "aiohttp", "http.client", "socket", "openai", "anthropic", "websocket",
+    )
+    # ★ 用 PROJECT_ROOT 而不是 _HERE：打包后前者指向 _MEIPASS，后者不一定。
+    ai_dir = PROJECT_ROOT / "core" / "ai"
+    scanned: list[str] = []
+    offenders: list[str] = []
+    if ai_dir.is_dir():
+        # ★ ``*.py`` **和** ``*.pyc``：PyInstaller 把模块编译成 .pyc 之后，
+        #   只 glob ``*.py`` 会扫到 **0 个文件**然后"通过" ——
+        #   那是**假绿**，比不检查更危险（实测打包版就撞上了这一条）。
+        for path in sorted(list(ai_dir.glob("*.py")) + list(ai_dir.glob("*.pyc"))):
+            scanned.append(path.name)
+            if path.suffix != ".py":
+                continue                      # 编译产物读不出源码，见下面第 2 道
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            for module in banned_imports:
+                # 只认真正的 import 语句，不认注释/文档里提到的名字
+                pattern = (
+                    rf"^\s*(?:import|from)\s+{_re.escape(module)}(?:[\s.]|$)"
+                )
+                if _re.search(pattern, text, _re.MULTILINE):
+                    offenders.append(f"{path.name} -> {module}")
+    if offenders:
+        lines.append(
+            f"FAIL  AI 适配器里出现了网络 import：{offenders}"
+            f"（charter 6.3：骨架阶段不许有任何真实调用）"
+        )
+    elif scanned:
+        lines.append(
+            f"ok    {'AI 适配器无网络 import':<32} 扫了 {len(scanned)} 个文件：{scanned}"
+        )
+    elif getattr(sys, "frozen", False):
+        # ★ 打包版**看不到 .py 源码**：PyInstaller 把模块编译进 PYZ 归档，
+        #   ``_MEIPASS/core/ai/`` 这个目录根本不存在。
+        #   所以这里**不是**失败，但也不能当成"通过"糊过去 ——
+        #   真正的守卫换成了下面第 1b 条（查已加载模块的命名空间），
+        #   而**权威的源码扫描在打包前那一次 --selfcheck 里跑的**
+        #   （build_exe.ps1 的顺序就是先跑源码自检、再打包，所以坏 import
+        #   在打包之前就已经被拦住了）。这一段是纵深防御的第二层。
+        lines.append(
+            f"ok    {'AI 适配器（打包版）':<32} 无 .py 源码（打进 PYZ），"
+            "改由下方命名空间检查兜底"
+        )
+    else:
+        # ★★ 源码版扫到 0 个文件 = **检查本身失效了**（路径写错 / 模块被改名），
+        #    必须 FAIL。实测打包版就撞过这一条：只 glob ``*.py``
+        #    扫到 0 个文件然后报 "ok"，是**假绿**，比不检查更危险。
+        lines.append(
+            f"FAIL  AI 适配器扫描扫到 0 个文件（{ai_dir}）—— "
+            "检查已经失效，不是通过"
+        )
+
+    # --- 1b. 已加载模块里也不许出现网络模块名（打包后源码读不出来时的兜底）---
+    try:
+        import importlib
+
+        leaked: list[str] = []
+        for name in ("core.ai.local_assistant", "core.ai.cloud_adapter", "core.ai"):
+            mod = importlib.import_module(name)
+            bound = set(vars(mod))
+            hit = bound & {
+                "requests", "httpx", "urllib", "socket", "http", "aiohttp",
+                "openai", "anthropic", "websocket", "urllib3",
+            }
+            if hit:
+                leaked.append(f"{name} -> {sorted(hit)}")
+        if leaked:
+            lines.append(f"FAIL  AI 模块里绑定了网络模块名：{leaked}")
+        else:
+            lines.append(
+                f"ok    {'AI 模块无网络绑定（打包版兜底）':<32} 查了 3 个模块的命名空间"
+            )
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"FAIL  AI 模块命名空间检查失败：{type(exc).__name__}: {exc}")
+
+    # --- 2. 脱敏出口 -------------------------------------------------------
+    try:
+        from core.ai.cloud_adapter import FORBIDDEN_FIELDS, redact_student
+
+        dirty = {
+            "S编号": "S001", "姓名": "张三", "学号": "2023001",
+            "身份证": "110101...", "加权均分": 85.05, "意愿标签": "考研",
+            "student": "张三", "student_id": "2023001",
+        }
+        clean = redact_student(dirty)
+        leaked = [k for k in clean if k in FORBIDDEN_FIELDS]
+        if leaked:
+            lines.append(f"FAIL  脱敏出口漏了字段：{leaked}")
+        elif "姓名" in clean or "学号" in clean:
+            lines.append("FAIL  脱敏出口把姓名/学号放出去了")
+        else:
+            lines.append(
+                f"ok    {'AI payload 强制脱敏':<32} "
+                f"8 个字段进 → {len(clean)} 个出（{sorted(clean)}）"
+            )
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"FAIL  脱敏出口自检失败：{type(exc).__name__}: {exc}")
+
+    # --- 3. 非白名单联网库不该在包里 ---------------------------------------
+    if getattr(sys, "frozen", False):
+        for banned in ("requests", "urllib3", "httpx", "aiohttp", "openai", "anthropic"):
+            try:
+                __import__(banned)
+            except ImportError:
+                lines.append(f"ok    {'未打包 ' + banned:<32} 骨架期不该有它")
+            else:
+                failures_hint = (
+                    f"打包里混进了 {banned} —— AI/更新都还是骨架，"
+                    "是不是有人偷偷加了依赖？"
+                )
+                lines.append(f"FAIL  {failures_hint}")
+
+    # --- 4. SMTP 例外要**真的在用**（避免"允许了却没人用"）-----------------
+    try:
+        import smtplib  # noqa: F401
+
+        from core.email_recovery import SmtpSender  # noqa: F401
+
+        lines.append(
+            f"ok    {'SMTP 例外（charter §3）':<32} smtplib + SmtpSender 就位"
+        )
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"FAIL  SMTP 路径不可用：{type(exc).__name__}: {exc}")
+
+    return lines
 
 
 def _credential_leak_report() -> list[str]:

@@ -27,8 +27,10 @@ from typing import Callable
 from PySide6.QtCore import (
     QAbstractAnimation,
     QEasingCurve,
+    QEvent,
     QObject,
     QPropertyAnimation,
+    Qt,
     QTimer,
 )
 from PySide6.QtGui import QColor
@@ -89,12 +91,17 @@ SHADOW_OFFSET = 2
 
 #: 切页锁的最长持有时间。超过就把这一页**直接落到位**（见 :meth:`StackSwitcher._force_finish`）。
 #:
-#: 实测：去掉淡出之后，一次切换中位 **~137ms**（淡入 130ms + Qt 调度）。
-#: 但**阈值不要跟着往下调** —— 它的职责不是"卡住多久算卡住"，而是
-#: "绝不能把一个本来会正常结束的动画砍掉"。机器忙的时候（首次绘制一个重页面、
-#: Defender 扫盘）见过一次 1513ms，那个值是调低之后一定会误伤的。
-#: 2500ms 只在真的卡死时才会到，而它到了就说明确实该强推一把。
-LOCK_TIMEOUT_MS = 2500
+#: 1500ms —— charter v1.6 第 5.2 节指定的值。
+#:
+#: 中途调高过一阵（2500ms）：当时一次切页中位 ~520ms，机器忙时见过一次 1513ms，
+#: 1500 会误砍一次本来能正常结束的动画。但那两个数都是**旧的 420ms 动画 +
+#: 首次绘制一个重页面**造成的。现在一次切页中位 **~137ms**，
+#: 1500ms 是 10 倍余量，够宽了，所以回落到了 charter 的值。
+#:
+#: ★ 它的职责**不是**"卡住多久算卡住"，而是"绝不能把一个本来会正常结束的
+#:   动画砍掉"。哪天动画又变长了，**先重量再决定**要不要放宽，
+#:   不要因为"感觉不够快"就往下调。
+LOCK_TIMEOUT_MS = 1500
 
 #: 正在跑的动画，按 widget 持有 —— 见模块开头第 1 条
 _KEEP: dict[int, list[QPropertyAnimation]] = {}
@@ -288,13 +295,50 @@ def fade_out(
     anim.start(QAbstractAnimation.DeletionPolicy.KeepWhenStopped)
 
 
+class _PageCover(QWidget):
+    """切页时盖住内容区的一层**纯色幕布**。
+
+    ★★ 为什么要有这个东西（这是"切页后界面略微抖动"的正解）★★
+
+    原来是给**新页**挂 ``QGraphicsOpacityEffect`` 做 0→1 淡入。问题在于：
+    一旦挂了效果，Qt 就把整页渲染进**一张离屏 pixmap**，而那条路径上
+    **文字的光栅化方式不一样**（没有 ClearType，字形的次像素取整也不同）。
+    动画跑完、效果一摘，整页**重新光栅化一遍** —— 所有字都换了个画法。
+
+    实测（抓整窗，带对照组校准）：挂着效果 @1.0 和摘掉效果两张图，
+    **17.4% 的像素不一样，最大通道差 240**
+    （同一个坐标上一个版本是深色字 `#0f173b`、另一个版本是纯白 `#ffffff`）。
+    这个重画发生在淡入结束之后约 30~60ms，用户看到的就是"切过去之后抖一下"。
+
+    修法：**页面永远不挂效果**（永远走正常渲染路径，永远不重光栅化）。
+    要淡入的改成盖在上面的一层纯色幕布淡出：
+    幕布是一整块纯色，离屏渲染和直接渲染画出来**逐像素一致**，
+    摘效果时没有任何可看出来的变化。
+
+    视觉上和"新页 0→1 淡入"完全一样 —— 因为新页本来就贴在
+    ``#F1F5F9`` 的背景上从背景里浮出来。
+    """
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setObjectName("PageCover")
+        # QSS 给非顶层 QWidget 设 background 必须开这个属性
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setGeometry(parent.rect())
+
+
 class StackSwitcher(QObject):
     """带淡入淡出的 QStackedWidget 切换器（Spec 八的 ``switch_stack``）。
 
     用法::
 
         self.switcher = StackSwitcher(self.stack)
-        self.switcher.switch(2)      # 淡出旧页 → setCurrentIndex → 淡入新页
+        self.switcher.switch(2)      # 换页 → 幕布淡出 → 新页显现
+
+    ★ 转场做法见 :class:`_PageCover`：**不动页面的效果**，
+      改淡一层盖在上面的纯色幕布。这样页面永远走正常渲染路径，
+      不会在动画结束后被重新光栅化（那就是"抖动"的来源）。
 
     ``_busy`` 锁是必须的：不加的话连点侧栏会让多段动画同时改同一个 widget 的
     opacity，屏幕上就是一次闪黑。
@@ -315,12 +359,44 @@ class StackSwitcher(QObject):
         self._busy = False
         #: 这一趟要切到哪一页。看门狗靠它把转场直接做完。
         self._pending: int | None = None
+        #: 正在淡出的幕布（同时最多一块）
+        self._cover: _PageCover | None = None
         #: 切换完成后回调（主窗口用来同步侧栏选中态）
         self._on_switched: Callable[[int], None] | None = None
         #: 看门狗：锁忘了放开时兜底
         self._watchdog = QTimer(self)
         self._watchdog.setSingleShot(True)
         self._watchdog.timeout.connect(self._force_finish)
+        # 幕布要跟着内容区一起变宽变高（窗口缩放、最大化）
+        stack.installEventFilter(self)
+
+    # ------------------------------------------------------------------ 幕布
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 - Qt 命名
+        if obj is self._stack and event.type() == QEvent.Type.Resize:
+            if self._cover is not None and is_alive(self._cover):
+                self._cover.setGeometry(self._stack.rect())
+        return False
+
+    def _raise_cover(self) -> _PageCover:
+        """造一块盖住内容区的幕布并置顶。"""
+        cover = _PageCover(self._stack)
+        cover.show()
+        cover.raise_()
+        self._cover = cover
+        return cover
+
+    def _drop_cover(self) -> None:
+        """把幕布收掉。
+
+        ★ 用 ``deleteLater`` 而**不是**直接 ``deleteLater`` 之外的任何同步销毁：
+          幕布身上挂着正在跑的动画，同步删它就是 AGENTS.md §4k 那个
+          use-after-free（进程 0xC0000409 静默消失）。
+        """
+        cover = self._cover
+        self._cover = None
+        if cover is not None and is_alive(cover):
+            cover.hide()
+            cover.deleteLater()
 
     @property
     def busy(self) -> bool:
@@ -373,9 +449,10 @@ class StackSwitcher(QObject):
         self._pending = None
         if index is None:  # pragma: no cover - 有 _busy 就一定有 _pending
             return
+        self._drop_cover()
         self._stack.setCurrentIndex(index)
-        # 动画半路被打断，透明度效果可能还挂在某一页上 —— 全部摘掉，
-        # 否则下次页面内部增删控件时会撞上"缓存 pixmap 不失效 → 整页空白"。
+        # 幕布方案下页面不该有透明度效果；这里再兜一遍，
+        # 免得以后有人改回"给页面挂效果"时留下"缓存 pixmap 不失效 → 整页空白"。
         for i in range(self._stack.count()):
             clear_effect(self._stack.widget(i))
         self._land(index)
@@ -405,6 +482,7 @@ class StackSwitcher(QObject):
 
         old = self._stack.currentWidget()
         if not animate or old is None:
+            self._drop_cover()
             self._stack.setCurrentIndex(index)
             self._land(index)
             return True
@@ -431,15 +509,36 @@ class StackSwitcher(QObject):
         return True
 
     def _after_out(self, index: int) -> None:
+        """换页 + 盖幕布 + 幕布淡出。
+
+        ★ 顺序是命门，三件事一件都不能挪：
+
+        1. **先换 index** —— 新页立刻以**正常渲染路径**画出来（这才是最终画面）；
+        2. **再盖幕布** —— 一块纯色挡在上面，用户此刻看到的是幕布；
+        3. **幕布淡出** —— 新页从背景里浮出来，视觉上就是"淡入"。
+
+        新页自始至终**没有 graphicsEffect**，所以永远不会有
+        "动画结束后整页重光栅化"那一下（见 :class:`_PageCover`）。
+
+        （旧写法是给新页挂 ``QGraphicsOpacityEffect`` 从 0 淡到 1 —— 功能一样，
+        但摘效果时整页会重画一遍，实测 17.4% 的像素变化、最大差 240。）
+        """
+        if self._pending != index:
+            # 看门狗已经替我们把这一页落到位了，别再动
+            return
         self._stack.setCurrentIndex(index)
-        new = self._stack.currentWidget()
-        if new is None:  # pragma: no cover - 理论上不可达
+        if self._stack.currentWidget() is None:  # pragma: no cover - 理论上不可达
             self._release()
             return
-        set_opacity(new, 0.0)
-        fade_in(new, FADE_IN_MS, lambda: self._run("淡入新页", lambda: self._after_in(index)))
+        cover = self._raise_cover()
+        fade_out(
+            cover,
+            FADE_IN_MS,
+            lambda: self._run("幕布淡出", lambda: self._after_in(index)),
+        )
 
     def _after_in(self, index: int) -> None:
+        self._drop_cover()
         self._release()
         self._land(index)
 

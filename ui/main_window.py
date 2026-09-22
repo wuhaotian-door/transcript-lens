@@ -36,6 +36,8 @@
 
 from __future__ import annotations
 
+import traceback
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -157,10 +159,10 @@ class MainWindow(QMainWindow):
         body.addLayout(right, 1)
 
         # --- 六个页面 ---
-        self.analysis_page = AnalysisPage()
+        self.analysis_page = AnalysisPage(self._store)
         self.profile_page = ProfilePage(self._store)
-        self.archive_page = ArchivePage()
-        self.scholarship_page = ScholarshipPage()
+        self.archive_page = ArchivePage(self._store)
+        self.scholarship_page = ScholarshipPage(self._store)
         self.settings_page = SettingsPage(self._store, self._data_root)
         self.account_page = AccountPage(self._store, self._data_root)
 
@@ -294,16 +296,38 @@ class MainWindow(QMainWindow):
         self.account_page.switch_account.connect(self.switch_account.emit)
         # 设置页导出用的数据来自智育分析页（不复制数据，只给个取值函数）
         self.settings_page.set_export_provider(self.analysis_page.export_records)
+        # ★ 导入完一个班 → 成长档案 / 奖学金两页立刻能选到它，不用切页重进
+        self.analysis_page.class_saved.connect(self._on_class_saved)
 
     # ---------------------------------------------------------------- 对外
     def set_user(self, username: str) -> None:
         """设置当前用户，并把六个页面各自的用户相关状态刷新一遍。"""
         self._username = username or ""
         self._user_label.setText(self._username or "（未登录）")
+        self.analysis_page.set_user(self._username)
         self.profile_page.set_user(self._username)
+        self.archive_page.set_user(self._username)
+        self.scholarship_page.set_user(self._username)
         self.settings_page.set_user(self._username)
         self.account_page.set_user(self._username)
         self._refresh_activation()
+
+    def _on_class_saved(self, class_name: str) -> None:
+        """刚导入了一个班 —— 让奖学金页和成长档案页立刻能看到新数据。
+
+        ★ 这里**只是刷新**，不替用户选中、也不自动跳页。
+          用户刚导完成绩，多半还想继续看智育分析。
+        ★ 刷新失败**只打日志、不弹窗**：数据已经存进去了，
+          某一页没刷新出来是显示问题，不该打断用户看成绩。
+        """
+        try:
+            self.scholarship_page.reload_classes(select=class_name)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        try:
+            self.archive_page.reload()
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
 
     def goto(self, index: int) -> None:
         """切到第 ``index`` 页（带动画）。"""

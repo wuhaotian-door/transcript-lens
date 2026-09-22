@@ -1,0 +1,41 @@
+{
+  "_comment": "奖学金测算规则模板 —— 只含字段结构与示例值。真实配置请另存为 config/rules.json（已被 .gitignore 忽略）。",
+  "_source": "docs/SGMS_v1.6_Dev_Charter.md 第 4 章（规则已定死，不许改）",
+  "version": 1,
+
+  "final_score": {
+    "_comment": "最终成绩 = 智育加权 × academic_weight + 德育分 × moral_weight",
+    "academic_weight": 0.7,
+    "moral_weight": 0.3,
+    "academic_scope": "ALL",
+    "_academic_scope_note": "口径①（含全部）。charter 4.2：智育加权来自 calculator 输出的总加权（全口径）"
+  },
+
+  "moral_score": {
+    "_comment": "德育分：0-100 整数，人工输入（辅导员/班委），支持 Excel 粘贴批量录入",
+    "min": 0,
+    "max": 100,
+    "integer_only": true
+  },
+
+  "quota": {
+    "_comment": "每个班级独立配置。默认 0 = 未配置，不分配名额",
+    "first": 0,
+    "second": 0,
+    "third": 0
+  },
+
+  "special_award": {
+    "_comment": "特等奖：最终成绩进入前 first 名 且 每门科目原始成绩 >= min_course_score",
+    "min_course_score": 90,
+    "require_rank_within_first_quota": true,
+    "counts_toward_quota": false,
+    "stackable": false,
+    "_stackable_note": "charter 4.4：默认不与其他奖项叠加；设置页可改为允许叠加"
+  },
+
+  "tie_break": {
+    "_comment": "最终成绩相同时的排序依据（依次比较，先比出来的胜）",
+    "order": ["academic", "moral", "student_id"]
+  }
+}

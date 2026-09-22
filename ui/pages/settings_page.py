@@ -17,7 +17,9 @@ from typing import Any, Callable
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -28,11 +30,15 @@ from PySide6.QtWidgets import (
 )
 
 from core.activation import load_state, try_activate
+from core.ai.local_assistant import PLACEHOLDER as LOCAL_PLACEHOLDER
 from core.crypto_store import CryptoError, CryptoStore, PAYLOAD_FILES
 from core.exporter import export_anonymized_xlsx, export_plain_xlsx
 from ui.anim import make_card
 
-__all__ = ["SettingsPage"]
+__all__ = ["AI_SETTINGS_FILE", "SettingsPage"]
+
+#: AI 设置在加密库里的文件名
+AI_SETTINGS_FILE = "ai_settings.json.enc"
 
 
 class SettingsPage(QWidget):
@@ -182,7 +188,159 @@ class SettingsPage(QWidget):
         clr.addWidget(self._clr_status)
         box.addWidget(clr_card)
 
+        box.addWidget(self._build_ai_card())
+
         box.addStretch(1)
+
+    # ---------------------------------------------------------------- AI 助手
+    def _build_ai_card(self) -> QFrame:
+        """AI 助手（charter 第 6 章：**只留开关和接口，不实现任何调用**）。
+
+        ★ 两个开关默认都是**关**的。云端那个打开时会要求填 API Key，
+          并且 Key 存进加密库（不是明文配置、不进仓库）。
+
+        ★ 这里**一个网络请求都没有**，连 import 都没有 ——
+          见 ``core/ai/cloud_adapter.py`` 顶部的说明。
+        """
+        from core.ai.cloud_adapter import DESCRIPTION as CLOUD_DESC
+        from core.ai.local_assistant import DESCRIPTION as LOCAL_DESC
+
+        card = make_card()
+        box = QVBoxLayout(card)
+        box.setContentsMargins(24, 20, 24, 20)
+        box.setSpacing(10)
+
+        title = QLabel("AI 助手")
+        title.setObjectName("H2")
+        box.addWidget(title)
+
+        note = QLabel(
+            "本地助手不联网；云端大模型仅在您主动点击「深度评估」时调用。"
+        )
+        note.setObjectName("Notice")
+        note.setWordWrap(True)
+        box.addWidget(note)
+
+        # --- 本地助手 ---
+        self._local_ai_box = QCheckBox("启用本地学习助手")
+        self._local_ai_box.setChecked(False)
+        self._local_ai_box.toggled.connect(self._on_local_ai_toggled)
+        box.addWidget(self._local_ai_box)
+
+        local_hint = QLabel(LOCAL_DESC)
+        local_hint.setObjectName("Muted")
+        local_hint.setWordWrap(True)
+        box.addWidget(local_hint)
+
+        # --- 云端助手 ---
+        self._cloud_ai_box = QCheckBox("允许辅导员手动启用云端大模型")
+        self._cloud_ai_box.setChecked(False)
+        self._cloud_ai_box.toggled.connect(self._on_cloud_ai_toggled)
+        box.addWidget(self._cloud_ai_box)
+
+        cloud_hint = QLabel(CLOUD_DESC)
+        cloud_hint.setObjectName("Muted")
+        cloud_hint.setWordWrap(True)
+        box.addWidget(cloud_hint)
+
+        key_row = QHBoxLayout()
+        self._ai_key_edit = QLineEdit()
+        self._ai_key_edit.setPlaceholderText("API Key（存加密库，不回显）")
+        # ★ 密码模式：**绝不回显**（charter 铁律 2）
+        self._ai_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._ai_key_edit.setMinimumHeight(36)
+        self._ai_key_edit.setEnabled(False)
+        self._ai_key_edit.setMinimumWidth(280)
+        key_row.addWidget(self._ai_key_edit, 1)
+
+        self._ai_save_btn = QPushButton("保存 AI 设置")
+        self._ai_save_btn.setObjectName("Ghost")
+        self._ai_save_btn.setMinimumHeight(36)
+        self._ai_save_btn.setEnabled(False)
+        self._ai_save_btn.clicked.connect(self._do_save_ai)
+        key_row.addWidget(self._ai_save_btn)
+        box.addLayout(key_row)
+
+        self._ai_status = QLabel("")
+        self._ai_status.setObjectName("Muted")
+        self._ai_status.setWordWrap(True)
+        box.addWidget(self._ai_status)
+        return card
+
+    def _on_local_ai_toggled(self, checked: bool) -> None:
+        self._ai_save_btn.setEnabled(True)
+        self._ai_status.setText(
+            "本地学习助手已打开 —— 但本版本还没接模型，点「评估」只会显示"
+            f"「{LOCAL_PLACEHOLDER}」。" if checked
+            else "本地学习助手已关闭。"
+        )
+
+    def _on_cloud_ai_toggled(self, checked: bool) -> None:
+        self._ai_key_edit.setEnabled(checked)
+        self._ai_save_btn.setEnabled(True)
+        if checked:
+            self._ai_key_edit.setFocus()
+            self._ai_status.setText(
+                "请填入 API Key 并保存。云端**只会在您点「深度评估」时**被调用，"
+                "而且传出去的只有 S 编号 / 均分 / 学分 / 分数区间 / 意愿标签，"
+                "不含姓名和学号。"
+            )
+        else:
+            self._ai_status.setText("云端大模型已关闭。")
+
+    def _do_save_ai(self) -> None:
+        """把 AI 开关（和 Key）存进加密库。**Key 绝不写日志、绝不回显。**"""
+        cloud_on = self._cloud_ai_box.isChecked()
+        key = self._ai_key_edit.text().strip()
+        if cloud_on and not key:
+            QMessageBox.warning(self, "还差 API Key",
+                                "启用云端大模型需要填 API Key。")
+            self._ai_key_edit.setFocus()
+            return
+        payload: dict[str, Any] = {
+            "local_enabled": self._local_ai_box.isChecked(),
+            "cloud_enabled": cloud_on,
+        }
+        if key:
+            payload["api_key"] = key
+        elif not cloud_on:
+            payload["api_key"] = ""
+
+        try:
+            self._save_ai_payload(payload)
+        except Exception as exc:  # noqa: BLE001 - 存不上要说清楚
+            QMessageBox.critical(self, "保存失败", f"{type(exc).__name__}: {exc}")
+            return
+
+        self._ai_key_edit.clear()
+        self._ai_save_btn.setEnabled(False)
+        self._ai_status.setText(
+            "AI 设置已保存到加密库。"
+            + ("（云端已启用，Key 已存）" if cloud_on else "（云端未启用）")
+        )
+        QMessageBox.information(
+            self, "已保存",
+            "AI 设置已加密存盘。\n\n"
+            "提醒：本版本只预留接口，点「深度评估」只会显示占位提示，"
+            "不会发起任何请求。",
+        )
+
+    def _save_ai_payload(self, payload: dict[str, Any]) -> None:
+        from core.crypto_store import CryptoError
+        from core.user_store import save_user_json
+
+        if not self._username:
+            raise CryptoError("还没登录，AI 设置没地方存")
+        save_user_json(self._store, self._username, AI_SETTINGS_FILE, payload)
+
+    def load_ai_settings(self) -> dict[str, Any]:
+        """读回 AI 设置（自检/其它页面用）。Key **不参与任何显示**。"""
+        from core.user_store import load_user_json
+
+        if not self._username:
+            return {}
+        data = load_user_json(self._store, self._username, AI_SETTINGS_FILE, {})
+        return data if isinstance(data, dict) else {}
 
     # ---------------------------------------------------------------- 激活
     def _refresh_activation(self) -> None:

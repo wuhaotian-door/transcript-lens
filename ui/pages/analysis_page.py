@@ -62,7 +62,9 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QTableWidget,
@@ -73,6 +75,9 @@ from PySide6.QtWidgets import (
 
 from core.archival import archive_key, build_archive
 from core.calculator import CalculationScope, calculate_many
+from core.crypto_store import CryptoError, CryptoStore
+from core.scholarship import ClassRecord, save_class, validate_class_name
+from core.user_store import save_user_json
 from core.validator import describe_alerts, parse_and_validate
 from ui.flags import LEVEL_DANGER, LEVEL_WARNING, build_flags_by_index
 from ui.intentions import student_key
@@ -170,6 +175,9 @@ _ROW_BUTTON_HEIGHT = 28
 #: **不猜** —— 猜错会让纵向档案的排序和趋势全乱。
 DEFAULT_TERM = "未标注"
 
+#: 纵向归档在加密库里的文件名（成长档案页读它）
+ARCHIVE_FILE = "archive.json.enc"
+
 #: 红标单元格的文字颜色（红标原因那一列现在真的是红的）
 _DANGER_COLOR = "#DC2626"
 _WARNING_COLOR = "#B45309"
@@ -232,9 +240,14 @@ class AnalysisPage(QWidget):
 
     student_selected = Signal(dict)
     roster_changed = Signal(list)
+    #: 导入成功并**把这一班存进加密库**之后发出（奖学金页靠它刷新班级下拉）
+    class_saved = Signal(str)
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, store: CryptoStore | None = None,
+                 parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._store = store if store is not None else CryptoStore()
+        self._username = ""
         #: 页面状态。（这一页是有状态的：表格、结果、红标都挂在这里）
         self._parsed: Any = None
         self._rows: list[TableRow] = []
@@ -261,6 +274,22 @@ class AnalysisPage(QWidget):
         self._import_btn.setMinimumWidth(170)
         self._import_btn.clicked.connect(self._do_import)
         head.addWidget(self._import_btn)
+
+        # --- 班级号（charter 4.1：导入必须人工输入班级号）---
+        head.addSpacing(6)
+        class_caption = QLabel("班级号")
+        class_caption.setObjectName("H3")
+        head.addWidget(class_caption)
+        self._class_edit = QLineEdit()
+        self._class_edit.setPlaceholderText("如 CS2023-1")
+        self._class_edit.setMinimumHeight(38)
+        self._class_edit.setMinimumWidth(150)
+        self._class_edit.setMaxLength(32)
+        self._class_edit.setToolTip(
+            "字母、数字、短横线。奖学金测算按班级号分班存成绩。\n"
+            "导入时没填会弹窗问你要。"
+        )
+        head.addWidget(self._class_edit)
         head.addStretch(1)
 
         # --- 口径筛选：三个 Toggle，互斥，默认「必修+限选」---
@@ -327,6 +356,23 @@ class AnalysisPage(QWidget):
         label.setObjectName("H3")
         return label
 
+    # ---------------------------------------------------------------- 外部
+    def set_user(self, username: str) -> None:
+        """切账户时调用。班级是**按用户**存的，所以换人要换班级号输入框。"""
+        self._username = username or ""
+
+    @property
+    def store(self) -> CryptoStore:
+        return self._store
+
+    @property
+    def class_name(self) -> str:
+        """当前输入框里的班级号（自检/奖学金页用）。"""
+        return self._class_edit.text().strip()
+
+    def set_class_name(self, name: str) -> None:
+        self._class_edit.setText(name or "")
+
     # ---------------------------------------------------------------- 口径筛选
     def _set_scope(self, scope: CalculationScope) -> None:
         """切换口径筛选：口径列显隐 + 红标跟着重算。"""
@@ -360,6 +406,86 @@ class AnalysisPage(QWidget):
         return self._scope
 
     # ---------------------------------------------------------------- 导入
+    def _require_class_name(self) -> str | None:
+        """拿到班级号（charter 4.1：导入**必须**有人工输入的班级号）。
+
+        顺序：先用输入框里的；空的就弹窗问；还不行就报错返回 ``None``，
+        调用方**中止导入**（绝不拿一个空班级号去存 —— 那会让奖学金页
+        出现一个点进去没内容的班）。
+
+        Returns:
+            校验通过的班级号，或 ``None``（用户取消 / 填得不合法）。
+        """
+        typed = self._class_edit.text().strip()
+        if typed:
+            try:
+                value = validate_class_name(typed)
+            except ValueError as exc:
+                QMessageBox.warning(self, "班级号不合法", str(exc))
+                self._class_edit.setFocus()
+                return None
+            self._class_edit.setText(value)
+            return value
+
+        value, ok = QInputDialog.getText(
+            self,
+            "这份成绩属于哪个班",
+            "班级号（字母、数字、短横线）：",
+            QLineEdit.EchoMode.Normal,
+            "",
+        )
+        if not ok:
+            self._set_status("已取消：没有班级号，本次未导入。", warn=True)
+            return None
+        try:
+            name = validate_class_name(value)
+        except ValueError as exc:
+            QMessageBox.warning(self, "班级号不合法", str(exc))
+            return None
+        self._class_edit.setText(name)
+        return name
+
+    def _build_class_record(self, class_name: str, source: str) -> Any:
+        """把刚算完的结果整理成一个班级快照（给奖学金测算用）。
+
+        ★ 存的是**算好的数**（口径①的加权均分）+ 每门课的分数，
+          奖学金页以后测算时**不需要重新解析 Excel** ——
+          也就不会出现"两次解析结果不一致"。
+        ★ 每门课的分数要留着：特等奖的「每门 ≥90」得逐门看（charter 4.4）。
+        """
+        students: list[dict[str, Any]] = []
+        for row in self._rows:
+            result = self._result_at(CalculationScope.ALL, row.index)
+            if result is None:
+                continue
+            courses: list[dict[str, Any]] = []
+            for course in getattr(result, "course_scores", ()) or ():
+                courses.append(
+                    {
+                        "name": getattr(course, "name", ""),
+                        # ★ score 可能是 None（没选这门课）—— 原样存，
+                        #   奖学金那边靠 None 区分"没考"和"考了 0 分"（红线 2）
+                        "score": getattr(course, "score", None),
+                        "credit": getattr(course, "credit", None),
+                    }
+                )
+            students.append(
+                {
+                    "student": row.student,
+                    "student_id": row.student_id,
+                    "key": row.key,
+                    "academic": result.weighted_average,
+                    "total_credit": result.total_credit,
+                    "courses": courses,
+                }
+            )
+        return ClassRecord(
+            class_name=class_name,
+            source=source,
+            term=DEFAULT_TERM,
+            students=students,
+        )
+
     def _do_import(self) -> None:
         path, _filter = QFileDialog.getOpenFileName(
             self,
@@ -408,6 +534,13 @@ class AnalysisPage(QWidget):
             self._set_status("解析失败：没有课程列。", error=True)
             return
 
+        # ★ charter 4.1：导入**必须**有人工确认的班级号。
+        #   位置就在"选完文件之后、确认课程弹窗之前"（用户要求的次序）——
+        #   这样用户是在"刚选完那份表"的上下文里回答"这是哪个班"的。
+        class_name = self._require_class_name()
+        if class_name is None:
+            return
+
         # ★ 红线 3：强制人工回显确认。没确认就绝不进入计算。
         confirmed = confirm_courses(
             self,
@@ -440,6 +573,10 @@ class AnalysisPage(QWidget):
             )
         except Exception:  # noqa: BLE001 - 归档失败不该拦住看数字
             self._archive = None
+        else:
+            # ★ 顺手把归档写进加密库 —— 否则"成长档案"页一关程序就空了。
+            #   存不上不影响本页显示（成绩已经算完了）。
+            self._save_archive()
 
         self._parsed = parsed
         self._results = results
@@ -457,8 +594,50 @@ class AnalysisPage(QWidget):
         self._refresh_flags()
         self._fill_table()
         self._update_status()
+        # ★ 把这一班存进加密库（奖学金测算按班级取成绩）。
+        #   存不上**不拦界面** —— 成绩已经算完并显示了，存班级只是顺带的事；
+        #   真失败会在状态行里明说，不静默。
+        self._save_class(class_name, self._source)
         # 把名单推给侧写辅导页（它靠这个建左侧列表）
         self.roster_changed.emit(self.roster())
+
+    def _save_archive(self) -> None:
+        """把纵向归档写进加密库（成长档案页靠它跨重启存活）。
+
+        ★ 归档是**便利数据**：存不上不弹窗、不中断，只在状态行里说一声。
+          成绩本身已经在屏幕上了，用户不该因为归档写不进去而看不到数字。
+        """
+        if self._archive is None or not self._username:
+            return
+        try:
+            payload = self._archive.as_dict()
+        except Exception:  # noqa: BLE001
+            return
+        try:
+            save_user_json(self._store, self._username, ARCHIVE_FILE, payload)
+        except (CryptoError, ValueError, OSError) as exc:
+            self._note_class_failure(f"归档没能存进加密库（{type(exc).__name__}）")
+
+    def _save_class(self, class_name: str, source: str) -> None:
+        """把本班成绩快照写进加密库，并广播 ``class_saved``。"""
+        if not self._username:
+            self._note_class_failure("还没登录，班级数据没地方存")
+            return
+        try:
+            record = self._build_class_record(class_name, source)
+            save_class(self._store, self._username, record)
+        except (CryptoError, ValueError, OSError) as exc:
+            self._note_class_failure(f"{type(exc).__name__}: {exc}")
+            return
+        self.class_saved.emit(class_name)
+
+    def _note_class_failure(self, reason: str) -> None:
+        """班级存不上时，把原因追加到状态行（**不弹窗打断**）。"""
+        self._status.setText(
+            self._status.text()
+            + f"\n⚠ 班级成绩没能存进加密库（{reason}）—— "
+            "奖学金测算那一页会看不到这个班。"
+        )
 
     def _refresh_flags(self) -> None:
         """为核心口径算红标。**按行序**返回，同名也不会串。"""

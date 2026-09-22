@@ -88,7 +88,22 @@ from ui.intentions import (
     student_key,
 )
 
-__all__ = ["LIST_WIDTH", "ProfilePage", "RESCUE_TARGET"]
+__all__ = [
+    "ITEM_HEIGHT",
+    "LIST_WIDTH",
+    "RESCUE_TARGET",
+    "StudentItemDelegate",
+    "ProfilePage",
+    # 下面这几个是给成长档案页复用的（同一个"学生名单"长相同一份实现，
+    # 不复制第二遍 —— 复制出来的那份迟早会和这份长得不一样）
+    "_ROLE_HAS_ID",
+    "_ROLE_ID",
+    "_ROLE_INDEX",
+    "_ROLE_LEVEL",
+    "_ROLE_NAME",
+    "_ROLE_SEED",
+    "_avatar_color",
+]
 
 #: "提一提"的目标分（Spec 六：附一句"提至85可+0.X"）
 RESCUE_TARGET = 85.0
