@@ -24,6 +24,7 @@ __all__ = [
     "FlagRules",
     "StudentFlag",
     "build_flags",
+    "build_flags_by_index",
 ]
 
 #: 分数及格线。低于它 = 挂科（只影响"标不标红"，不影响加权算法）
@@ -89,6 +90,33 @@ class StudentFlag:
         return ""
 
 
+def build_flags_by_index(
+    results: Sequence[CalculationResult],
+    *,
+    rules: FlagRules = DEFAULT_RULES,
+    invalid_rows: Sequence[Any] = (),
+    anchor_exceeded: Sequence[Any] = (),
+) -> list[StudentFlag]:
+    """和 :func:`build_flags` 判据一模一样，但**按行序返回列表**。
+
+    ★ 为什么需要它：:func:`build_flags` 返回的是 ``{学生名: StudentFlag}``。
+    同名学生（历届都有）会**互相覆盖** —— 两个人只留下一个 flag，
+    表格里两行拿到的是同一份预警。列表没有这个问题：第 i 个 flag
+    一定对应第 i 行。
+
+    界面上"这一行是谁"由行序决定，所以用列表；需要按名字查的地方
+    （老代码、导出）继续用 :func:`build_flags`。
+    """
+    invalid_names = {getattr(row, "student", "") for row in invalid_rows}
+    anchor_names = {getattr(check, "student", "") for check in anchor_exceeded}
+    return [
+        _flag_for(
+            result, rules=rules, invalid_names=invalid_names, anchor_names=anchor_names
+        )
+        for result in results
+    ]
+
+
 def build_flags(
     results: Sequence[CalculationResult],
     *,
@@ -98,73 +126,89 @@ def build_flags(
 ) -> dict[str, StudentFlag]:
     """按 :class:`FlagRules` 给每个学生算预警，返回 ``学生名 → StudentFlag``。
 
+    ⚠ 这个返回值的键是**姓名**。同名学生只留得下一个，要用在逐行显示的
+    地方请改用 :func:`build_flags_by_index`。
+
     Args:
         results: 某口径下的整班计算结果。
         invalid_rows: ``parse_result.invalid_rows``（行本身非法，不参与计算）。
         anchor_exceeded: ``anchor_report.exceeded``（锚点超标行）。
     """
-    invalid_names = {getattr(row, "student", "") for row in invalid_rows}
-    anchor_names = {getattr(check, "student", "") for check in anchor_exceeded}
+    return {
+        flag.student: flag
+        for flag in build_flags_by_index(
+            results,
+            rules=rules,
+            invalid_rows=invalid_rows,
+            anchor_exceeded=anchor_exceeded,
+        )
+    }
 
-    flags: dict[str, StudentFlag] = {}
-    for result in results:
-        flag = StudentFlag(student=result.student)
 
-        failed = [
-            course.name
-            for course in result.course_scores
-            if course.counted and course.score is not None
-            and 0 < course.score < rules.pass_score
-        ]
-        absent = [
-            course.name
-            for course in result.course_scores
-            if course.counted and course.score == 0
-        ]
-        pending = [
-            course.name
-            for course in result.course_scores
-            if course.category.value == "unknown"
-            or any("人工确认" in warning for warning in course.warnings)
-        ]
+def _flag_for(
+    result: CalculationResult,
+    *,
+    rules: FlagRules,
+    invalid_names: set[str],
+    anchor_names: set[str],
+) -> StudentFlag:
+    """单个学生的预警判定（两级：红 = 必须当场处理；黄 = 先核对再谈）。"""
+    flag = StudentFlag(student=result.student)
 
-        if rules.fail and failed:
-            flag.failed_courses = failed
-            flag.reasons.append(f"挂科 {len(failed)} 门：{'、'.join(failed)}")
-        if rules.absent and absent:
-            flag.absent_courses = absent
-            flag.reasons.append(f"缺考 {len(absent)} 门：{'、'.join(absent)}")
+    failed = [
+        course.name
+        for course in result.course_scores
+        if course.counted and course.score is not None
+        and 0 < course.score < rules.pass_score
+    ]
+    absent = [
+        course.name
+        for course in result.course_scores
+        if course.counted and course.score == 0
+    ]
+    pending = [
+        course.name
+        for course in result.course_scores
+        if course.category.value == "unknown"
+        or any("人工确认" in warning for warning in course.warnings)
+    ]
 
-        data_problems: list[str] = []
-        if result.student in invalid_names:
-            data_problems.append("所在行未通过校验")
-        if result.student in anchor_names:
-            data_problems.append("「所得学分」锚点对不上")
-        if data_problems:
-            flag.data_problem = "；".join(data_problems)
+    if rules.fail and failed:
+        flag.failed_courses = failed
+        flag.reasons.append(f"挂科 {len(failed)} 门：{'、'.join(failed)}")
+    if rules.absent and absent:
+        flag.absent_courses = absent
+        flag.reasons.append(f"缺考 {len(absent)} 门：{'、'.join(absent)}")
 
-        if flag.failed_courses or flag.absent_courses or (rules.bad_data and data_problems):
-            flag.level = LEVEL_DANGER
-        else:
-            if rules.needs_review and pending:
-                flag.reviewed_courses = pending
-                flag.reasons.append(f"待人工确认 {len(pending)} 门：{'、'.join(pending)}")
-            if rules.invalid_score and result.invalid_scores:
-                flag.invalid_courses = list(result.invalid_scores)
-                flag.reasons.append(f"分数异常被排除：{'、'.join(result.invalid_scores)}")
-            average = result.weighted_average
-            if (
-                rules.average_below > 0
-                and average is not None
-                and average < rules.average_below
-            ):
-                flag.reasons.append(f"均分低于 {rules.average_below:g}")
-            if flag.reasons:
-                flag.level = LEVEL_WARNING
+    data_problems: list[str] = []
+    if result.student in invalid_names:
+        data_problems.append("所在行未通过校验")
+    if result.student in anchor_names:
+        data_problems.append("「所得学分」锚点对不上")
+    if data_problems:
+        flag.data_problem = "；".join(data_problems)
 
-        # 数据问题说明放最后，便于用户先看学业问题
-        if flag.data_problem:
-            flag.reasons.append(f"数据问题：{flag.data_problem}")
+    if flag.failed_courses or flag.absent_courses or (rules.bad_data and data_problems):
+        flag.level = LEVEL_DANGER
+    else:
+        if rules.needs_review and pending:
+            flag.reviewed_courses = pending
+            flag.reasons.append(f"待人工确认 {len(pending)} 门：{'、'.join(pending)}")
+        if rules.invalid_score and result.invalid_scores:
+            flag.invalid_courses = list(result.invalid_scores)
+            flag.reasons.append(f"分数异常被排除：{'、'.join(result.invalid_scores)}")
+        average = result.weighted_average
+        if (
+            rules.average_below > 0
+            and average is not None
+            and average < rules.average_below
+        ):
+            flag.reasons.append(f"均分低于 {rules.average_below:g}")
+        if flag.reasons:
+            flag.level = LEVEL_WARNING
 
-        flags[result.student] = flag
-    return flags
+    # 数据问题说明放最后，便于用户先看学业问题
+    if flag.data_problem:
+        flag.reasons.append(f"数据问题：{flag.data_problem}")
+
+    return flag

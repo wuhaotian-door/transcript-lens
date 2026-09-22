@@ -52,6 +52,14 @@ $ErrorActionPreference = 'Stop'
 $OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
+# ★ 还得让**子进程**也说 UTF-8。
+#   `[Console]::OutputEncoding` 只管 PowerShell 自己这一侧的编码；被管道接住的
+#   python 会去猜 stdout 的编码，猜到的往往是系统 ANSI（本机 GBK）——
+#   于是它写 UTF-8 的字节、我们按 UTF-8 解，中文全变乱码
+#   （打包日志里那段"源码自检"就是这么糊掉的，而报告文件本身是好的）。
+$env:PYTHONIOENCODING = 'utf-8'
+$env:PYTHONUTF8 = '1'
+
 $Root = $PSScriptRoot
 Set-Location $Root
 
@@ -319,6 +327,44 @@ function Build-One {
         }
         if ($code -ne 0) { throw "exe 自检失败（退出码 $code），看上面的报告" }
         Write-Host "exe 自检通过" -ForegroundColor Green
+
+        # --- ★ 真实启动流程自检 ---
+        #
+        # --selfcheck 是**无窗口**的：它把数据链路跑通了，但一行 GUI 代码都没碰。
+        # 而 --windowed 的 exe 没有 stdout/stderr —— 界面代码一旦在启动路径上
+        # 崩掉（不是 Python 异常，是 0xC0000409 那种直接把进程抹掉），
+        # 用户看到的就是"打完招呼就没反应了"，开发者这边一个字都拿不到。
+        #
+        # 踩过一次：欢迎页淡出 → 销毁窗口 → 动画被一起销毁 → Qt 发完 finished
+        # 还在用那个动画对象 → 进程消失。**当时 400 多项测试全绿、源码自检全绿、
+        # 两个 exe 都"自检通过"** —— 因为它栽在一条从来没被跑过的路径上。
+        Write-Host "=== 打包后：$name.exe --bootcheck（真实启动流程）===" -ForegroundColor Cyan
+        $bootReport = Join-Path ([System.IO.Path]::GetTempPath()) 'transcript-lens-bootcheck.txt'
+        Remove-Item $bootReport -Force -ErrorAction SilentlyContinue
+        $boot = Start-Process -FilePath $exe -ArgumentList '--bootcheck' -PassThru
+        $bootDone = $true
+        try { Wait-Process -Id $boot.Id -Timeout 180 -ErrorAction Stop }
+        catch { $bootDone = $false }
+
+        if (-not $bootDone) {
+            Stop-Process -Id $boot.Id -Force -ErrorAction SilentlyContinue
+            Get-Process $name -ErrorAction SilentlyContinue |
+                Stop-Process -Force -ErrorAction SilentlyContinue
+            throw "exe --bootcheck 超时 180s（启动流程卡住了）"
+        }
+        $boot.Refresh()
+        if (Test-Path $bootReport) {
+            Write-Host "--- exe 启动流程报告 ---"
+            Get-Content $bootReport -Encoding UTF8 | ForEach-Object { Write-Host $_ }
+        }
+        else {
+            Write-Host "!! 没找到启动流程报告 $bootReport" -ForegroundColor Red
+        }
+        # ★ 退出码是关键：崩溃（0xC0000409）会是一个很大的负数
+        if ($boot.ExitCode -ne 0) {
+            throw "exe --bootcheck 失败（退出码 $($boot.ExitCode)）—— 启动流程有问题，看上面的报告"
+        }
+        Write-Host "exe 启动流程自检通过" -ForegroundColor Green
     }
 
     return $exe

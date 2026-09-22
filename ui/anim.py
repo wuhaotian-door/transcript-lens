@@ -67,20 +67,61 @@ FADE_OUT_MS = 180
 SHADOW_BLUR = 18
 SHADOW_OFFSET = 2
 
-#: 切页锁的最长持有时间。超过就强制放开 —— 界面绝不能被一次转场卡死。
-#: 正常一次切换约 455ms（淡出 180 + 淡入 240 + Qt 调度），1500ms 有三倍余量。
-LOCK_TIMEOUT_MS = 1500
+#: 切页锁的最长持有时间。超过就把这一页**直接落到位**（见 :meth:`StackSwitcher._force_finish`）。
+#:
+#: 实测：一次切换中位 ~520ms（淡出 180 + 淡入 240 + Qt 调度 + 无边框窗口的
+#: 半透明合成），最慢 ~600ms。机器忙的时候（首次绘制一个重页面、Defender 扫盘）
+#: 见过一次 1513ms。所以 1500ms 太紧 —— 会去砍一次**本来会正常结束**的动画。
+#: 2500ms 只在真的卡住时才会到。
+LOCK_TIMEOUT_MS = 2500
 
 #: 正在跑的动画，按 widget 持有 —— 见模块开头第 1 条
 _KEEP: dict[int, list[QPropertyAnimation]] = {}
 
 
+def is_alive(obj: object) -> bool:
+    """这个 PySide 包装对象背后的 C++ 对象还在不在。
+
+    ★★ 为什么必须有它 ★★
+
+    动画的 parent 就是它作用的那个 widget（``QPropertyAnimation(target,
+    b"...", widget)``）。**widget 被销毁时动画跟着一起没**，而 Qt 的信号发射
+    并不会因此停下 —— 连接表是引用计数的，发送者死了它照样把剩下的槽逐个调完。
+
+    于是"排在后面的槽碰到一个已经释放的包装对象"就成立，**表现是整个进程
+    直接消失（``0xC0000409``），stdout/stderr 一个字都不打** —— 打包成
+    ``--windowed`` 的 exe 之后，用户看到的就是"打完招呼就没了，点任务栏也没反应"。
+
+    实测：登录成功 → 欢迎页淡出 → ``finished`` 里把欢迎页引用丢掉 →
+    欢迎页当场析构 → 紧接着 ``_drop`` 碰了一下已经没了的动画 → 进程消失。
+    """
+    try:
+        import shiboken6
+
+        return bool(shiboken6.isValid(obj))
+    except Exception:  # noqa: BLE001 - 查不了就当它还活着，别把正常路径拦死
+        return True
+
+
 def _retain(widget: QWidget, anim: QPropertyAnimation) -> None:
+    """保住动画对象，并在跑完之后把它摘干净。
+
+    ★ **连接顺序是命门**：``_drop`` 必须是 ``finished`` 上的**第一个**槽。
+
+    ``on_done`` 回调里常常会把触发动画的那个窗口丢掉（欢迎页淡出 → 起主窗、
+    登录窗淡出 → 起主窗），窗口一析构，parent 在它上面的动画也就没了。
+    要是 ``_drop`` 排在 ``on_done`` **后面**，它就会在一个已经释放的对象上
+    调 ``deleteLater()`` —— 直接段错误，而且什么都不打印。
+    """
     key = id(widget)
     _KEEP.setdefault(key, []).append(anim)
 
     def _drop() -> None:
         bucket = _KEEP.get(key)
+        if bucket is not None and not is_alive(anim):
+            # 动画已经跟着它的 parent 一起没了，直接清账，绝不碰它
+            _KEEP.pop(key, None)
+            return
         if bucket and anim in bucket:
             bucket.remove(anim)
         if bucket is not None and not bucket:
@@ -107,7 +148,12 @@ def clear_effect(widget: QWidget) -> None:
     所以动画一结束就把效果摘掉：页面回到"没有 effect"的普通状态，
     之后无论内部怎么改控件都能正常重绘。下次要淡入时
     :func:`effect_of` 会重新挂一个新的。
+
+    控件已经销毁时**直接返回**：这个函数在 ``deleteLater`` 路径上会被延后调用，
+    那一刻控件可能已经没了（见 :func:`is_alive`）。
     """
+    if not is_alive(widget):
+        return
     if isinstance(widget.graphicsEffect(), QGraphicsOpacityEffect):
         widget.setGraphicsEffect(None)
 
@@ -118,7 +164,7 @@ def _schedule_clear(widget: QWidget) -> None:
     不在 ``finished`` 里直接摘：那一刻动画对象还活着（虽然已经停了），
     而摘效果会把它指向的对象删掉。等一拍，让 ``deleteLater`` 先落地。
     """
-    QTimer.singleShot(0, lambda: clear_effect(widget))
+    QTimer.singleShot(0, lambda: clear_effect(widget) if is_alive(widget) else None)
 
 
 def apply_shadow(
@@ -186,8 +232,11 @@ def fade_in(widget: QWidget, ms: int = FADE_IN_MS, on_done: Callable[[], None] |
             on_done()
         _schedule_clear(widget)
 
-    anim.finished.connect(_finish)
+    # ★ _retain 必须在 connect(_finish) **之前**：它连的 _drop 要当
+    #   finished 上的第一个槽，否则 on_done 里销毁了 widget 之后，
+    #   _drop 会去碰一个已经释放的动画对象（见 _retain / is_alive）。
     _retain(widget, anim)
+    anim.finished.connect(_finish)
     anim.start(QAbstractAnimation.DeletionPolicy.KeepWhenStopped)
 
 
@@ -213,8 +262,8 @@ def fade_out(
             on_done()
         _schedule_clear(widget)
 
-    anim.finished.connect(_finish)
     _retain(widget, anim)
+    anim.finished.connect(_finish)
     anim.start(QAbstractAnimation.DeletionPolicy.KeepWhenStopped)
 
 
@@ -234,8 +283,8 @@ class StackSwitcher(QObject):
        而且它是间歇性的、跑十次只出一次。所以这里有三道保险：
 
     1. **try/finally**：起动画时抛异常也一定把锁放开；
-    2. **看门狗**：锁持有超过 :data:`LOCK_TIMEOUT_MS` 就强制作废并放开 ——
-       宁可少一次淡入淡出，也绝不能让界面变成点不动的；
+    2. **看门狗**：锁持有超过 :data:`LOCK_TIMEOUT_MS` 就**把这一页直接落到位**
+       （不是只放锁）—— 宁可少一次淡入淡出，也绝不能让界面变成点不动的；
     3. **异常不吞**：回调里出错会打 traceback 到 stderr，不静默。
     """
 
@@ -243,12 +292,14 @@ class StackSwitcher(QObject):
         super().__init__(parent)
         self._stack = stack
         self._busy = False
+        #: 这一趟要切到哪一页。看门狗靠它把转场直接做完。
+        self._pending: int | None = None
         #: 切换完成后回调（主窗口用来同步侧栏选中态）
         self._on_switched: Callable[[int], None] | None = None
         #: 看门狗：锁忘了放开时兜底
         self._watchdog = QTimer(self)
         self._watchdog.setSingleShot(True)
-        self._watchdog.timeout.connect(self._force_release)
+        self._watchdog.timeout.connect(self._force_finish)
 
     @property
     def busy(self) -> bool:
@@ -269,25 +320,52 @@ class StackSwitcher(QObject):
     def _release(self) -> None:
         self._watchdog.stop()
         self._busy = False
+        self._pending = None
 
-    def _force_release(self) -> None:
-        """看门狗到点：无论卡在哪一步，都把锁放开，让界面重新能用。"""
-        if self._busy:
-            print(
-                "[StackSwitcher] 切页锁超时未释放，已强制放开 —— "
-                "界面可以继续用，但这一次的淡入淡出可能不完整。",
-                file=sys.stderr,
-            )
+    def _force_finish(self) -> None:
+        """看门狗到点：把这一次转场直接做完。"""
+        self._finish_now("切页超时未完成")
+
+    def _finish_now(self, reason: str) -> None:
+        """**把这一次转场直接做完**，而不是只把锁放开。
+
+        ★ 只放锁的写法（``self._busy = False``）留下两个真实的坑：
+
+        1. 正在跑的动画**还在继续**。用户这时再点侧栏，两段动画会同时改
+           同一个 opacity —— 正是 ``_busy`` 本来要防的闪黑；
+        2. 界面会停在一个**自相矛盾**的状态：侧栏亮着 A，内容还是 B，
+           而且永远不会自愈（把锁放开不等于把页切过去）。
+
+        所以这里干脆把 index 落到位、把残留的透明度效果摘干净、再放开锁。
+        宁可这一次没有淡入淡出，也不要一个会说谎、点不动的界面。
+        """
+        index = self._pending
+        self._watchdog.stop()
+        if not self._busy:  # pragma: no cover - _release 已经停了定时器
+            return
+        print(
+            f"[StackSwitcher] {reason}，已直接把这一页落到位"
+            f"（跳过剩余动画，index={index}）。",
+            file=sys.stderr,
+        )
         self._busy = False
+        self._pending = None
+        if index is None:  # pragma: no cover - 有 _busy 就一定有 _pending
+            return
+        self._stack.setCurrentIndex(index)
+        # 动画半路被打断，透明度效果可能还挂在某一页上 —— 全部摘掉，
+        # 否则下次页面内部增删控件时会撞上"缓存 pixmap 不失效 → 整页空白"。
+        for i in range(self._stack.count()):
+            clear_effect(self._stack.widget(i))
+        self._land(index)
 
     def _run(self, what: str, fn: Callable[[], None]) -> None:
-        """跑一步转场；出错就打 traceback 并放开锁，绝不静默卡死。"""
+        """跑一步转场；出错就打 traceback 并把这一页落到位，绝不静默卡死。"""
         try:
             fn()
         except BaseException:  # noqa: BLE001 - 转场失败不能让界面卡死
             traceback.print_exc()
-            print(f"[StackSwitcher] 转场步骤「{what}」失败，已放开锁。", file=sys.stderr)
-            self._release()
+            self._finish_now(f"转场步骤「{what}」失败")
 
     # ------------------------------------------------------------------ 切换
     def switch(self, index: int, *, animate: bool = True) -> bool:
@@ -306,6 +384,8 @@ class StackSwitcher(QObject):
             self._land(index)
             return True
 
+        # ★ 先记下"要切到哪一页"：看门狗和异常兜底都靠它把转场做完。
+        self._pending = index
         self._acquire()
         try:
             fade_out(old, FADE_OUT_MS, lambda: self._run("淡出旧页", lambda: self._after_out(index)))
@@ -364,7 +444,36 @@ def window_fade(
     ms: int,
     on_done: Callable[[], None] | None = None,
 ) -> None:
-    """改 ``windowOpacity`` 做窗口级淡入淡出。"""
+    """改 ``windowOpacity`` 做窗口级淡入淡出。
+
+    ★★ **连接顺序是这一个函数的命门，改动前先读这段** ★★
+
+    ``_retain`` 必须**先调**，``anim.finished.connect(...)`` 必须**后接**。
+    因为 ``_retain`` 连进去的 ``_drop`` 要当第一个槽：
+
+    ``on_done`` 的典型工作就是"这个窗口没用了，起下一个" ——
+    欢迎页淡出 → ``AppFlow._after_welcome`` 把欢迎页引用丢掉 → 窗口当场析构。
+    而动画的 parent 就是这个窗口，**窗口一没动画也跟着没**。
+    要是 ``_drop`` 排在 ``on_done`` 后面，Qt 走完 ``on_done`` 接着就会在
+    一个已经释放的对象上调 ``deleteLater()``：
+
+        **整个进程 0xC0000409 直接消失，stdout/stderr 一个字都不打。**
+
+    打包成 ``--windowed`` 的 exe 之后，用户看到的就是
+    「开屏 → 打个招呼 → 没了，点任务栏也没反应」。
+    实测复现并靠逐层 trace 定位到这一行（见 `%TEMP%\\tl_boot_trace.py`）。
+
+    ⚠️ **光把 `_drop` 排到前面还不够**（试过，照样崩）：Qt 发完 ``finished``
+    之后 ``QAbstractAnimationPrivate::setState`` **还要继续用这个动画对象**
+    （注销统一计时器、按 deleteWhenStopped 决定删不删）。窗口一析构、
+    parent 在它上面的动画跟着没，栈上那句话就踩空了。
+
+    所以 ``on_done`` 一律**延后一拍**再调：等这一轮事件循环走完，
+    动画彻底收工，谁来销毁窗口都安全。
+
+    ★ 用 ``QTimer.singleShot(0, window, on_done)`` 的 **context 重载**：
+    窗口先一步没了的话，这一次回调会被自动跳过，不会去碰一个死对象。
+    """
     window.setWindowOpacity(start)
     anim = QPropertyAnimation(window, b"windowOpacity", window)
     anim.setDuration(ms)
@@ -373,9 +482,12 @@ def window_fade(
     anim.setEasingCurve(
         QEasingCurve.Type.OutCubic if end > start else QEasingCurve.Type.InCubic
     )
-    if on_done is not None:
-        anim.finished.connect(lambda: on_done())
+    # ★ _retain 必须在 connect 之前 —— 它连的 _drop 要当 finished 上的第一个槽
     _retain(window, anim)
+    if on_done is not None:
+        anim.finished.connect(
+            lambda: QTimer.singleShot(0, window, on_done)
+        )
     anim.start(QAbstractAnimation.DeletionPolicy.KeepWhenStopped)
 
 

@@ -1,6 +1,6 @@
 """👤 个人中心页（Spec 七）。
 
-当前账号名 + 找回邮箱 + [重新生成找回码] + [切换账号] + [修改密码]占位 + 关于信息。
+当前账号名 + 找回邮箱 + [重新生成找回码] + [切换账号] + [修改密码] + 关于信息。
 
 ★ 改名说明：Spec 六 把「侧写辅导」定名为 ``profile_page.py``，
   所以"个人中心"落在本模块，别走错。
@@ -15,8 +15,18 @@
 
 这不是多此一举：它顺带挡住了"别人趁你没锁屏，偷偷把找回码换成他自己的邮箱"。
 
-★ 「修改密码」仍是占位：它同样需要库密钥，而且要先验旧密码。
-  下一阶段连同这个一起做。
+★ 「修改密码」怎么做的
+--------------------
+
+改密码**不是**把整个成绩库重新加密一遍 —— 库密钥不随密码变，只是换一把
+钥匙去包它（``CryptoStore.change_password`` 就是干这个的）。所以：
+
+* 快；也不存在"改一半失败、半个库是新钥匙半个库是旧钥匙"的风险；
+* **找回码不受影响** —— 它包的是同一把库密钥；
+* 但**已经泄漏出去的那把库密钥不会失效**（这个取舍写在 ``crypto_store`` 开头）。
+
+改完顺手把「7 天自动登录」的令牌清掉：改密码的动机通常就是"把别人挡在外面"，
+而令牌是免密码入口，留着它等于门没锁。
 """
 
 from __future__ import annotations
@@ -37,10 +47,18 @@ from PySide6.QtWidgets import (
 from core.crypto_store import CryptoError, CryptoStore, WrongPasswordError
 from core.email_recovery import send_recovery_mail
 from core.recovery import RecoveryError, enable_recovery, recovery_info
+from core.session_token import clear_token
 from ui.anim import make_card
 from ui.workers import run_async
 
 __all__ = ["AccountPage"]
+
+#: 新密码最短长度。必须和 ui/login_window.MIN_PASSWORD_LENGTH 一致 ——
+#: 注册时要求 8 位、改密码却允许 4 位的话，等于给自己开了个后门。
+#: 那边 import 本模块会成环（login_window ← account_page），所以这里
+#: 不去 import 它，而是用一条自检把两个数字钉在一起
+#: （见文件末尾的 :func:`password_length_consistent`）。
+MIN_PASSWORD_LENGTH = 8
 
 _ABOUT = (
     ("程序", "成绩单透镜 · transcript-lens"),
@@ -126,14 +144,19 @@ class AccountPage(QWidget):
         switch.clicked.connect(self._do_switch)
         row.addWidget(switch)
 
-        change = QPushButton("修改密码")
-        change.setObjectName("Ghost")
-        change.setMinimumHeight(38)
-        change.clicked.connect(self._do_change_password)
-        row.addWidget(change)
+        self._pwd_btn = QPushButton("修改密码")
+        self._pwd_btn.setObjectName("Ghost")
+        self._pwd_btn.setMinimumHeight(38)
+        self._pwd_btn.clicked.connect(self._do_change_password)
+        row.addWidget(self._pwd_btn)
 
         row.addStretch(1)
         acc_box.addLayout(row)
+
+        self._pwd_status = QLabel("")
+        self._pwd_status.setObjectName("Muted")
+        self._pwd_status.setWordWrap(True)
+        acc_box.addWidget(self._pwd_status)
         box.addWidget(acc)
 
         # --- 找回密码 ---
@@ -283,15 +306,159 @@ class AccountPage(QWidget):
         self._regen_status.style().polish(self._regen_status)
 
     def _do_change_password(self) -> None:
-        QMessageBox.information(
-            self,
-            "修改密码：占位",
-            "本功能还没做，原因不是懒：\n\n"
-            "改密码需要「库密钥」才能重新包裹它，而库密钥只有输过密码的那次登录"
-            "才拿得到 —— 自动登录的令牌里刻意不放密钥"
-            "（放了就等于把成绩库的钥匙放进一个人人可解的文件）。\n\n"
-            "下一阶段会连同「改密码时校验旧密码」一起做。",
+        """改密码 = 换一把钥匙重新包住库密钥（不重加密成绩库）。
+
+        ★ 走后台线程：``change_password`` 里面有两次 PBKDF2（验旧 + 派生新），
+          主线程直接跑会让窗口僵住半秒多。
+        """
+        if not self._username:
+            QMessageBox.warning(self, "还没有登录", "请先登录。")
+            return
+
+        dialog = _ChangePasswordDialog(self._username, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        old_password = dialog.old_password
+        new_password = dialog.new_password
+        if not old_password or not new_password:
+            return
+
+        self._pwd_btn.setEnabled(False)
+        self._pwd_btn.setText("修改中…")
+        self._set_pwd_status("正在校验旧密码并重新包裹库密钥…")
+
+        def _work() -> str:
+            # login 解出库密钥（也就验了旧密码），change_password 再换新的包裹
+            session = self._store.login(self._username, old_password)
+            self._store.change_password(session, old_password, new_password)
+            return self._username
+
+        def _done(name: str) -> None:
+            self._pwd_btn.setEnabled(True)
+            self._pwd_btn.setText("修改密码")
+            # ★ 改密码通常就是为了把别人挡在外面；自动登录令牌是免密码入口，
+            #   留着它等于门没锁。顺手清掉（不影响当前这次登录）。
+            token_note = ""
+            try:
+                cleared = clear_token(self._data_root)
+                if cleared:
+                    token_note = "「自动登录」凭证已一并清除，下次启动需要重新输密码。"
+            except Exception:  # noqa: BLE001 - 清不掉也要能继续用
+                token_note = ""
+            self._set_pwd_status(f"「{name}」的密码已更新。{token_note}")
+            QMessageBox.information(
+                self,
+                "密码已修改",
+                f"账户「{name}」的密码已经改好。\n\n"
+                "· 成绩库没有被重新加密，一条数据都没动。\n"
+                "· 邮箱里的**找回码依然有效** —— 它包的是同一把库密钥。\n"
+                + (f"· {token_note}\n" if token_note else ""),
+            )
+
+        def _failed(exc: BaseException) -> None:
+            self._pwd_btn.setEnabled(True)
+            self._pwd_btn.setText("修改密码")
+            if isinstance(exc, WrongPasswordError):
+                message = "旧密码不对，密码没有改动。"
+            elif isinstance(exc, (CryptoError, ValueError)):
+                message = str(exc)
+            else:
+                message = f"{type(exc).__name__}: {exc}"
+            self._set_pwd_status(f"失败：{message}", error=True)
+            QMessageBox.critical(self, "没能修改", message)
+
+        run_async(self, _work, on_done=_done, on_error=_failed)
+
+    def _set_pwd_status(self, text: str, *, error: bool = False) -> None:
+        self._pwd_status.setObjectName("Danger" if error else "Muted")
+        self._pwd_status.setText(text)
+        self._pwd_status.style().unpolish(self._pwd_status)
+        self._pwd_status.style().polish(self._pwd_status)
+
+
+class _ChangePasswordDialog(QDialog):
+    """改密码的小框：旧密码 / 新密码 / 确认新密码。
+
+    密码只在内存里待一会儿：不落盘、不打日志、不进异常信息。
+    """
+
+    def __init__(self, username: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.old_password = ""
+        self.new_password = ""
+        self.setWindowTitle("修改密码")
+        self.setModal(True)
+        self.setMinimumWidth(460)
+
+        box = QVBoxLayout(self)
+        box.setContentsMargins(22, 18, 22, 18)
+        box.setSpacing(10)
+
+        title = QLabel(f"修改「{username}」的密码")
+        title.setObjectName("H2")
+        box.addWidget(title)
+
+        note = QLabel(
+            "先输旧密码确认是本人。成绩库不会被重新加密，"
+            "邮箱里的找回码也依然有效。"
         )
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        box.addWidget(note)
+
+        box.addWidget(QLabel("旧密码"))
+        self._old = QLineEdit()
+        self._old.setEchoMode(QLineEdit.EchoMode.Password)
+        self._old.setMinimumHeight(36)
+        box.addWidget(self._old)
+
+        box.addWidget(QLabel("新密码"))
+        self._new = QLineEdit()
+        self._new.setEchoMode(QLineEdit.EchoMode.Password)
+        self._new.setPlaceholderText(f"至少 {MIN_PASSWORD_LENGTH} 位")
+        self._new.setMinimumHeight(36)
+        box.addWidget(self._new)
+
+        box.addWidget(QLabel("确认新密码"))
+        self._new2 = QLineEdit()
+        self._new2.setEchoMode(QLineEdit.EchoMode.Password)
+        self._new2.setMinimumHeight(36)
+        self._new2.returnPressed.connect(self._accept)
+        box.addWidget(self._new2)
+
+        buttons = QDialogButtonBox()
+        cancel = QPushButton("取消")
+        cancel.setObjectName("Ghost")
+        cancel.clicked.connect(self.reject)
+        buttons.addButton(cancel, QDialogButtonBox.ButtonRole.RejectRole)
+        ok = QPushButton("确认修改")
+        ok.setObjectName("Primary")
+        ok.setDefault(True)
+        ok.clicked.connect(self._accept)
+        buttons.addButton(ok, QDialogButtonBox.ButtonRole.AcceptRole)
+        box.addWidget(buttons)
+
+    def _accept(self) -> None:
+        old = self._old.text()
+        new = self._new.text()
+        again = self._new2.text()
+        if not old:
+            QMessageBox.warning(self, "还差一点", "请输入旧密码。")
+            return
+        if len(new) < MIN_PASSWORD_LENGTH:
+            QMessageBox.warning(
+                self, "新密码太短", f"新密码至少 {MIN_PASSWORD_LENGTH} 位。"
+            )
+            return
+        if new != again:
+            QMessageBox.warning(self, "两次不一致", "两次输入的新密码不一样。")
+            return
+        if new == old:
+            QMessageBox.warning(self, "没有变化", "新密码和旧密码一样，等于没改。")
+            return
+        self.old_password = old
+        self.new_password = new
+        self.accept()
 
 
 class _PasswordDialog(QDialog):
@@ -359,3 +526,21 @@ class _PasswordDialog(QDialog):
         self.password = self._pass.text()
         self.email = email
         self.accept()
+
+
+# ---------------------------------------------------------------------------
+# 自检
+# ---------------------------------------------------------------------------
+
+
+def password_length_consistent() -> bool:
+    """本页的密码长度下限和登录/注册页是不是同一个数。
+
+    ★ 为什么不直接 ``from ui.login_window import MIN_PASSWORD_LENGTH``：
+      ``ui.login_window`` 会（延迟地）import 本模块所在的页面树，写在文件头上
+      会成环。所以这里在**函数里**延迟 import，只给自检用。
+      两个数字一旦漂开（注册要 8 位、改密码只要 4 位），就是给自己开后门。
+    """
+    from ui.login_window import MIN_PASSWORD_LENGTH as OTHER
+
+    return OTHER == MIN_PASSWORD_LENGTH

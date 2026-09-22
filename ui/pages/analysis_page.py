@@ -12,17 +12,41 @@
 **calculator / parser / validator / archival 一个字符都没改**，
 它们返回什么这里就显示什么；本页只做格式化，不做任何二次算术。
 
+★ 口径筛选（三个 Toggle）
+------------------------
+
+``必修`` / ``必修+限选`` / ``全部`` —— 正好就是 :class:`CalculationScope` 的三档，
+不新增、不改口径定义（Spec 第 61 / 246 行：默认必修+限选计入，**选修默认剔除**）。
+
+切换筛选只做两件事：
+
+1. ``showColumn`` / ``hideColumn`` 把口径列显隐对齐到当前选择；
+2. 红标**跟着当前口径重算** —— 因为分母变了，"挂科/缺考"的判定基础就变了。
+
+★ 为什么行序是唯一的身份
+------------------------
+
+表格里一行 = ``parsed.valid_rows`` 里的第 i 行，而 ``core.calculator.calculate_all``
+就是按 ``valid_rows`` 的顺序逐行算的，所以 ``results[scope][i]`` 一定属于第 i 行。
+
+**不能用姓名去查。** 同名学生（历届都有）会让 ``{姓名: 结果}`` 这种字典
+互相覆盖 —— 两行显示同一份数字、同一份意愿。学号才是 Spec 第 2 章指定的
+纵向钥匙；没有学号时退回姓名，并且界面要**明说同名风险**。
+
 红标判定见 :mod:`ui.flags`（只决定标不标色，不参与加权）。
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import pandas as pd
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QButtonGroup,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -35,14 +59,25 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.archival import build_archive
+from core.archival import archive_key, build_archive
 from core.calculator import CalculationScope, calculate_many
 from core.validator import describe_alerts, parse_and_validate
-from ui.anim import make_card
-from ui.flags import build_flags
+from ui.flags import LEVEL_DANGER, LEVEL_WARNING, build_flags_by_index
+from ui.intentions import student_key
 from ui.review_dialog import confirm_courses
 
-__all__ = ["AnalysisPage", "SCOPE_COLUMNS"]
+__all__ = [
+    "ACTION_COLUMN",
+    "COLUMN_TITLES",
+    "FILTER_LABELS",
+    "FILTER_ORDER",
+    "FIRST_SCOPE_COLUMN",
+    "FLAG_COLUMN",
+    "ID_COLUMN",
+    "NAME_COLUMN",
+    "SCOPE_COLUMNS",
+    "AnalysisPage",
+]
 
 #: 表格里的三档口径列（顺序即列顺序）
 SCOPE_COLUMNS: tuple[tuple[str, str, CalculationScope], ...] = (
@@ -51,7 +86,7 @@ SCOPE_COLUMNS: tuple[tuple[str, str, CalculationScope], ...] = (
     ("req", "口径③ 仅必修", CalculationScope.REQUIRED_ONLY),
 )
 
-#: 完整列标题：**姓名 + 三口径 + 红标原因 + 操作**。
+#: 完整列标题：**姓名 + 学号 + 三口径 + 红标原因 + 操作**。
 #:
 #: ★ 必须从 SCOPE_COLUMNS **推出来**，绝不能手写。
 #:   踩过的坑：加「操作」列时手写了一份表头元组，漏掉一个口径列 ——
@@ -59,16 +94,34 @@ SCOPE_COLUMNS: tuple[tuple[str, str, CalculationScope], ...] = (
 #:   「红标原因」的单元格上（表头写着"红标原因"的那一列显示的其实是口径③）。
 #:   自动推导之后，两边再也不可能漂移。
 COLUMN_TITLES: tuple[str, ...] = (
-    ("姓名",)
+    ("姓名", "学号")
     + tuple(title for _key, title, _scope in SCOPE_COLUMNS)
     + ("红标原因", "操作")
 )
 
 #: 列下标（同样推导，不写魔法数字）
 NAME_COLUMN = 0
-FIRST_SCOPE_COLUMN = 1
+ID_COLUMN = 1
+FIRST_SCOPE_COLUMN = 2
 FLAG_COLUMN = len(COLUMN_TITLES) - 2
 ACTION_COLUMN = len(COLUMN_TITLES) - 1
+
+#: 口径筛选按钮的顺序：**由窄到宽**（必修 ⊂ 必修+限选 ⊂ 全部），最好理解
+FILTER_ORDER: tuple[CalculationScope, ...] = (
+    CalculationScope.REQUIRED_ONLY,
+    CalculationScope.REQUIRED_LIMITED,
+    CalculationScope.ALL,
+)
+
+#: 筛选按钮上的字。和 :data:`SCOPE_COLUMNS` 里的口径名是同一件事，只是短一点。
+FILTER_LABELS: dict[CalculationScope, str] = {
+    CalculationScope.REQUIRED_ONLY: "必修",
+    CalculationScope.REQUIRED_LIMITED: "必修+限选",
+    CalculationScope.ALL: "全部",
+}
+
+#: 默认筛选 = Spec 的默认计算口径（必修+限选计入，选修剔除）
+DEFAULT_FILTER = CalculationScope.REQUIRED_LIMITED
 
 #: 「操作」列宽度。「侧写」按钮 + 左右各 6px 容器边距，留点余量。
 _ACTION_COLUMN_WIDTH = 96
@@ -82,6 +135,10 @@ _ROW_BUTTON_HEIGHT = 28
 #: 导入时假设的学期标签。表里没有学期信息，用"未标注学期"，
 #: **不猜** —— 猜错会让纵向档案的排序和趋势全乱。
 DEFAULT_TERM = "未标注"
+
+#: 红标单元格的文字颜色（红标原因那一列现在真的是红的）
+_DANGER_COLOR = "#DC2626"
+_WARNING_COLOR = "#B45309"
 
 
 def _read_raw_frame(path: str) -> pd.DataFrame:
@@ -100,24 +157,55 @@ def _fmt(value: float | None) -> str:
     return "—" if value is None else f"{value:.6f}"
 
 
+@dataclass(frozen=True)
+class TableRow:
+    """表格一行的身份。**行序就是身份**，姓名只是显示用的。"""
+
+    index: int
+    student: str
+    student_id: str
+
+    @property
+    def key(self) -> str:
+        """:func:`ui.intentions.student_key` 算出来的稳定标识。"""
+        return student_key(self.student_id, self.student)
+
+    @property
+    def has_id(self) -> bool:
+        return bool(self.student_id.strip())
+
+    @property
+    def label(self) -> str:
+        """给列表/提示用的短标签：``张三（2023001）``。"""
+        return f"{self.student}（{self.student_id}）" if self.has_id else self.student
+
+
 class AnalysisPage(QWidget):
     """智育分析页。
 
     Signals:
         student_selected(dict): 用户双击某行或点该行「侧写」按钮。
             dict 里带着侧写辅导页需要的**全部**原料，它不需要重算任何东西。
+        roster_changed(list): 导入完成后，把全班名单推给侧写辅导页。
+            列表元素是 :class:`TableRow`。
     """
 
     student_selected = Signal(dict)
+    roster_changed = Signal(list)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         #: 页面状态。（这一页是有状态的：表格、结果、红标都挂在这里）
         self._parsed: Any = None
+        self._rows: list[TableRow] = []
+        #: ``{口径: [CalculationResult, ...]}`` —— **按行序**，下标即行号
         self._results: dict[Any, list[Any]] = {}
-        self._flags: dict[str, Any] = {}
+        #: ``{口径: [StudentFlag, ...]}`` —— 同样按行序
+        self._flags: dict[Any, list[Any]] = {}
         self._archive: Any = None
+        self._anchor_report: Any = None
         self._source: str = ""
+        self._scope: CalculationScope = DEFAULT_FILTER
         self._build()
 
     # ---------------------------------------------------------------- 搭界面
@@ -133,11 +221,26 @@ class AnalysisPage(QWidget):
         self._import_btn.setMinimumWidth(170)
         self._import_btn.clicked.connect(self._do_import)
         head.addWidget(self._import_btn)
-
-        hint = QLabel("选一份成绩单 → 人工核对学分与类别 → 三口径加权")
-        hint.setObjectName("Muted")
-        head.addWidget(hint)
         head.addStretch(1)
+
+        # --- 口径筛选：三个 Toggle，互斥，默认「必修+限选」---
+        head.addWidget(self._filter_caption())
+        self._filter_group = QButtonGroup(self)
+        self._filter_group.setExclusive(True)
+        self._filter_buttons: dict[CalculationScope, QPushButton] = {}
+        for scope in FILTER_ORDER:
+            button = QPushButton(FILTER_LABELS[scope])
+            button.setObjectName("FilterToggle")
+            button.setCheckable(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setMinimumHeight(34)
+            button.setChecked(scope is DEFAULT_FILTER)
+            button.clicked.connect(
+                lambda _=False, s=scope: self._set_scope(s)
+            )
+            self._filter_group.addButton(button)
+            self._filter_buttons[scope] = button
+            head.addWidget(button)
         root.addLayout(head)
 
         self._status = QLabel("还没有导入数据。")
@@ -159,7 +262,8 @@ class AnalysisPage(QWidget):
         self._table.doubleClicked.connect(self._on_double_click)
 
         header = self._table.horizontalHeader()
-        header.setSectionResizeMode(NAME_COLUMN, QHeaderView.ResizeMode.ResizeToContents)
+        for col in (NAME_COLUMN, ID_COLUMN):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         for col in range(FIRST_SCOPE_COLUMN, ACTION_COLUMN):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
         # ★ 操作列必须写死宽度：ResizeToContents **不会**把 setCellWidget 放进去的
@@ -174,6 +278,43 @@ class AnalysisPage(QWidget):
         self._detail.setObjectName("Muted")
         self._detail.setWordWrap(True)
         root.addWidget(self._detail)
+
+        self._apply_scope()
+
+    @staticmethod
+    def _filter_caption() -> QLabel:
+        label = QLabel("计算口径")
+        label.setObjectName("H3")
+        return label
+
+    # ---------------------------------------------------------------- 口径筛选
+    def _set_scope(self, scope: CalculationScope) -> None:
+        """切换口径筛选：口径列显隐 + 红标跟着重算。"""
+        if scope is self._scope:
+            return
+        self._scope = scope
+        self._apply_scope()
+        if self._rows:
+            self._refresh_flag_column()
+            self._show_detail(self._current_index())
+            self._update_status()
+
+    def _apply_scope(self) -> None:
+        """按当前口径 ``showColumn`` / ``hideColumn``。
+
+        ★ 三个口径列**始终都在**（表头和数据一一对应，见 COLUMN_TITLES 的注释），
+          筛选只改**可见性**。这样列下标永远是稳的 —— 增删列会让
+          "表头 ↔ 单元格"重新有机会漂移，而那正是上一版的 bug。
+        """
+        for offset, (_key, _title, scope) in enumerate(SCOPE_COLUMNS):
+            column = FIRST_SCOPE_COLUMN + offset
+            self._table.setColumnHidden(column, scope is not self._scope)
+        for scope, button in self._filter_buttons.items():
+            button.setChecked(scope is self._scope)
+
+    @property
+    def scope(self) -> CalculationScope:
+        return self._scope
 
     # ---------------------------------------------------------------- 导入
     def _do_import(self) -> None:
@@ -257,143 +398,200 @@ class AnalysisPage(QWidget):
         except Exception:  # noqa: BLE001 - 归档失败不该拦住看数字
             self._archive = None
 
-        # 红标以默认口径（仅必修+限选）为准，和辅导员日常看的那张表一致
-        default_rows = results.get(CalculationScope.REQUIRED_LIMITED, [])
-        self._flags = build_flags(
-            default_rows,
-            invalid_rows=parsed.invalid_rows,
-            anchor_exceeded=anchor_report.exceeded if anchor_report is not None else (),
-        )
         self._parsed = parsed
         self._results = results
+        self._anchor_report = anchor_report
         self._source = _base_name(path)
-        self._fill_table(parsed, results)
+        # ★ 名单按**行序**建立，姓名只是显示用的一个字段
+        self._rows = [
+            TableRow(
+                index=i,
+                student=row.student,
+                student_id=getattr(row, "student_id", "") or "",
+            )
+            for i, row in enumerate(parsed.valid_rows)
+        ]
+        self._refresh_flags()
+        self._fill_table()
+        self._update_status()
+        # 把名单推给侧写辅导页（它靠这个建左侧列表）
+        self.roster_changed.emit(list(self._rows))
 
-        danger = sum(1 for f in self._flags.values() if f.level == "danger")
-        warning = sum(1 for f in self._flags.values() if f.level == "warning")
-        if anchor_report is None or not anchor_report.anchors:
-            anchor_text = "表内无「所得学分」锚点列"
-        elif describe_alerts(anchor_report):
-            anchor_text = f"锚点超标 {len(anchor_report.exceeded)} 处"
-        else:
-            anchor_text = "锚点校验通过"
-        self._status.setText(
-            f"已导入 {self._source}　·　{len(parsed.courses)} 门课 / "
-            f"{parsed.total_credit:g} 学分　·　{len(parsed.valid_rows)} 名学生　·　"
-            f"红标 {danger} 人 / 黄标 {warning} 人　·　{anchor_text}"
-        )
-        self._repolish(self._status)
+    def _refresh_flags(self) -> None:
+        """为核心口径算红标。**按行序**返回，同名也不会串。"""
+        anchor_exceeded = getattr(self._anchor_report, "exceeded", ()) or ()
+        invalid_rows = getattr(self._parsed, "invalid_rows", ()) if self._parsed else ()
+        self._flags = {}
+        for scope, rows in self._results.items():
+            self._flags[scope] = build_flags_by_index(
+                rows, invalid_rows=invalid_rows, anchor_exceeded=anchor_exceeded
+            )
 
     # ---------------------------------------------------------------- 填表
-    def _fill_table(self, parsed: Any, results: dict[Any, list[Any]]) -> None:
-        primary = results.get(CalculationScope.ALL, [])
-        by_scope = {scope: {r.student: r for r in rows} for scope, rows in results.items()}
+    def _fill_table(self) -> None:
+        self._table.setRowCount(len(self._rows))
+        for row in self._rows:
+            i = row.index
 
-        self._table.setRowCount(len(primary))
-        for row, item in enumerate(primary):
-            name = item.student
-            flag = self._flags.get(name)
-
-            # 姓名
-            name_cell = QTableWidgetItem(name)
+            name_cell = QTableWidgetItem(row.student)
             name_cell.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
-            self._table.setItem(row, NAME_COLUMN, name_cell)
+            self._table.setItem(i, NAME_COLUMN, name_cell)
 
-            # 三档口径（列下标紧跟姓名，由 COLUMN_TITLES 保证对齐）
+            id_cell = QTableWidgetItem(row.student_id if row.has_id else "—")
+            id_cell.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+            if not row.has_id:
+                id_cell.setToolTip(
+                    "表里没有这一行的学号。同名学生会共用同一份意愿，"
+                    "建议在成绩表里补上学号列再导入。"
+                )
+            self._table.setItem(i, ID_COLUMN, id_cell)
+
+            # 三档口径（列下标紧跟学号，由 COLUMN_TITLES 保证对齐）
             for offset, (_key, _title, scope) in enumerate(SCOPE_COLUMNS):
-                result = by_scope.get(scope, {}).get(name)
+                result = self._result_at(scope, i)
                 cell = QTableWidgetItem(_fmt(result.weighted_average) if result else "—")
                 cell.setTextAlignment(
                     int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
                 )
-                self._table.setItem(row, FIRST_SCOPE_COLUMN + offset, cell)
+                self._table.setItem(i, FIRST_SCOPE_COLUMN + offset, cell)
 
-            # 红标原因
-            flag_cell = QTableWidgetItem(flag.summary if flag else "")
-            flag_cell.setToolTip(flag.summary if flag else "")
-            self._table.setItem(row, FLAG_COLUMN, flag_cell)
+            self._set_flag_cell(i)
 
-            # 操作
             button = QPushButton("侧写")
             button.setObjectName("RowAction")
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.setMinimumHeight(_ROW_BUTTON_HEIGHT)
-            button.clicked.connect(lambda _=False, n=name: self._emit_student(n))
+            button.clicked.connect(lambda _=False, idx=i: self._emit_student(idx))
             holder = QWidget()
             holder_box = QHBoxLayout(holder)
             holder_box.setContentsMargins(6, 6, 6, 6)
             holder_box.addWidget(button)
-            self._table.setCellWidget(row, ACTION_COLUMN, holder)
+            self._table.setCellWidget(i, ACTION_COLUMN, holder)
 
-        if primary:
+        if self._rows:
             self._table.selectRow(0)
-            self._show_detail(primary[0].student)
+            self._show_detail(0)
 
-    def _show_detail(self, student: str) -> None:
+    def _set_flag_cell(self, index: int) -> None:
+        """写红标原因那一格。**颜色跟着级别走** —— 叫"红标"就得真是红的。"""
+        flag = self._flag_at(self._scope, index)
+        text = flag.summary if flag is not None else ""
+        cell = QTableWidgetItem(text)
+        cell.setToolTip(text)
+        if flag is not None:
+            if flag.level == LEVEL_DANGER:
+                cell.setForeground(QColor(_DANGER_COLOR))
+            elif flag.level == LEVEL_WARNING:
+                cell.setForeground(QColor(_WARNING_COLOR))
+        self._table.setItem(index, FLAG_COLUMN, cell)
+
+    def _refresh_flag_column(self) -> None:
+        for row in self._rows:
+            self._set_flag_cell(row.index)
+
+    # ---------------------------------------------------------------- 取值
+    def _result_at(self, scope: CalculationScope, index: int) -> Any:
+        rows = self._results.get(scope) or []
+        return rows[index] if 0 <= index < len(rows) else None
+
+    def _flag_at(self, scope: CalculationScope, index: int) -> Any:
+        flags = self._flags.get(scope) or []
+        return flags[index] if 0 <= index < len(flags) else None
+
+    def _current_index(self) -> int:
+        row = self._table.currentRow()
+        if 0 <= row < len(self._rows):
+            return row
+        return 0
+
+    def row_of(self, key: str) -> int | None:
+        """按稳定标识找行号。**同名不会串**（键含学号）。"""
+        for row in self._rows:
+            if row.key == key:
+                return row.index
+        return None
+
+    def table_row(self, index: int) -> TableRow | None:
+        if 0 <= index < len(self._rows):
+            return self._rows[index]
+        return None
+
+    # ---------------------------------------------------------------- 详情
+    def _show_detail(self, index: int) -> None:
         """表下那一行口径明细 —— Σ学分 / Σ成绩×学分 是加权算术的证据链。"""
-        if self._parsed is None or not student:
+        row = self.table_row(index)
+        if self._parsed is None or row is None:
             return
         parts: list[str] = []
         for _key, title, scope in SCOPE_COLUMNS:
-            result = next(
-                (r for r in self._results.get(scope, []) if r.student == student), None
-            )
+            result = self._result_at(scope, index)
             if result is None:
                 continue
             parts.append(
                 f"{title}＝{_fmt(result.weighted_average)}"
                 f"（Σ学分 {result.total_credit:g}，Σ成绩×学分 {result.weighted_sum:g}）"
             )
-        flag = self._flags.get(student)
+        flag = self._flag_at(self._scope, index)
         if flag is not None and flag.reasons:
             parts.append(f"预警（{flag.label}）：{'；'.join(flag.reasons)}")
-        self._detail.setText(f"【{student}】" + "　|　".join(parts))
+        head = f"【{row.label}】"
+        if not row.has_id:
+            head += "（无学号）"
+        self._detail.setText(head + "　|　".join(parts))
         self._repolish(self._detail)
 
     # ---------------------------------------------------------------- 选中
     def _on_double_click(self, index) -> None:
-        row = index.row()
-        item = self._table.item(row, NAME_COLUMN)
-        if item is not None:
-            self._emit_student(item.text())
+        self._emit_student(index.row())
 
-    def _emit_student(self, name: str) -> None:
-        payload = self.student_payload(name)
+    def _emit_student(self, index: int) -> None:
+        payload = self.payload_at(index)
         if payload is not None:
             self.student_selected.emit(payload)
 
-    def student_payload(self, name: str) -> dict[str, Any] | None:
+    def payload_at(self, index: int) -> dict[str, Any] | None:
         """把侧写辅导页需要的东西**一次性打包**，那边一个数都不用再算。
 
         里面放的是 core 的原始对象（``CalculationResult`` / ``StudentArchive``），
         不是重新拼的字典 —— 免得两份数字打架。
+
+        ★ 打包的身份是 **``key``（学号优先）**，不是姓名。
         """
-        if self._parsed is None or not name:
+        row = self.table_row(index)
+        if self._parsed is None or row is None:
             return None
         results = {
-            scope: next((r for r in rows if r.student == name), None)
-            for scope, rows in self._results.items()
+            scope: self._result_at(scope, index) for scope in self._results
         }
         if all(value is None for value in results.values()):
             return None
         student_archive = None
         if self._archive is not None:
-            student_archive = next(
-                (s for s in self._archive.students.values() if s.student == name), None
+            # ★ 档案字典的键是 core.archival.archive_key()（学号哈希），
+            #   不是学号原文 —— 必须用它自己那把钥匙去查。
+            student_archive = self._archive.students.get(
+                archive_key(row.student_id, row.student)
             )
         return {
-            "student": name,
+            "student": row.student,
+            "student_id": row.student_id,
+            "key": row.key,
+            "index": row.index,
             "results": results,
-            "flag": self._flags.get(name),
+            "flag": self._flag_at(self._scope, index),
             "archive": student_archive,
             "source": self._source,
         }
 
     def current_payload(self) -> dict[str, Any] | None:
         """当前选中的那行（侧栏切过来时用）。"""
-        row = self._table.currentRow()
-        item = self._table.item(row, NAME_COLUMN) if row >= 0 else None
-        return self.student_payload(item.text()) if item is not None else None
+        if not self._rows:
+            return None
+        return self.payload_at(self._current_index())
+
+    def roster(self) -> list[TableRow]:
+        """全班名单（侧写辅导页的左侧列表用它）。"""
+        return list(self._rows)
 
     def export_records(self) -> list[dict[str, Any]]:
         """给设置页的导出功能提供记录。
@@ -401,26 +599,31 @@ class AnalysisPage(QWidget):
         列名按 :data:`core.exporter.ANONYMIZED_COLUMNS` 来 —— 脱敏导出会按
         白名单裁列，**姓名不在白名单里**，所以明文版能带姓名、脱敏版带不了。
         本方法只负责把已有数字摆成表，不做任何新算术。
+
+        口径固定用「仅必修+限选」（Spec 默认口径），**不跟着筛选按钮变** ——
+        导出的是一份可归档的固定口径，不是屏幕上的临时视图。
         """
-        if not self._results:
+        if not self._rows:
             return []
-        rows = self._results.get(CalculationScope.REQUIRED_LIMITED) or []
-        by_student = {r.student: r for r in rows}
-        archive_students = {}
+        scope = CalculationScope.REQUIRED_LIMITED
+        archive_students: dict[str, Any] = {}
         if self._archive is not None:
-            archive_students = {
-                s.student: s for s in self._archive.students.values()
-            }
+            archive_students = dict(self._archive.students)
 
         records: list[dict[str, Any]] = []
-        for index, (name, result) in enumerate(by_student.items(), 1):
-            student_archive = archive_students.get(name)
+        for index, row in enumerate(self._rows, 1):
+            result = self._result_at(scope, index - 1)
+            if result is None:
+                continue
+            student_archive = archive_students.get(
+                archive_key(row.student_id, row.student)
+            )
             records.append(
                 {
                     "S编号": f"S{index:03d}",
-                    "姓名": name,
+                    "姓名": row.student,
                     "学期": DEFAULT_TERM,
-                    "口径": "仅必修+限选",
+                    "口径": FILTER_LABELS[scope],
                     "加权均分": result.weighted_average,
                     "总学分": result.total_credit,
                     "挂科数": getattr(student_archive, "failed_total", 0),
@@ -431,6 +634,37 @@ class AnalysisPage(QWidget):
         return records
 
     # ---------------------------------------------------------------- 杂项
+    def _update_status(self) -> None:
+        danger = sum(
+            1 for f in (self._flags.get(self._scope) or []) if f.level == LEVEL_DANGER
+        )
+        warning = sum(
+            1 for f in (self._flags.get(self._scope) or []) if f.level == LEVEL_WARNING
+        )
+        missing_ids = sum(1 for row in self._rows if not row.has_id)
+        if self._parsed is None:
+            return
+        parsed = self._parsed
+        anchor_report = self._anchor_report
+        if anchor_report is None or not anchor_report.anchors:
+            anchor_text = "表内无「所得学分」锚点列"
+        elif describe_alerts(anchor_report):
+            anchor_text = f"锚点超标 {len(anchor_report.exceeded)} 处"
+        else:
+            anchor_text = "锚点校验通过"
+        text = (
+            f"已导入 {self._source}　·　{len(parsed.courses)} 门课 / "
+            f"{parsed.total_credit:g} 学分　·　{len(self._rows)} 名学生　·　"
+            f"当前口径「{FILTER_LABELS[self._scope]}」　·　"
+            f"红标 {danger} 人 / 黄标 {warning} 人　·　{anchor_text}"
+        )
+        if missing_ids:
+            text += (
+                f"\n⚠ 有 {missing_ids} 名学生没有学号，只能靠姓名区分 —— "
+                "同名学生会用同一份意愿。建议在成绩表里补上学号列再导入。"
+            )
+        self._set_status(text, warn=bool(missing_ids))
+
     def _set_status(self, text: str, *, error: bool = False, warn: bool = False) -> None:
         self._status.setText(text)
         self._status.setObjectName("Danger" if error else ("Warn" if warn else "Muted"))

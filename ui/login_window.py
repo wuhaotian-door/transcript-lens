@@ -28,13 +28,21 @@
 忘密码那天它已经解不开了，"现在发一封邮件"发不出任何有用的东西 ——
 能解开它的只有注册时生成、并已用它包好密钥的那一串码。
 
-★ 关于无边框：Spec 允许保留系统标题栏，铁律九也写明「不做无边框拖拽自绘」。
-   所以这里**保留系统标题栏**，圆角 12px 做在内部卡片上。
+★ 关于无边框
+-----------
+
+现在走**无边框自绘**（Spec 里没有禁止这一条的条文；早先那句"不做无边框拖拽"
+是界面还是 tkinter 时的旧约束，本轮按商业质感要求改掉了）。
+系统标题栏没了，所以拖拽/最小化/关闭全部由 :mod:`ui.frameless` 补上：
+
+* 一圈留白给阴影，圆角 12px 做在卡片上；
+* 顶部一条自定义标题栏（可拖拽 + 最小化 + 关闭）；
+* 边缘 6px 可以拖动缩放。
 """
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -69,6 +77,14 @@ from core.recovery import (
 )
 from core.session_token import AUTO_LOGIN_DAYS, clear_token, save_token, token_info
 from ui.anim import window_fade_in, window_fade_out
+from ui.frameless import (
+    SHADOW_MARGIN,
+    TITLE_BAR_HEIGHT,
+    WindowTitleBar,
+    apply_frameless,
+    build_root_frame,
+    install_chrome,
+)
 from ui.workers import run_async
 
 __all__ = ["APP_VERSION", "MIN_PASSWORD_LENGTH", "SLOGAN", "LoginWindow"]
@@ -104,39 +120,53 @@ class LoginWindow(QWidget):
         self._store = store if store is not None else CryptoStore(root)
 
         self.setWindowTitle("成绩单透镜 · 登录")
-        self.setMinimumSize(880, 560)
-        self.resize(920, 580)
+        # ★ 无边框 + 透明底必须在 show() 之前设好（setWindowFlag 会藏窗口）
+        apply_frameless(self)
+        # 尺寸是**卡片可见部分**的尺寸，四周还要多留一圈给阴影
+        self.setMinimumSize(880 + 2 * SHADOW_MARGIN, 560 + 2 * SHADOW_MARGIN)
+        self.resize(920 + 2 * SHADOW_MARGIN, 580 + 2 * SHADOW_MARGIN)
         self.setWindowOpacity(0.0)
         #: 防止淡出过程中被再次触发登录
         self._leaving = False
 
         self._build()
+        install_chrome(self, self._card, corners=[self._title_bar, self._brand])
         self._refresh_usernames()
         self._hint_about_token()
 
     # ---------------------------------------------------------------- 搭界面
     def _build(self) -> None:
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(18, 18, 18, 18)
+        # 圆角 + 阴影的窗口容器（objectName 让 QSS 里的 #LoginCard 生效）
+        self._card = build_root_frame(self, name="LoginCard")
+        card_box = QVBoxLayout(self._card)
+        card_box.setContentsMargins(0, 0, 0, 0)
+        card_box.setSpacing(0)
 
-        card = QFrame()
-        card.setObjectName("LoginCard")
-        outer.addWidget(card)
+        # --- 自定义标题栏（系统那圈边框没了，这些都得自己来）---
+        self._title_bar = WindowTitleBar(
+            "成绩单透镜 · 登录", minimizable=True, maximizable=False, closable=True
+        )
+        self._title_bar.minimize_requested.connect(self.showMinimized)
+        self._title_bar.close_requested.connect(self.close)
+        card_box.addWidget(self._title_bar)
 
-        row = QHBoxLayout(card)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(0)
+        body = QWidget()
+        body_box = QHBoxLayout(body)
+        body_box.setContentsMargins(0, 0, 0, 0)
+        body_box.setSpacing(0)
 
-        row.addWidget(self._build_brand())
+        self._brand = self._build_brand()
+        body_box.addWidget(self._brand)
 
         right = QWidget()
         right_box = QVBoxLayout(right)
-        right_box.setContentsMargins(38, 34, 38, 30)
+        right_box.setContentsMargins(38, 30, 38, 30)
         self._stack = QStackedWidget()
         self._stack.addWidget(self._build_login_page())
         self._stack.addWidget(self._build_register_page())
         right_box.addWidget(self._stack)
-        row.addWidget(right, 1)
+        body_box.addWidget(right, 1)
+        card_box.addWidget(body, 1)
 
     def _build_brand(self) -> QFrame:
         brand = QFrame()
@@ -644,6 +674,10 @@ class LoginWindow(QWidget):
           只在构造时定一次尺寸的话，切到注册页底部就会被切掉 ——
           控件树里查得到、用户看不见。这里每次翻页都按当前页的
           ``sizeHint()`` 重新量一遍，不够就把窗口撑大。
+
+        ★ 高度里**必须算上自定义标题栏**（``TITLE_BAR_HEIGHT``）：系统标题栏
+          没了之后，那 36px 是我们自己加的一行，量漏了注册页底部同样会被切掉
+          —— 和无边框改造前是同一个坑，换了个来源而已。
         """
         current = self._stack.currentWidget()
         if current is None:
@@ -651,7 +685,13 @@ class LoginWindow(QWidget):
         hint = current.sizeHint()
         margins = self.layout().contentsMargins()
         need_w = hint.width() + margins.left() + margins.right() + _BRAND_WIDTH + 40
-        need_h = hint.height() + margins.top() + margins.bottom() + 40
+        need_h = (
+            hint.height()
+            + margins.top()
+            + margins.bottom()
+            + TITLE_BAR_HEIGHT
+            + 40
+        )
         if need_w > self.width() or need_h > self.height():
             self.resize(max(need_w, self.width()), max(need_h, self.height()))
 

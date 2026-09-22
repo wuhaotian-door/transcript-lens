@@ -75,6 +75,8 @@ QSS_RELATIVE = Path("ui") / "styles.qss"
 CHECK_MODULES: tuple[str, ...] = (
     "ui.anim",
     "ui.splash",
+    "ui.frameless",
+    "ui.welcome",
     "ui.intentions",
     "ui.workers",
     "ui.flags",
@@ -546,6 +548,7 @@ class AppFlow:
         self.root = root
         self.splash = None
         self.login = None
+        self.welcome = None
         self.main = None
 
     # ---------------------------------------------------------------- 入口
@@ -563,9 +566,29 @@ class AppFlow:
         self.splash = None
         user = load_token(self.root)
         if user:
-            self.show_main(user)
+            # 自动登录也算"登录成功"，同样先打一句招呼
+            self.greet_then_main(user)
         else:
             self.show_login()
+
+    # ---------------------------------------------------------------- 欢迎页
+    def greet_then_main(self, username: str) -> None:
+        """登录成功之后：先欢迎页（停 1.5s），再淡入主界面。
+
+        ★ 这一页不是装饰。登录窗淡出后直接跳出主界面，人会懵一下；
+          中间垫一句带时间的问候，也是确认"进来的是我，账号没选错"。
+        """
+        from ui.welcome import WelcomeWindow
+
+        self.welcome = WelcomeWindow(username)
+        self.welcome.finished.connect(
+            lambda name=username: self._after_welcome(name)
+        )
+        self.welcome.run()
+
+    def _after_welcome(self, username: str) -> None:
+        self.welcome = None
+        self.show_main(username)
 
     # ---------------------------------------------------------------- 主界面
     def show_main(self, username: str, *, fade: bool = True) -> None:
@@ -608,9 +631,155 @@ class AppFlow:
         self.login.run()
 
     def _on_logged_in(self, username: str) -> None:
-        """登录窗已经自己淡出并 hide 了，这里负责把主窗口淡入。"""
+        """登录窗已经自己淡出并 hide 了，这里接欢迎页，再让主窗口淡入。"""
         self.login = None
-        self.show_main(username)
+        self.greet_then_main(username)
+
+
+def run_bootcheck() -> int:
+    """跑一遍**真实启动流程**（开屏 → 欢迎页 → 主界面），把结果写进报告文件。
+
+    ★ 为什么需要它：``--selfcheck`` 是**无窗口**的，它把数据链路跑通了，
+      但一行 GUI 代码都没碰。而打包成 ``--windowed`` 的 exe **没有 stdout/
+      stderr** —— 界面代码一旦在启动路径上崩掉（不是 Python 异常，是
+      ``0xC0000409`` 那种直接把进程抹掉），用户看到的就是"没反应"，
+      开发者这边一个字都拿不到。
+
+      踩过一次：欢迎页淡出时销毁窗口 → 动画被一起销毁 → Qt 发完 finished
+      还在用那个动画对象 → 进程消失。**400 多项测试全绿、自检全绿、
+      两个 exe 都"自检通过"**，因为它栽在一条从来没被跑过的路径上。
+
+      所以这个开关跑的就是那条路：真动画、真计时、一步不跳，
+      最后把"主窗口到底可不可见"写进报告文件。见 ``build_exe.ps1``。
+
+    用临时数据目录，**不碰真实用户数据**。窗口会一闪而过（这是真的 GUI）。
+    """
+    import tempfile
+    import time
+    from pathlib import Path as _Path
+
+    report_path = _Path(tempfile.gettempdir()) / "transcript-lens-bootcheck.txt"
+    lines: list[str] = []
+    failed = False
+
+    def say(text: str = "") -> None:
+        lines.append(text)
+        # 每步立刻落盘 + flush：卡住时也要能看出停在哪一步（见 AGENTS.md §7）
+        try:
+            report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
+    def check(label: str, ok: bool, detail: str = "") -> None:
+        nonlocal failed
+        if not ok:
+            failed = True
+        say(f"{'ok  ' if ok else 'FAIL'}  {label}" + (f"    {detail}" if detail else ""))
+
+    say(f"python      {sys.version.split()[0]}")
+    say(f"frozen      {getattr(sys, 'frozen', False)}")
+    say(f"executable  {sys.executable}")
+    say("-" * 74)
+
+    work = _Path(tempfile.mkdtemp(prefix="tl_bootcheck_"))
+    data_root = work / "SGMS"
+    app = None
+    try:
+        from core.crypto_store import CryptoStore
+        from core.session_token import save_token
+
+        store = CryptoStore(root=data_root)
+        store.register("自检用户", "bootcheck123")
+        save_token("自检用户", root=str(data_root))
+        check("准备了临时账户 + 自动登录令牌", True, str(data_root))
+
+        app = make_app(["transcript-lens-bootcheck"])
+        flow = AppFlow(app, root=str(data_root))
+
+        from PySide6.QtCore import QEventLoop, QTimer
+
+        def pump(ms: int) -> None:
+            """推事件循环 ms 毫秒（QTest 不在打包产物里，所以手搓一个）。"""
+            loop = QEventLoop()
+            QTimer.singleShot(ms, loop.quit)
+            loop.exec()
+
+        def wait_until(pred, timeout_ms: int, label: str) -> bool:
+            """轮询等条件成立。
+
+            ★ 别用"睡够 X 毫秒应该就好了"：这条链上有 4 段动画 +
+              一个 1.5 秒停留，机器一忙就错开。第一次写的时候就
+              因为少等了一次 260ms 的淡入，把 opacity=0.000 判成了 FAIL。
+            """
+            waited = 0
+            while waited < timeout_ms:
+                if pred():
+                    return True
+                pump(50)
+                waited += 50
+            return bool(pred())
+
+        flow.start()
+
+        check(
+            "开屏让位给欢迎页",
+            wait_until(lambda: flow.splash is None and flow.welcome is not None, 4000,
+                       "welcome"),
+        )
+        check(
+            "欢迎页让位、主窗建出来",
+            wait_until(lambda: flow.welcome is None and flow.main is not None, 8000,
+                       "main"),
+        )
+        # 主窗还有一次 260ms 的淡入要跑完才真正"看得见"
+        pump(900)
+
+        main = flow.main
+        check("★ 主窗口建出来了", main is not None, type(main).__name__ if main else "None")
+        if main is not None:
+            check("★ 主窗口 isVisible()", main.isVisible())
+            check("★ 主窗口不透明（淡入真的跑完了）",
+                  main.windowOpacity() > 0.99, f"opacity={main.windowOpacity():.3f}")
+            check("★ 主窗口没被最小化", not main.isMinimized())
+            check("★ 原生窗口句柄可见",
+                  main.windowHandle() is not None and main.windowHandle().isVisible())
+            check("★ 主窗口没被藏起来", not main.isHidden())
+            pump(300)
+            shot = _Path(tempfile.gettempdir()) / "transcript-lens-bootcheck.png"
+            try:
+                main.grab().save(str(shot))
+                check("截了一张主窗口的图", True, str(shot))
+            except Exception as exc:  # noqa: BLE001
+                check("截图", False, str(exc))
+    except BaseException:  # noqa: BLE001 - 报告里要留下完整 traceback
+        import traceback
+
+        say("")
+        say("!!!! bootcheck 抛异常 !!!!")
+        say(traceback.format_exc())
+        failed = True
+    finally:
+        if app is not None:
+            for widget in app.topLevelWidgets():
+                try:
+                    widget.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        import shutil
+
+        shutil.rmtree(work, ignore_errors=True)
+
+    say("-" * 74)
+    say("BOOTCHECK: " + ("FAIL" if failed else "ALL OK"))
+    say(f"报告：{report_path}")
+    # --windowed 没有 stdout，所以报告**只**写文件；能打印就顺便打一份
+    stream = getattr(sys, "stdout", None)
+    if stream is not None:
+        try:
+            stream.write("\n".join(lines) + "\n")
+        except Exception:  # noqa: BLE001
+            pass
+    return 1 if failed else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -627,6 +796,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_mailcheck(send_test=True)
     if "--mailcheck" in args:
         return run_mailcheck(send_test=False)
+    if "--bootcheck" in args:
+        return run_bootcheck()
 
     if "--help" in args or "-h" in args:
         stream = getattr(sys, "stdout", None)
@@ -634,6 +805,11 @@ def main(argv: list[str] | None = None) -> int:
             stream.write(
                 "transcript-lens 图形界面\n"
                 "用法：transcript-lens.exe [--selfcheck] [--mailcheck[-send]]\n"
+                "                        [--bootcheck]\n"
+                "  --selfcheck    无窗口跑一遍数据链路（解析 → 算分 → 锚点）\n"
+                "  --mailcheck    检查邮件配置能不能连上（不寄信）\n"
+                "  --mailcheck-send  连上并真的寄一封测试信\n"
+                "  --bootcheck    跑一遍真实启动流程（开屏 → 欢迎页 → 主界面）\n"
             )
         return 0
 

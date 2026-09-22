@@ -153,7 +153,15 @@ class SplashScreen(QSplashScreen):
         # ★ 必须留引用：动画对象被 GC 掉的话会在下一帧静默停住
         self._anim = anim
         if on_done is not None:
-            anim.finished.connect(lambda: on_done())
+            # ★ **延后一拍**再回调。`on_done` 最后一步会把开屏关掉，
+            #   而 AppFlow 接住 `finished` 之后就把 splash 的引用丢了 ——
+            #   开屏当场析构，parent 在它上面的这个动画也跟着没。
+            #   可 Qt 发完 `finished` 之后**还要继续用这个动画对象**
+            #   （注销计时器、处理 deleteWhenStopped），于是踩空 →
+            #   整个进程 0xC0000409 直接消失、一个字都不打。
+            #   等这一轮事件循环走完再动手就安全了。
+            #   context 用 self：开屏先没了的话这次回调自动跳过。
+            anim.finished.connect(lambda: QTimer.singleShot(0, self, on_done))
         anim.start(QAbstractAnimation.DeletionPolicy.KeepWhenStopped)
 
     def _after_fade_in(self) -> None:

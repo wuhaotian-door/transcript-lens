@@ -23,6 +23,78 @@ QMainWindow, QDialog {
     background: #F1F5F9;
 }
 
+/* ------------------------------------------------- 无边框窗口（商业质感）
+   ----------------------------------------------------------------------------
+   ★ 为什么窗口自己必须显式透明：上面那条 `QMainWindow { background }` 会把
+     整个窗口矩形填成不透明 —— 包括我们留给阴影的那圈边距。那样四个圆角
+     外面就变成灰白色方块，"无边框圆角"根本看不出来。
+   ★ 圆角**不会裁剪子控件**：贴着窗口边的那些子控件（侧栏 / 顶栏 / 标题栏）
+     必须各自带对应角的圆角，否则四角会露出方角。见 ui/frameless.py。
+   ------------------------------------------------------------------------- */
+QMainWindow#FramelessWindow, QWidget#FramelessWindow {
+    background: transparent;
+}
+
+QFrame#WindowRoot {
+    background: #F1F5F9;
+    border: 1px solid #E2E8F0;
+    border-radius: 12px;
+}
+QFrame#WindowRoot[tlMaximized="true"] {
+    border-radius: 0;
+    border: none;
+}
+
+/* 自定义标题栏 */
+QFrame#WindowTitleBar {
+    background: #F8FAFC;
+    border: none;
+    border-bottom: 1px solid #E2E8F0;
+    border-top-left-radius: 12px;
+    border-top-right-radius: 12px;
+}
+QFrame#WindowTitleBar[tlMaximized="true"] {
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+}
+QLabel#WindowTitle {
+    color: #64748B;
+    font-size: 12px;
+    font-weight: 700;
+}
+QPushButton#TitleButton, QPushButton#TitleButtonClose {
+    background: transparent;
+    color: #64748B;
+    border: none;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 700;
+}
+QPushButton#TitleButton:hover      { background: #E2E8F0; color: #1F2430; }
+QPushButton#TitleButton:pressed    { background: #CBD5E1; }
+QPushButton#TitleButtonClose:hover { background: #EF4444; color: #FFFFFF; }
+QPushButton#TitleButtonClose:pressed { background: #DC2626; color: #FFFFFF; }
+
+/* 欢迎页 */
+QFrame#WelcomeCard {
+    background: #1E293B;
+    border: none;
+    border-radius: 16px;
+}
+QLabel#WelcomeGreeting {
+    color: #F8FAFC;
+    font-size: 30px;
+    font-weight: 700;
+}
+QLabel#WelcomeDate {
+    color: #94A3B8;
+    font-size: 14px;
+}
+QLabel#WelcomeHint {
+    color: #64748B;
+    font-size: 12px;
+}
+
 /* ---------------------------------------------------------------- 文字层级 */
 QLabel#H1 {
     font-size: 26px;
@@ -62,9 +134,16 @@ QFrame#CardFlat {
 }
 
 /* ------------------------------------------------------------------ 侧栏 */
+/* ★ 左侧两个角要跟着窗口圆角走（圆角不裁剪子控件） */
 QFrame#Sidebar {
     background: #1E293B;
     border: none;
+    border-top-left-radius: 12px;
+    border-bottom-left-radius: 12px;
+}
+QFrame#Sidebar[tlMaximized="true"] {
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
 }
 QLabel#BrandTitle {
     color: #F8FAFC;
@@ -102,10 +181,15 @@ QPushButton#NavButton:checked:hover {
 }
 
 /* ------------------------------------------------------------- 顶部窄条 */
+/* 顶栏同时充当主窗口的自定义标题栏：右上角跟着窗口圆角，整条可拖拽 */
 QFrame#TopBar {
     background: #FFFFFF;
     border: none;
     border-bottom: 1px solid #E2E8F0;
+    border-top-right-radius: 12px;
+}
+QFrame#TopBar[tlMaximized="true"] {
+    border-top-right-radius: 0;
 }
 QLabel#TopUser {
     color: #334155;
@@ -354,11 +438,14 @@ QFrame#LoginCard {
     border: 1px solid #E2E8F0;
     border-radius: 12px;
 }
+/* 品牌区在标题栏下面，所以只有左下角要圆 —— 左上角归标题栏 */
 QFrame#LoginBrand {
     background: #1E293B;
     border: none;
-    border-top-left-radius: 12px;
     border-bottom-left-radius: 12px;
+}
+QFrame#LoginBrand[tlMaximized="true"] {
+    border-bottom-left-radius: 0;
 }
 QLabel#LoginBrandTitle {
     color: #F8FAFC;

@@ -1,7 +1,32 @@
-"""🎯 侧写辅导页 —— 本次的核心新增。
+"""🎯 侧写辅导页 —— 左侧学生名单（可搜索） + 右侧三层侧写。
 
 ★ 文件名说明：Spec 五/六 把这一页定名为 ``profile_page.py``（"侧写"），
   所以**个人中心**那一页在 :mod:`ui.pages.account_page`，别走错。
+
+布局::
+
+    +------------------+---------------------------------------+
+    | 学生名单          |  【张三（2023001）】 学业肖像          |
+    | 🔍 [搜索姓名/学号] |   发展意愿                             |
+    | 张三（2023001）   |   辅导提纲                             |
+    | 李四（2023002）   |                                       |
+    +------------------+---------------------------------------+
+
+★ 为什么要有这一层列表
+---------------------
+
+原来点侧栏「侧写辅导」直接落到**上一次那一名学生**身上 —— 用户看到的是别人的
+数据，还以为是在看自己刚点的那个人。现在：
+
+* 点侧栏 → 落在**名单**上（右侧是谁取决于你在名单里点了谁，没点就是提示语）；
+* 从智育分析页点「侧写」→ 才带着具体学生跳过来，并在名单里选中他。
+
+★ 身份用**学号**，不用姓名
+-------------------------
+
+同名学生（历届都有）按姓名索引会**互相串号**：意愿互相覆盖、预警取错行。
+本页一律用 ``payload["key"]``（``sid:<学号>``，没学号才退回 ``name:<姓名>``）
+作为意愿的键。没学号的学生会在界面上**明说**同名风险。
 
 三层结构（Spec 六）::
 
@@ -26,7 +51,7 @@ Spec 说「数据来源：student dict 里已有的字段，不重新算」。�
 from __future__ import annotations
 
 import dataclasses
-from typing import Any
+from typing import Any, Callable
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -35,6 +60,9 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QRadioButton,
@@ -49,9 +77,15 @@ from core.archival import merge_records, partition, trend
 from core.calculator import CalculationScope, weighted_average
 from core.crypto_store import CryptoError, CryptoStore
 from ui.anim import make_card
-from ui.intentions import INTENTION_OPTIONS, load_intentions, save_intention
+from ui.intentions import (
+    INTENTION_OPTIONS,
+    KEY_PREFIX_NAME,
+    load_intentions,
+    save_intention,
+    student_key,
+)
 
-__all__ = ["ProfilePage", "RESCUE_TARGET"]
+__all__ = ["LIST_WIDTH", "ProfilePage", "RESCUE_TARGET"]
 
 #: "提一提"的目标分（Spec 六：附一句"提至85可+0.X"）
 RESCUE_TARGET = 85.0
@@ -62,13 +96,16 @@ TREND_EPS = 0.5
 #: 可抢救项最多列几门（列表太长反而看不清重点）
 MAX_RESCUE = 5
 
+#: 左侧名单宽度
+LIST_WIDTH = 236
+
 
 def _fmt(value: float | None, digits: int = 2) -> str:
     return "—" if value is None else f"{value:.{digits}f}"
 
 
 class ProfilePage(QWidget):
-    """侧写辅导页。"""
+    """侧写辅导页：左名单 + 右详情。"""
 
     def __init__(self, store: CryptoStore | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -76,6 +113,12 @@ class ProfilePage(QWidget):
         self._username = ""
         self._payload: dict[str, Any] | None = None
         self._intentions: dict[str, str] = {}
+        #: 全班名单（:class:`ui.pages.analysis_page.TableRow`），由智育分析页推过来
+        self._roster: list[Any] = []
+        #: 行号 → 稳定标识（选中名单时用，避免每次线性扫名单）
+        self._key_by_index: dict[int, str] = {}
+        #: 由主窗口注入：``index -> payload``（名单里的行号 → 侧写原料）
+        self._provider: Callable[[int], dict[str, Any] | None] | None = None
         self._build()
 
     # ---------------------------------------------------------------- 外部
@@ -86,31 +129,133 @@ class ProfilePage(QWidget):
             load_intentions(self._store, self._username) if self._username else {}
         )
         if self._payload is not None:
-            self.show_student(self._payload)
+            self._render()
+
+    def set_payload_provider(self, provider: Callable[[int], dict[str, Any] | None]) -> None:
+        """注入"行号 → 侧写原料"的取值函数（智育分析页提供，不复制数据）。"""
+        self._provider = provider
+
+    def set_roster(self, rows: list[Any]) -> None:
+        """接住智育分析页导入后推过来的全班名单。
+
+        Args:
+            rows: :class:`ui.pages.analysis_page.TableRow` 列表。
+        """
+        self._roster = list(rows)
+        self._migrate_name_keys()
+        self._fill_list()
+        if self._payload is not None:
+            self._select_key(self._payload.get("key", ""))
 
     def show_student(self, payload: dict[str, Any]) -> None:
-        """接住智育分析页传来的学生包。"""
+        """接住智育分析页传来的学生包，并在名单里把他选中。"""
         self._payload = payload
-        self._empty.hide()
-        self._body.show()
+        self._select_key(payload.get("key", ""))
         self._render()
+
+    def focus_list(self) -> None:
+        """侧栏点进来时调用：**不换人**，只是把焦点交给搜索框。
+
+        ★ 这就是"禁止点击侧栏直接跳转个人侧写"：侧栏落到名单上，
+          具体看谁由用户在名单里点。
+        """
+        self._search.setFocus()
 
     # ---------------------------------------------------------------- 搭界面
     def _build(self) -> None:
-        root = QVBoxLayout(self)
+        root = QHBoxLayout(self)
         root.setContentsMargins(22, 20, 22, 20)
-        root.setSpacing(0)
+        root.setSpacing(14)
+        root.addWidget(self._build_list_pane())
+        root.addWidget(self._build_detail_pane(), 1)
 
-        # --- 没选学生时的占位 ---
+    # --- 左：名单 + 搜索 ---
+    def _build_list_pane(self) -> QFrame:
+        card = make_card()
+        card.setFixedWidth(LIST_WIDTH)
+        box = QVBoxLayout(card)
+        box.setContentsMargins(14, 14, 14, 14)
+        box.setSpacing(10)
+
+        title = QLabel("学生名单")
+        title.setObjectName("H2")
+        box.addWidget(title)
+
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("🔍  搜索姓名或学号")
+        self._search.setClearButtonEnabled(True)
+        self._search.setMinimumHeight(34)
+        self._search.textChanged.connect(self._on_search)
+        box.addWidget(self._search)
+
+        self._list = QListWidget()
+        self._list.setObjectName("StudentList")
+        self._list.setAlternatingRowColors(False)
+        self._list.setUniformItemSizes(True)
+        self._list.itemClicked.connect(self._on_item_clicked)
+        box.addWidget(self._list, 1)
+
+        self._list_note = QLabel("")
+        self._list_note.setObjectName("Muted")
+        self._list_note.setWordWrap(True)
+        box.addWidget(self._list_note)
+        return card
+
+    def _fill_list(self) -> None:
+        """按名单重建列表。带学号的显示学号 —— 同名也能一眼分开。"""
+        blocked = self._list.blockSignals(True)
+        self._list.clear()
+        self._key_by_index = {}
+        for row in self._roster:
+            item = QListWidgetItem(row.label)
+            item.setData(Qt.ItemDataRole.UserRole, row.index)
+            item.setToolTip(
+                f"学号 {row.student_id}" if row.has_id
+                else "⚠ 表里没有学号，同名学生会共用同一份意愿"
+            )
+            self._list.addItem(item)
+            self._key_by_index[row.index] = row.key
+        self._list.blockSignals(blocked)
+        self._search.clear()
+        self._update_list_note()
+
+    def _update_list_note(self) -> None:
+        total = self._list.count()
+        shown = sum(1 for i in range(total) if not self._list.item(i).isHidden())
+        missing = sum(1 for row in self._roster if not row.has_id)
+        if not total:
+            self._list_note.setText("还没有名单。先在「📊 智育分析」导入成绩表。")
+            return
+        text = f"共 {total} 人" if shown == total else f"筛出 {shown} / {total} 人"
+        if missing:
+            text += f"\n⚠ {missing} 人没有学号，同名会共用意愿"
+        self._list_note.setText(text)
+
+    @property
+    def roster_size(self) -> int:
+        return len(self._roster)
+
+    @property
+    def visible_count(self) -> int:
+        """搜索过滤之后还看得见的条数（自检用）。"""
+        return sum(1 for i in range(self._list.count()) if not self._list.item(i).isHidden())
+
+    # --- 右：详情 ---
+    def _build_detail_pane(self) -> QWidget:
+        pane = QWidget()
+        box = QVBoxLayout(pane)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(0)
+
         self._empty = QLabel(
-            "请先在「📊 智育分析」导入成绩表，然后双击一名学生\n"
-            "（或点该行的「侧写」按钮）"
+            "👈  在左边点一名学生，这里显示他的学业肖像、发展意愿和辅导提纲。\n\n"
+            "名单来自「📊 智育分析」导入的成绩表。还没导入的话，先去那一页导一份。"
         )
         self._empty.setObjectName("Placeholder")
         self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        root.addWidget(self._empty, 1)
+        self._empty.setWordWrap(True)
+        box.addWidget(self._empty, 1)
 
-        # --- 有学生时的主体 ---
         self._body = QWidget()
         body_box = QVBoxLayout(self._body)
         body_box.setContentsMargins(0, 0, 0, 0)
@@ -131,8 +276,9 @@ class ProfilePage(QWidget):
 
         scroll.setWidget(inner)
         body_box.addWidget(scroll, 1)
-        root.addWidget(self._body, 1)
+        box.addWidget(self._body, 1)
         self._body.hide()
+        return pane
 
     # --- 第一层：学业肖像 ---
     def _build_portrait(self) -> QFrame:
@@ -202,6 +348,13 @@ class ProfilePage(QWidget):
         note.setObjectName("Muted")
         box.addWidget(note)
 
+        #: 没学号时的警告条（有学号时藏起来）
+        self._id_warn = QLabel("")
+        self._id_warn.setObjectName("Warn")
+        self._id_warn.setWordWrap(True)
+        box.addWidget(self._id_warn)
+        self._id_warn.hide()
+
         row = QHBoxLayout()
         row.setSpacing(10)
         self._intent_group = QButtonGroup(self)
@@ -220,6 +373,7 @@ class ProfilePage(QWidget):
 
         self._intent_status = QLabel("")
         self._intent_status.setObjectName("Muted")
+        self._intent_status.setWordWrap(True)
         box.addWidget(self._intent_status)
         return card
 
@@ -256,19 +410,104 @@ class ProfilePage(QWidget):
         box.addWidget(self._outline)
         return card
 
+    # ---------------------------------------------------------------- 名单
+    def _on_search(self, text: str) -> None:
+        """实时过滤：不匹配的条目 ``setHidden(True)``。
+
+        匹配用 ``findItems`` + ``MatchContains`` —— 条目文字是
+        ``张三（2023001）``，所以搜姓名和搜学号都能命中。
+        """
+        keyword = (text or "").strip()
+        for i in range(self._list.count()):
+            self._list.item(i).setHidden(True)
+        if keyword:
+            # MatchContains：条目文字是「张三（2023001）」，搜姓名和搜学号都能中。
+            # **不要加 MatchCaseInsensitive** —— PySide6 里没这个名字（只有
+            # MatchCaseSensitive），加了会抛 AttributeError；Qt 默认就是
+            # 大小写不敏感，不写即可。
+            hit = self._list.findItems(keyword, Qt.MatchFlag.MatchContains)
+            for item in hit:
+                item.setHidden(False)
+        else:
+            for i in range(self._list.count()):
+                self._list.item(i).setHidden(False)
+        self._update_list_note()
+
+    def _on_item_clicked(self, item: QListWidgetItem) -> None:
+        index = item.data(Qt.ItemDataRole.UserRole)
+        payload = self._provider(index) if self._provider is not None else None
+        if payload is None:
+            self._intent_status.setText("这一行没有可显示的侧写数据。")
+            return
+        self._payload = payload
+        self._render()
+
+    def _select_key(self, key: str) -> None:
+        """按稳定标识在名单里选中对应条目（**同名不会选错人**）。"""
+        if not key:
+            return
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if self._key_by_index.get(item.data(Qt.ItemDataRole.UserRole)) == key:
+                self._list.setCurrentItem(item)
+                self._list.scrollToItem(item)
+                return
+
+    def _migrate_name_keys(self) -> None:
+        """把老的"裸姓名"意愿迁到学号上（**只在指代唯一时才迁**）。
+
+        上一版按姓名存意愿（``name:张三``）。现在有了学号，如果全班只有**一个**
+        张三，那这份意愿指的一定是他 —— 迁过去，用户不用重选。
+        有两个及以上同名时**不猜**，原样留在 ``name:`` 键上。
+        """
+        if not self._username or not self._roster:
+            return
+        by_name: dict[str, list[Any]] = {}
+        for row in self._roster:
+            by_name.setdefault(row.student, []).append(row)
+
+        moved = 0
+        for name, rows in by_name.items():
+            if len(rows) != 1:
+                continue
+            row = rows[0]
+            if not row.has_id:
+                continue
+            old_key = f"{KEY_PREFIX_NAME}{name}"
+            if old_key not in self._intentions:
+                continue
+            value = self._intentions.pop(old_key)
+            self._intentions[row.key] = value
+            try:
+                save_intention(self._store, self._username, old_key, "")
+                save_intention(self._store, self._username, row.key, value)
+            except (CryptoError, ValueError):
+                continue
+            moved += 1
+        if moved:
+            print(f"[ProfilePage] 已把 {moved} 条按姓名的意愿迁移到学号键上。")
+
     # ---------------------------------------------------------------- 渲染
     def _render(self) -> None:
         payload = self._payload
         if payload is None:
+            self._empty.show()
+            self._body.hide()
             return
+        self._empty.hide()
+        self._body.show()
+
         name = payload["student"]
+        key = payload.get("key") or student_key(payload.get("student_id", ""), name)
+        student_id = (payload.get("student_id") or "").strip()
         results = payload.get("results") or {}
         archive = payload.get("archive")
 
         default = results.get(CalculationScope.REQUIRED_LIMITED)
         overall = results.get(CalculationScope.ALL)
 
-        self._portrait_title.setText(f"{name} · 学业肖像")
+        head = f"{name}（{student_id}）" if student_id else name
+        self._portrait_title.setText(f"{head} · 学业肖像")
         self._avg_label.setText(_fmt(default.weighted_average if default else None))
 
         # --- 趋势（core.archival.trend）---
@@ -341,18 +580,34 @@ class ProfilePage(QWidget):
                 self._tagged("· 没有明显可抢救的课（分数都已达标或学分太小）", "TagGray")
             )
 
-        # --- 意愿回填 ---
-        current = self._intentions.get(name, "")
+        # --- 没学号的警告 ---
+        if student_id:
+            self._id_warn.hide()
+        else:
+            self._id_warn.setText(
+                "⚠ 成绩表里这名学生没有学号，意愿只能按姓名存 —— "
+                "如果班上有同名的人，两个人会共用同一份意愿。"
+                "建议在成绩表里补上学号列再导入一次。"
+            )
+            self._id_warn.show()
+
+        # --- 意愿回填（键是学号，不是姓名）---
+        current = self._intentions.get(key, "")
+        # ★ 必须先关掉互斥：互斥组里**已经选中的那个按钮 setChecked(False) 是无效的**，
+        #   于是从"有志愿的学生"切到"还没选的学生"时，上一个学生的志愿会留在界面上
+        #   ——状态栏写着"还没有选意愿"，按钮却亮着一个。踩过。
+        self._intent_group.setExclusive(False)
         for option, radio in self._intent_buttons.items():
             radio.blockSignals(True)
             radio.setChecked(option == current)
             radio.blockSignals(False)
+        self._intent_group.setExclusive(True)
         self._intent_status.setText(
             f"当前意愿：{current}" if current else "还没有选意愿。"
         )
 
         # --- 提纲 ---
-        self._outline.setPlainText(self._build_outline_text(payload, rescues))
+        self._outline.setPlainText(self._build_outline_text(payload, rescues, current))
 
     def _compute_rescues(self, payload: dict[str, Any]) -> list[tuple[str, float, float, float]]:
         """算出"提至 85 能拉多少"。
@@ -395,7 +650,10 @@ class ProfilePage(QWidget):
 
     # ---------------------------------------------------------------- 提纲
     def _build_outline_text(
-        self, payload: dict[str, Any], rescues: list[tuple[str, float, float, float]]
+        self,
+        payload: dict[str, Any],
+        rescues: list[tuple[str, float, float, float]],
+        intention: str = "",
     ) -> str:
         """三段式提纲（Spec 七）。
 
@@ -416,7 +674,9 @@ class ProfilePage(QWidget):
         part = partition(archive) if archive is not None else None
         locked = list(part.get("locked", [])) if part else []
         absent = list(part.get("absent", [])) if part else []
-        intention = self._intentions.get(name, "")
+        if not intention:
+            key = payload.get("key") or student_key(payload.get("student_id", ""), name)
+            intention = self._intentions.get(key, "")
 
         # --- 一、事实陈述：念数 ---
         fact: list[str] = [f"{name}　仅必修+限选均分 {_fmt(avg)}"]
@@ -483,19 +743,23 @@ class ProfilePage(QWidget):
         payload = self._payload
         if payload is None:
             return
-        name = payload["student"]
+        key = payload.get("key") or student_key(
+            payload.get("student_id", ""), payload.get("student", "")
+        )
         if not self._username:
             self._intent_status.setText("还没有登录用户，意愿没地方存。")
             return
         try:
-            path = save_intention(self._store, self._username, name, option)
+            path = save_intention(self._store, self._username, key, option)
         except (CryptoError, ValueError) as exc:
             QMessageBox.warning(self, "意愿没能保存", str(exc))
             self._intent_status.setText(f"保存失败：{exc}")
             return
 
-        self._intentions[name] = option
-        self._intent_status.setText(f"已保存：{name} → {option}（{path.name}）")
+        self._intentions[key] = option
+        self._intent_status.setText(
+            f"已保存：{payload.get('student', '')} → {option}（{path.name}）"
+        )
         self._render()
 
     def _do_copy(self) -> None:
