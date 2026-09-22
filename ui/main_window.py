@@ -81,6 +81,12 @@ SIDEBAR_WIDTH = 190
 #: 顶栏（兼标题栏）高度
 TOPBAR_HEIGHT = 54
 
+#: 主窗淡入时长。
+#:
+#: 原来 260ms。它跟欢迎页的淡出**首尾相接**，两段加起来快半秒，
+#: 而这两段传达的是同一件事（"换界面了"）。200ms 足够看清是淡入而不是闪现。
+WINDOW_FADE_IN_MS = 200
+
 #: 导航项：``(键, 图标+文字)``。顺序即侧栏顺序。
 NAV_ITEMS: tuple[tuple[str, str], ...] = (
     ("analysis", "📊  智育分析"),
@@ -306,12 +312,17 @@ class MainWindow(QMainWindow):
             self._sync_nav(self._stack.currentIndex())
 
     def show_and_fade_in(self, username: str) -> None:
-        """显示窗口 + 淡入。登录窗淡出之后由主程序调这个。"""
+        """显示窗口 + 淡入。登录窗淡出之后由主程序调这个。
+
+        ★ 窗口可能**已经被 `AppFlow._prewarm_main` 提前 show 过**（透明度 0）。
+          那种情况下这里的 ``show()`` 是空操作，只剩一次 opacity 0→1 ——
+          这正是预热想要的结果，不用特判。
+        """
         self.set_user(username)
         self._stack.setCurrentIndex(DEFAULT_PAGE)
         self._sync_nav(DEFAULT_PAGE)
         self.show()
-        window_fade_in(self, 260)
+        window_fade_in(self, WINDOW_FADE_IN_MS)
 
     # ---------------------------------------------------------------- 内部
     def _nav_to(self, index: int) -> None:

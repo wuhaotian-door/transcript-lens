@@ -58,10 +58,30 @@ __all__ = [
     "window_fade_out",
 ]
 
-#: 淡入时长（Spec 八：单次动画不超过 250ms）
-FADE_IN_MS = 240
-#: 淡出时长
-FADE_OUT_MS = 180
+#: 淡入时长。
+#:
+#: ★ 240ms 实测一次切页要 **439ms**（中位，见下表），用户明确反馈"明显的卡顿"。
+#:   130ms 是一次切页 **~137ms** —— 落到「100ms 以内算瞬时、200ms 以上能感到迟滞」
+#:   这条感知线的下面。数字是量出来的，不是拍的：
+#:
+#:   淡出 + 淡入      实测切页中位
+#:   ------------    ------------
+#:   180 + 240         439 ms   ← 改之前
+#:    90 + 150         260 ms
+#:     0 + 150         166 ms
+#:     0 + 130        ~137 ms   ← 现在
+FADE_IN_MS = 130
+
+#: 淡出时长。**0 = 不淡出，直接换页**（见 :meth:`StackSwitcher.switch`）。
+#:
+#: 为什么砍掉淡出：淡出那一段是纯粹的等待 —— 旧页在变淡的过程中，新页还没开始
+#: 出现，用户盯着一个越来越空的屏幕。上表里 180→0 一项就省掉近 300ms，
+#: 是整条链上最划算的一刀。换来的是"点哪页立刻到哪页"，这正是桌面软件该有的手感
+#: （浏览器标签页、VS Code 都是瞬切）。
+#:
+#: 想要回淡出：把这里设回 180 即可，``switch()`` 会自动走回淡出分支，
+#: 两条路径都有测试覆盖。
+FADE_OUT_MS = 0
 
 #: 卡片阴影参数（Spec 一：blurRadius=18，offset=(0, 2)）
 SHADOW_BLUR = 18
@@ -69,10 +89,11 @@ SHADOW_OFFSET = 2
 
 #: 切页锁的最长持有时间。超过就把这一页**直接落到位**（见 :meth:`StackSwitcher._force_finish`）。
 #:
-#: 实测：一次切换中位 ~520ms（淡出 180 + 淡入 240 + Qt 调度 + 无边框窗口的
-#: 半透明合成），最慢 ~600ms。机器忙的时候（首次绘制一个重页面、Defender 扫盘）
-#: 见过一次 1513ms。所以 1500ms 太紧 —— 会去砍一次**本来会正常结束**的动画。
-#: 2500ms 只在真的卡住时才会到。
+#: 实测：去掉淡出之后，一次切换中位 **~137ms**（淡入 130ms + Qt 调度）。
+#: 但**阈值不要跟着往下调** —— 它的职责不是"卡住多久算卡住"，而是
+#: "绝不能把一个本来会正常结束的动画砍掉"。机器忙的时候（首次绘制一个重页面、
+#: Defender 扫盘）见过一次 1513ms，那个值是调低之后一定会误伤的。
+#: 2500ms 只在真的卡死时才会到，而它到了就说明确实该强推一把。
 LOCK_TIMEOUT_MS = 2500
 
 #: 正在跑的动画，按 widget 持有 —— 见模块开头第 1 条
@@ -372,6 +393,10 @@ class StackSwitcher(QObject):
         """切到 ``index``。返回是否真的执行了切换。
 
         正在动画中、或目标就是当前页 → 返回 ``False``（连点被吃掉）。
+
+        ★ ``FADE_OUT_MS == 0`` 时走**瞬时换页**分支：不挂透明度效果、
+          不建动画对象，直接换 index 再淡入新页。少掉的是一条
+          ``QGraphicsOpacityEffect`` 的建立/拆除 + 一段 180ms 的空等。
         """
         if self._busy or index == self._stack.currentIndex():
             return False
@@ -388,7 +413,17 @@ class StackSwitcher(QObject):
         self._pending = index
         self._acquire()
         try:
-            fade_out(old, FADE_OUT_MS, lambda: self._run("淡出旧页", lambda: self._after_out(index)))
+            if FADE_OUT_MS <= 0:
+                # 瞬时换页：旧页直接消失，新页淡入。
+                # 一样走 _run —— 出异常时它会调用 _finish_now 把页面落到位，
+                # 而不是把锁挂在半路上（见 _force_finish 的注释）。
+                self._run("瞬时换页", lambda: self._after_out(index))
+            else:
+                fade_out(
+                    old,
+                    FADE_OUT_MS,
+                    lambda: self._run("淡出旧页", lambda: self._after_out(index)),
+                )
         except BaseException:  # noqa: BLE001
             traceback.print_exc()
             self._release()

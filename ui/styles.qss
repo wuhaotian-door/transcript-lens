@@ -465,6 +465,48 @@ QLabel#BrandBullet {
     font-size: 12px;
 }
 
+/* --------------------------------------------------- 侧写页 · 左侧学生名单
+   ----------------------------------------------------------------------------
+   ★ 条目的**内容**（头像圆 / 姓名 / 学号 / 预警点 / 选中底色 / hover）
+     全部由 StudentItemDelegate 自绘 —— 见 ui/pages/profile_page.py。
+     这里只管控件壳：背景、边框、滚动条、人数药丸、页脚文字。
+
+   ★ 所以**不要**在这里写 QListWidget#StudentList::item 的样式：
+     delegate 一旦接管 paint()，QSS 的 ::item 规则就不会被应用，
+     写了只会让人以为它生效了（改半天没反应，最难查的那种）。
+   ------------------------------------------------------------------------- */
+QListWidget#StudentList {
+    background: transparent;
+    border: none;
+    outline: none;
+    padding: 0;
+}
+QLabel#CountPill {
+    background: #EFF6FF;
+    color: #2563EB;
+    border: 1px solid #BFDBFE;
+    border-radius: 9px;
+    padding: 1px 9px;
+    font-size: 11px;
+    font-weight: 700;
+}
+QLineEdit#ListSearch {
+    background: #F8FAFC;
+    border: 1px solid #E2E8F0;
+    border-radius: 8px;
+    padding: 5px 9px;
+    font-size: 12px;
+}
+QLineEdit#ListSearch:focus {
+    background: #FFFFFF;
+    border: 1px solid #3B82F6;
+}
+QLabel#ListNote {
+    color: #94A3B8;
+    font-size: 11px;
+    border-top: 1px solid #F1F5F9;
+}
+
 /* ------------------------------------------------------------------ 提示条 */
 QLabel#Notice {
     background: #EFF6FF;

@@ -53,7 +53,8 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Callable
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QRect, QSize, Qt
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -68,6 +69,8 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QSizePolicy,
+    QStyle,
+    QStyledItemDelegate,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -98,6 +101,168 @@ MAX_RESCUE = 5
 
 #: 左侧名单宽度
 LIST_WIDTH = 236
+
+#: 名单里一行的高度。要同时放得下头像圆(34) + 上下各 8px 呼吸，还要让
+#: 两行字（姓名 13px / 学号 11px）不挤在一起。
+ITEM_HEIGHT = 54
+
+#: 头像圆的直径
+_AVATAR = 34
+
+
+# ---- 条目上挂的数据（delegate 绘制时读）-----------------------------------
+_ROLE_INDEX = Qt.ItemDataRole.UserRole          #: 行号（原有，别改）
+_ROLE_NAME = Qt.ItemDataRole.UserRole + 1       #: 姓名
+_ROLE_ID = Qt.ItemDataRole.UserRole + 2         #: 学号（可能是空串）
+_ROLE_HAS_ID = Qt.ItemDataRole.UserRole + 3     #: 有没有学号
+_ROLE_LEVEL = Qt.ItemDataRole.UserRole + 4      #: "" / "danger" / "warning"
+_ROLE_SEED = Qt.ItemDataRole.UserRole + 5       #: 头像配色的稳定种子
+
+#: 头像底色。按学号取模选一个 —— 同一个人每次打开都是同一个颜色。
+#:
+#: ★ 绝不能用内置 ``hash()`` 当种子：Python 对 str 的 hash **每个进程都加盐**，
+#:   同一个人这次是蓝的、下次开程序就变绿了，看着像换了个人。
+_AVATAR_COLORS = (
+    "#3B82F6", "#0EA5E9", "#8B5CF6", "#EC4899",
+    "#F59E0B", "#10B981", "#6366F1", "#14B8A6",
+)
+
+_SEL_BG = "#EFF6FF"
+_HOVER_BG = "#F8FAFC"
+_ACCENT = "#3B82F6"
+_TEXT = "#0F172A"
+_MUTED = "#94A3B8"
+
+_DANGER = "#EF4444"
+_WARNING = "#F59E0B"
+
+
+def _avatar_color(seed: str) -> str:
+    """稳定的头像配色。**不用 hash()**（见 _AVATAR_COLORS 的注释）。"""
+    if not seed:
+        return "#94A3B8"
+    return _AVATAR_COLORS[sum(ord(ch) for ch in seed) % len(_AVATAR_COLORS)]
+
+
+def _initial(name: str) -> str:
+    """头像里那个字：中文取姓氏，英文取首字母。"""
+    text = (name or "").strip()
+    return text[0].upper() if text else "?"
+
+
+class StudentItemDelegate(QStyledItemDelegate):
+    """名单条目自绘 —— 头像 + 姓名 + 学号 + 预警点。
+
+    ★ 为什么用 delegate 而不是给每条 ``setItemWidget`` 塞一个 QWidget：
+      ``setItemWidget`` 每个条目都要建一整棵控件树。一个班 40 人还行，
+      一届几百人就是几百个 QWidget，滚动会明显掉帧。delegate 只画画，
+      没有控件对象，几千条也不会卡。
+
+    ★ 每一条画出来的东西都来自 ``index.data(...)``，**没有一处另算**：
+      姓名/学号来自 :class:`TableRow`，预警级别来自智育分析页**当前口径**
+      现填的 flag。所以这个列表不会自己编数据。
+    """
+
+    def sizeHint(self, option, index) -> QSize:  # noqa: N802 - Qt 命名
+        return QSize(0, ITEM_HEIGHT)
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+
+        rect: QRect = option.rect
+        # ★ 用 QStyle.StateFlag 枚举按位与 —— **不要**写 option.state.__class__，
+        #   那拿到的是 flag 的运行时类型，不是 QStyle。
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+
+        # --- 底 ---
+        if selected:
+            painter.fillRect(rect, QColor(_SEL_BG))
+            # 左侧 4px 主色线：跟侧栏导航按钮的选中态用同一种语言
+            painter.fillRect(QRect(rect.left(), rect.top(), 4, rect.height()),
+                             QColor(_ACCENT))
+        elif hovered:
+            painter.fillRect(rect, QColor(_HOVER_BG))
+
+        # --- 头像圆 ---
+        seed = index.data(_ROLE_SEED) or ""
+        name = index.data(_ROLE_NAME) or ""
+        ax = rect.left() + 14
+        ay = rect.top() + (rect.height() - _AVATAR) // 2
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(_avatar_color(seed)))
+        painter.drawEllipse(ax, ay, _AVATAR, _AVATAR)
+
+        initial_font = QFont(option.font)
+        # pointSizeF() 在字体是用 pixelSize 设的时候返回 -1 —— 兜一个底，
+        # 否则 setPointSizeF(-1+1) 会让字直接消失（实测过）。
+        base_pt = option.font.pointSizeF()
+        if base_pt <= 0:
+            base_pt = 10.0
+        initial_font.setPointSizeF(base_pt + 1.0)
+        initial_font.setBold(True)
+        painter.setFont(initial_font)
+        painter.setPen(QColor("#FFFFFF"))
+        painter.drawText(QRect(ax, ay, _AVATAR, _AVATAR),
+                         Qt.AlignmentFlag.AlignCenter, _initial(name))
+
+        # --- 右侧预留：预警点 / 缺学号角标 ---
+        level = index.data(_ROLE_LEVEL) or ""
+        has_id = bool(index.data(_ROLE_HAS_ID))
+        right_reserve = 22
+
+        # --- 文字区 ---
+        tx = ax + _AVATAR + 11
+        tw = rect.right() - right_reserve - tx
+        if tw > 20:
+            name_font = QFont(option.font)
+            name_font.setBold(True)
+            painter.setFont(name_font)
+            painter.setPen(QColor(_TEXT if (selected or hovered) else "#1F2430"))
+            metrics = QFontMetrics(name_font)
+            name_text = metrics.elidedText(name, Qt.TextElideMode.ElideRight, tw)
+
+            sid = index.data(_ROLE_ID) or ""
+            name_rect = QRect(tx, rect.top() + 9, tw, 18)
+            painter.drawText(name_rect,
+                             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                             name_text)
+
+            sub_font = QFont(option.font)
+            sub_font.setPointSizeF(max(8.0, base_pt - 1.0))
+            painter.setFont(sub_font)
+            if has_id:
+                painter.setPen(QColor(_MUTED))
+                sub_text = sid
+            else:
+                # 没学号 = 只能靠姓名区分，同名会串意愿。**在名单上就说清楚**，
+                # 不要等用户点进去才告诉他。
+                painter.setPen(QColor(_WARNING))
+                sub_text = "⚠ 无学号 · 同名会串意愿"
+            sub_metrics = QFontMetrics(sub_font)
+            painter.drawText(
+                QRect(tx, rect.top() + 28, tw, 16),
+                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                sub_metrics.elidedText(sub_text, Qt.TextElideMode.ElideRight, tw),
+            )
+
+        # --- 预警点：红=必须当场处理，黄=数据可疑 ---
+        if level in ("danger", "warning"):
+            color = _DANGER if level == "danger" else _WARNING
+            d = 8
+            cx = rect.right() - 16
+            cy = rect.top() + rect.height() // 2
+            painter.setBrush(QColor(color))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(cx - d // 2, cy - d // 2, d, d)
+
+        # --- 分隔线（最后一条不画）---
+        painter.setPen(QColor("#F1F5F9"))
+        painter.drawLine(rect.left() + 14, rect.bottom(),
+                         rect.right() - 14, rect.bottom())
+        painter.restore()
 
 
 def _fmt(value: float | None, digits: int = 2) -> str:
@@ -174,30 +339,59 @@ class ProfilePage(QWidget):
         card = make_card()
         card.setFixedWidth(LIST_WIDTH)
         box = QVBoxLayout(card)
-        box.setContentsMargins(14, 14, 14, 14)
-        box.setSpacing(10)
+        # ★ 上下左右全 0：让列表的选中底色能**顶到卡片边缘**。
+        #   原来留 14px 内边距，选中色块是一小块浮在中间的方块，很土。
+        #   内边距改由各段自己带（头部 14、搜索 12、列表 0、页脚 12）。
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(0)
 
+        # --- 头部：标题 + 人数 ---
+        head = QWidget()
+        head.setObjectName("ListHead")
+        head_box = QHBoxLayout(head)
+        head_box.setContentsMargins(14, 13, 12, 10)
+        head_box.setSpacing(8)
         title = QLabel("学生名单")
         title.setObjectName("H2")
-        box.addWidget(title)
+        head_box.addWidget(title)
+        head_box.addStretch(1)
+        self._count_pill = QLabel("0")
+        self._count_pill.setObjectName("CountPill")
+        self._count_pill.setToolTip("当前名单人数")
+        head_box.addWidget(self._count_pill)
+        box.addWidget(head)
 
+        # --- 搜索 ---
+        search_holder = QWidget()
+        search_box = QVBoxLayout(search_holder)
+        search_box.setContentsMargins(12, 0, 12, 10)
+        search_box.setSpacing(0)
         self._search = QLineEdit()
-        self._search.setPlaceholderText("🔍  搜索姓名或学号")
+        self._search.setObjectName("ListSearch")
+        self._search.setPlaceholderText("搜索姓名或学号")
         self._search.setClearButtonEnabled(True)
-        self._search.setMinimumHeight(34)
+        self._search.setMinimumHeight(32)
         self._search.textChanged.connect(self._on_search)
-        box.addWidget(self._search)
+        search_box.addWidget(self._search)
+        box.addWidget(search_holder)
 
+        # --- 列表本体 ---
         self._list = QListWidget()
         self._list.setObjectName("StudentList")
         self._list.setAlternatingRowColors(False)
         self._list.setUniformItemSizes(True)
+        self._list.setMouseTracking(True)          # hover 高亮要它才会来
+        self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._list.setFrameShape(QFrame.Shape.NoFrame)
+        self._list.setItemDelegate(StudentItemDelegate(self._list))
         self._list.itemClicked.connect(self._on_item_clicked)
         box.addWidget(self._list, 1)
 
+        # --- 页脚：人数 / 过滤说明 ---
         self._list_note = QLabel("")
-        self._list_note.setObjectName("Muted")
+        self._list_note.setObjectName("ListNote")
         self._list_note.setWordWrap(True)
+        self._list_note.setContentsMargins(14, 8, 12, 10)
         box.addWidget(self._list_note)
         return card
 
@@ -207,8 +401,16 @@ class ProfilePage(QWidget):
         self._list.clear()
         self._key_by_index = {}
         for row in self._roster:
-            item = QListWidgetItem(row.label)
-            item.setData(Qt.ItemDataRole.UserRole, row.index)
+            item = QListWidgetItem(row.label)      # text 保留：搜索靠它
+            item.setData(_ROLE_INDEX, row.index)
+            item.setData(_ROLE_NAME, row.student)
+            item.setData(_ROLE_ID, row.student_id)
+            item.setData(_ROLE_HAS_ID, bool(row.has_id))
+            # ★ 预警级别来自智育分析页**当前口径**现填的 flag（见 TableRow.flag）。
+            #   这里不自己判、不缓存 —— 口径一变那边会重新推一份名单过来。
+            item.setData(_ROLE_LEVEL, getattr(row.flag, "level", "") or "")
+            item.setData(_ROLE_SEED, row.student_id or row.student)
+            item.setSizeHint(QSize(0, ITEM_HEIGHT))
             item.setToolTip(
                 f"学号 {row.student_id}" if row.has_id
                 else "⚠ 表里没有学号，同名学生会共用同一份意愿"
@@ -223,10 +425,18 @@ class ProfilePage(QWidget):
         total = self._list.count()
         shown = sum(1 for i in range(total) if not self._list.item(i).isHidden())
         missing = sum(1 for row in self._roster if not row.has_id)
+        self._count_pill.setText(str(total))
+        flagged = sum(
+            1
+            for row in self._roster
+            if (getattr(row.flag, "level", "") or "") == "danger"
+        )
         if not total:
             self._list_note.setText("还没有名单。先在「📊 智育分析」导入成绩表。")
             return
         text = f"共 {total} 人" if shown == total else f"筛出 {shown} / {total} 人"
+        if flagged:
+            text += f"　·　红标 {flagged} 人"
         if missing:
             text += f"\n⚠ {missing} 人没有学号，同名会共用意愿"
         self._list_note.setText(text)

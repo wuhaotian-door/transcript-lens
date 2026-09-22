@@ -1,18 +1,21 @@
-"""登录成功后的欢迎页 —— 打招呼，停 1.5 秒，淡出，让位给主界面。
+"""登录成功后的欢迎页 —— 打招呼，停 0.9 秒，淡出，让位给主界面。
 
 时序（全部走 QTimer / QPropertyAnimation，**一处 time.sleep 都没有**）::
 
-    opacity 0 → 1   (260ms)
-    停留 1500ms     (QTimer.singleShot)
-    opacity 1 → 0   (260ms)
+    opacity 0 → 1   (180ms)
+    停留 900ms      (QTimer.singleShot)
+    opacity 1 → 0   (180ms)
     finished 信号   → 主程序淡入主窗口
 
-★ 为什么要多这一页
-------------------
+★ 时序是量出来的，不是拍的
+--------------------------
 
-登录窗淡出之后直接"啪"地跳出主界面，人会有点懵：刚输完密码，还没反应过来
-就到了另一个界面。中间垫一句带时间的问候，是让人喘一口气，也是确认
-"进来的是我，账号没选错"。
+「登录成功 → 用户真的看见主界面」原来要 2020ms，是整条启动链上最大的一块。
+问候语只有一行、日期只有一行，扫一眼就够了，1500ms 是纯粹站着等。
+现在 180 + 900 + 180 = 1260ms。
+
+★ 主窗口在这 900ms 里**已经建好了**（见 ``main.AppFlow`` 的预热），
+  所以这条线跑完就能直接淡入，不用再等一次原生窗口创建。
 
 ★ 时段划分（按系统本地时间）
 
@@ -30,7 +33,9 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime
+from typing import Callable
 
 from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
@@ -54,10 +59,20 @@ __all__ = [
 ]
 
 #: 淡入 / 淡出各用多久
-FADE_MS = 260
+FADE_MS = 180
 
-#: 完全显示后停留多久（需求：1.5 秒）
-HOLD_MS = 1500
+#: 完全显示后停留多久。
+#:
+#: 原来 1500ms —— 实测「登录 → 看见主界面」这一段因此多花 600ms。
+#: 这一页要传达的信息只有一句问候 + 一个日期，人扫一眼就够了；
+#: 900ms 读得完，又不至于变成一段站着等的过场。
+#:
+#: ★ 主窗的构造（实测约 600ms）**藏在这 900ms 里面**，不是加在它后面
+#:   —— 见 :meth:`WelcomeWindow._after_in`。
+HOLD_MS = 900
+
+#: 停留时间的下限。预热再慢也要让人看清是谁进来了。
+_MIN_HOLD_MS = 400
 
 _CARD_W = 520
 _CARD_H = 280
@@ -109,11 +124,15 @@ class WelcomeWindow(QWidget):
         hold_ms: int = HOLD_MS,
         fade_ms: int = FADE_MS,
         now: datetime | None = None,
+        on_shown: Callable[[], None] | None = None,
     ) -> None:
         super().__init__()
         self._username = username or ""
         self._hold_ms = hold_ms
         self._fade_ms = fade_ms
+        #: 淡入结束、这一页**真的画在屏幕上**之后调一次（只调一次）。
+        #: 主程序用它来预热主窗 —— 见 :meth:`_after_in`。
+        self._on_shown = on_shown
         self._done = False
 
         apply_frameless(self)
@@ -179,7 +198,31 @@ class WelcomeWindow(QWidget):
         window_fade(self, 0.0, 1.0, self._fade_ms, self._after_in)
 
     def _after_in(self) -> None:
-        QTimer.singleShot(self._hold_ms, self._fade_out)
+        """淡入结束 —— 这一页已经在屏幕上了。
+
+        ★ ``on_shown`` 必须在这里调，**不能**在 :meth:`run` 里紧接着
+          ``show()`` 调。``run()`` 只是把动画 start 出去就返回了，
+          那一刻窗口还是 opacity 0、一帧都没画；在那种时候跑一段
+          600ms 的同步工作（建主窗），事件循环被占住，淡入动画会
+          **冻在第一帧**上 —— 用户看到的是"点了一下，半天没反应"。
+
+          等淡入跑完再建，这 600ms 就落在用户正看着问候语的时候。
+
+        ★ 停留时间是**扣掉这段工作之后**的余量。
+
+          一开始写成"干完活再开始计时"，结果这一页实际停留
+          ``900 + 600 = 1500ms`` —— 问候语本身只要扫一眼，多出来的
+          600ms 纯粹是站着等。改成先扣后等，用户看到的始终是
+          ``HOLD_MS``，而工作藏在里面。
+        """
+        started = time.perf_counter()
+        if self._on_shown is not None:
+            hook, self._on_shown = self._on_shown, None
+            hook()
+        spent_ms = (time.perf_counter() - started) * 1000.0
+        # 留一个下限：工作再慢也要让人看清是谁进来了
+        remaining = max(_MIN_HOLD_MS, int(self._hold_ms - spent_ms))
+        QTimer.singleShot(remaining, self._fade_out)
 
     def _fade_out(self) -> None:
         window_fade(self, self.windowOpacity(), 0.0, self._fade_ms, self._emit_finished)

@@ -18,10 +18,21 @@
 ``必修`` / ``必修+限选`` / ``全部`` —— 正好就是 :class:`CalculationScope` 的三档，
 不新增、不改口径定义（Spec 第 61 / 246 行：默认必修+限选计入，**选修默认剔除**）。
 
-切换筛选只做两件事：
+切换筛选只做三件事：
 
 1. ``showColumn`` / ``hideColumn`` 把口径列显隐对齐到当前选择；
-2. 红标**跟着当前口径重算** —— 因为分母变了，"挂科/缺考"的判定基础就变了。
+2. 红标**跟着当前口径重算** —— 因为分母变了，"挂科/缺考"的判定基础就变了；
+3. 把重算后的名单再推给侧写页一次（它名单上的红点也按口径判）。
+
+★ 表头为什么三档共用一句「加权均分」
+----------------------------------
+
+同一时刻只有一档列可见（另外两档 ``hideColumn``），表头再区分"口径①/②/③"
+就是重复信息 —— 上面那三个按钮已经亮着当前是哪一档。三条信息各归各位：
+
+* **表头**　　→ 这一列是什么数据（恒定 :data:`SCOPE_HEADER`）
+* **按钮 / 状态行** → 现在算的是哪一档
+* **表下明细行**　→ 三档各是多少，逐档写全名（证据链在这里，一个数都没少）
 
 ★ 为什么行序是唯一的身份
 ------------------------
@@ -38,6 +49,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Any
 
@@ -76,15 +88,37 @@ __all__ = [
     "ID_COLUMN",
     "NAME_COLUMN",
     "SCOPE_COLUMNS",
+    "SCOPE_HEADER",
     "AnalysisPage",
 ]
 
-#: 表格里的三档口径列（顺序即列顺序）
+#: 表格里的三档口径列（顺序即列顺序）。
+#:
+#: 第二个元素是**口径全名**，只用在表下方那行明细里
+#: （``口径① 含全部＝85.05…　|　口径② 仅必修+限选＝…``）。
+#: 它**不进表头** —— 表头统一叫 :data:`SCOPE_HEADER`，原因见那里。
 SCOPE_COLUMNS: tuple[tuple[str, str, CalculationScope], ...] = (
     ("all", "口径① 含全部", CalculationScope.ALL),
     ("req_lim", "口径② 仅必修+限选", CalculationScope.REQUIRED_LIMITED),
     ("req", "口径③ 仅必修", CalculationScope.REQUIRED_ONLY),
 )
+
+#: 三档口径列在**表头**里统一显示这一行字。
+#:
+#: ★ 为什么不写「口径① 含全部」这种带区分的表头
+#:
+#: 因为**同一时刻只有一档列是可见的**（``_apply_scope`` 把另外两档
+#: ``hideColumn`` 掉）。表头再写"口径②"就是重复信息 —— 上面那三个筛选按钮
+#: 已经亮着当前是哪一档了。用户看到的就是一句"加权均分"，干净。
+#:
+#: ★ 分工（改这里之前先读）：
+#:
+#: * **表头** = 这一列是什么数据 → :data:`SCOPE_HEADER`，恒定，不随筛选变；
+#: * **筛选按钮 + 状态行** = 现在算的是哪一档 → ``FILTER_LABELS`` / ``_update_status``；
+#: * **表下明细行** = 三档各是多少（逐档列全名）→ :data:`SCOPE_COLUMNS` 的第二项。
+#:
+#: 三条各司其职，所以证据链一点没丢：三个数字仍然同时可见、各有全名。
+SCOPE_HEADER = "加权均分"
 
 #: 完整列标题：**姓名 + 学号 + 三口径 + 红标原因 + 操作**。
 #:
@@ -95,7 +129,7 @@ SCOPE_COLUMNS: tuple[tuple[str, str, CalculationScope], ...] = (
 #:   自动推导之后，两边再也不可能漂移。
 COLUMN_TITLES: tuple[str, ...] = (
     ("姓名", "学号")
-    + tuple(title for _key, title, _scope in SCOPE_COLUMNS)
+    + (SCOPE_HEADER,) * len(SCOPE_COLUMNS)
     + ("红标原因", "操作")
 )
 
@@ -159,11 +193,17 @@ def _fmt(value: float | None) -> str:
 
 @dataclass(frozen=True)
 class TableRow:
-    """表格一行的身份。**行序就是身份**，姓名只是显示用的。"""
+    """表格一行的身份。**行序就是身份**，姓名只是显示用的。
+
+    ``flag`` 是**当前口径下**的预警（由 :meth:`AnalysisPage.roster` 现填）。
+    侧写页左侧名单靠它在名字旁边点一个小圆点。默认 ``None`` ——
+    导入那一刻还没选口径，谁都不该被标。
+    """
 
     index: int
     student: str
     student_id: str
+    flag: Any = None
 
     @property
     def key(self) -> str:
@@ -298,6 +338,9 @@ class AnalysisPage(QWidget):
             self._refresh_flag_column()
             self._show_detail(self._current_index())
             self._update_status()
+            # ★ 名单也要跟着重推一次：侧写页左侧的小红点是按口径判的，
+            #   分母变了它就得变（见 roster() 的注释）。
+            self.roster_changed.emit(self.roster())
 
     def _apply_scope(self) -> None:
         """按当前口径 ``showColumn`` / ``hideColumn``。
@@ -415,7 +458,7 @@ class AnalysisPage(QWidget):
         self._fill_table()
         self._update_status()
         # 把名单推给侧写辅导页（它靠这个建左侧列表）
-        self.roster_changed.emit(list(self._rows))
+        self.roster_changed.emit(self.roster())
 
     def _refresh_flags(self) -> None:
         """为核心口径算红标。**按行序**返回，同名也不会串。"""
@@ -590,8 +633,18 @@ class AnalysisPage(QWidget):
         return self.payload_at(self._current_index())
 
     def roster(self) -> list[TableRow]:
-        """全班名单（侧写辅导页的左侧列表用它）。"""
-        return list(self._rows)
+        """全班名单（侧写辅导页的左侧列表用它）。
+
+        ★ ``flag`` 字段是**按当前口径现填**的 —— ``self._rows`` 里存的那份
+          flag 永远是 ``None``（导入时还没选口径）。不这么做的话，用户在
+          智育分析页把筛选从「必修+限选」切到「全部」，侧写页名单上的小红点
+          会**停在旧口径的判定上** —— 分母都变了，红点却没跟着变，
+          正是这个项目最忌讳的那种"界面在说谎"。
+        """
+        return [
+            dataclasses.replace(row, flag=self._flag_at(self._scope, row.index))
+            for row in self._rows
+        ]
 
     def export_records(self) -> list[dict[str, Any]]:
         """给设置页的导出功能提供记录。

@@ -550,6 +550,8 @@ class AppFlow:
         self.login = None
         self.welcome = None
         self.main = None
+        #: 正在淡出的开屏。**必须留着引用**（见 _after_splash 的注释）
+        self._retiring_splash = None
 
     # ---------------------------------------------------------------- 入口
     def start(self) -> None:
@@ -560,10 +562,31 @@ class AppFlow:
         self.splash.run()
 
     def _after_splash(self) -> None:
-        """开屏结束：有有效令牌就直接进主界面，否则弹登录。"""
+        """开屏结束：有有效令牌就直接进主界面，否则弹登录。
+
+        ★ 这一段是**在开屏还盖着屏幕的时候**跑的。
+
+        ``SplashScreen._start_fade_out`` 的次序是"先发 ``finished``、
+          再淡出自己"，所以这个槽返回之前，用户看到的仍然是开屏。
+          下面这一整段 —— ``load_token`` + 建主窗 + 建欢迎页 ——
+          实测 **765ms**，全都被开屏遮住。改这个次序之前先读
+          ``ui/splash.py`` 的 ``HOLD_MS`` 注释。
+
+        ★ 开屏的 Python 引用**不能在这里就丢**（踩过 0xC0000409）。
+
+        顶层窗口没有 parent：引用一没，它的 C++ 对象就被析构，
+        而它的淡出动画 parent 就在它身上 —— 动画跑到一半源没了，
+        整个进程直接消失、一个字都不打。所以交给 ``_retiring_splash``
+        挂住，等它自己 ``dismissed`` 再放手。
+        """
         from core.session_token import load_token
 
+        splash = self.splash
         self.splash = None
+        if splash is not None:
+            self._retiring_splash = splash
+            splash.dismissed.connect(self._splash_gone)
+
         user = load_token(self.root)
         if user:
             # 自动登录也算"登录成功"，同样先打一句招呼
@@ -571,20 +594,65 @@ class AppFlow:
         else:
             self.show_login()
 
+    def _splash_gone(self) -> None:
+        """开屏已经淡出并关闭 —— 现在才可以放开它。"""
+        self._retiring_splash = None
+
     # ---------------------------------------------------------------- 欢迎页
     def greet_then_main(self, username: str) -> None:
-        """登录成功之后：先欢迎页（停 1.5s），再淡入主界面。
+        """登录成功之后：先欢迎页（停 0.9s），再淡入主界面。
 
         ★ 这一页不是装饰。登录窗淡出后直接跳出主界面，人会懵一下；
           中间垫一句带时间的问候，也是确认"进来的是我，账号没选错"。
+
+        ★ 主窗在**这一页的停留里**建好（``on_shown`` → :meth:`_prewarm_main`）。
+          实测 ``MainWindow()`` 构造 + ``set_user`` 要 **600ms**（6 个页面
+          全量 QSS polish + 解密这个人的意愿）。这 600ms 原来花在
+          "欢迎页还没出现、屏幕上什么都没有"的那一刻，现在落在
+          用户正看着问候语的时候。
+
+        ★ 两条路径都被盖住了：
+          * 自动登录 → 这一段跑在开屏背后（开屏还没淡出）；
+          * 手动登录 → 登录窗淡出后欢迎页立刻 show 出来，再预热。
         """
         from ui.welcome import WelcomeWindow
 
-        self.welcome = WelcomeWindow(username)
+        self.welcome = WelcomeWindow(
+            username,
+            on_shown=lambda: self._prewarm_main(username),
+        )
         self.welcome.finished.connect(
             lambda name=username: self._after_welcome(name)
         )
         self.welcome.run()
+
+    def _prewarm_main(self, username: str) -> None:
+        """提前把主窗建出来并映射（**透明度 0，看不见**）。
+
+        为什么敢 show()：``MainWindow.__init__`` 里已经 ``setWindowOpacity(0.0)``，
+        所以映射出来的是一扇全透明窗口 —— Windows 照样为它建好原生句柄、
+        跑完布局、加载好 QSS，但这些开销全落在用户看不见的时候。
+        等欢迎页淡出，主窗只剩一次 opacity 0→1。
+
+        失败**不抛**：预热是优化，不是功能。真出问题就退回
+        :meth:`show_main` 里现建现显的老路，启动不能因为优化而挂掉。
+        """
+        if self.main is not None:
+            return
+        from ui.main_window import MainWindow
+
+        try:
+            window = MainWindow(root=self.root)
+            window.switch_account.connect(self._on_switch_account)
+            window.set_user(username)
+            window.show()
+        except Exception:  # noqa: BLE001 - 优化失败不能拦住启动
+            import traceback as _tb
+
+            _tb.print_exc()
+            self.main = None
+            return
+        self.main = window
 
     def _after_welcome(self, username: str) -> None:
         self.welcome = None
@@ -592,11 +660,12 @@ class AppFlow:
 
     # ---------------------------------------------------------------- 主界面
     def show_main(self, username: str, *, fade: bool = True) -> None:
-        from ui.main_window import MainWindow
+        """起主界面。已经被 :meth:`_prewarm_main` 建好时直接复用那一扇。"""
+        if self.main is None:
+            from ui.main_window import MainWindow
 
-        self.main = MainWindow(root=self.root)
-        self.main.switch_account.connect(self._on_switch_account)
-        self.main.set_user(username)
+            self.main = MainWindow(root=self.root)
+            self.main.switch_account.connect(self._on_switch_account)
         if fade:
             self.main.show_and_fade_in(username)
         else:
@@ -636,6 +705,16 @@ class AppFlow:
         self.greet_then_main(username)
 
 
+def _any_visible_splash(app) -> bool:
+    """还有没有一块开屏挂在屏幕上（截图/启动检查用）。"""
+    from ui.splash import SplashScreen
+
+    for widget in app.topLevelWidgets():
+        if isinstance(widget, SplashScreen) and widget.isVisible():
+            return True
+    return False
+
+
 def run_bootcheck() -> int:
     """跑一遍**真实启动流程**（开屏 → 欢迎页 → 主界面），把结果写进报告文件。
 
@@ -657,6 +736,13 @@ def run_bootcheck() -> int:
     import tempfile
     import time
     from pathlib import Path as _Path
+
+    #: 性能计时的起点。
+    #:
+    #: ⚠ 它**不含** PyInstaller onefile 的解包时间（那一段在 Python 起来
+    #:   之前），也不含本函数下面准备临时账户的 PBKDF2 —— 只覆盖
+    #:   "建 QApplication → 开屏 → 欢迎页 → 主窗可见"这条真实界面路径。
+    started_at = time.perf_counter()
 
     report_path = _Path(tempfile.gettempdir()) / "transcript-lens-bootcheck.txt"
     lines: list[str] = []
@@ -728,11 +814,11 @@ def run_bootcheck() -> int:
         )
         check(
             "欢迎页让位、主窗建出来",
-            wait_until(lambda: flow.welcome is None and flow.main is not None, 8000,
+            wait_until(lambda: flow.welcome is None and flow.main is not None, 12000,
                        "main"),
         )
-        # 主窗还有一次 260ms 的淡入要跑完才真正"看得见"
-        pump(900)
+        # 主窗还有一次 200ms 的淡入要跑完才真正"看得见"
+        pump(700)
 
         main = flow.main
         check("★ 主窗口建出来了", main is not None, type(main).__name__ if main else "None")
@@ -744,6 +830,16 @@ def run_bootcheck() -> int:
             check("★ 原生窗口句柄可见",
                   main.windowHandle() is not None and main.windowHandle().isVisible())
             check("★ 主窗口没被藏起来", not main.isHidden())
+            # ★ 开屏必须真的被关掉、并且引用被放开。
+            #   开屏现在自己负责淡出收尾（_start_fade_out 先 finished 再淡出），
+            #   如果 dismissed 没接上，AppFlow 会永远挂着它 —— 而且它是置顶窗口，
+            #   会一直盖在主界面上（界面上看就是"主窗出来了但被什么挡住"）。
+            pump(500)
+            check("★ 开屏已经关掉", not _any_visible_splash(app),
+                  f"retiring={flow._retiring_splash is not None}")
+            check("★ 开屏的引用已经放开", flow._retiring_splash is None)
+            say(f"     （建 app → 主窗可见：{time.perf_counter() - started_at:.2f}s，"
+                f"不含 PyInstaller 解包）")
             pump(300)
             shot = _Path(tempfile.gettempdir()) / "transcript-lens-bootcheck.png"
             try:
