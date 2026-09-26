@@ -59,6 +59,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -73,11 +74,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.archival import archive_key, build_archive
+from core.archival import (
+    SEMESTER_ORDER,
+    TOTAL_TERMS,
+    Archive,
+    archive_key,
+    build_archive,
+)
 from core.calculator import CalculationScope, calculate_many
 from core.crypto_store import CryptoError, CryptoStore
+from core.parser import Category
 from core.scholarship import ClassRecord, save_class, validate_class_name
-from core.user_store import save_user_json
+from core.user_store import load_user_json, save_user_json
 from core.validator import describe_alerts, parse_and_validate
 from ui.flags import LEVEL_DANGER, LEVEL_WARNING, build_flags_by_index
 from ui.intentions import student_key
@@ -94,7 +102,9 @@ __all__ = [
     "NAME_COLUMN",
     "SCOPE_COLUMNS",
     "SCOPE_HEADER",
+    "SEMESTER_TERMS",
     "AnalysisPage",
+    "scope_breakdown",
 ]
 
 #: 表格里的三档口径列（顺序即列顺序）。
@@ -162,6 +172,41 @@ FILTER_LABELS: dict[CalculationScope, str] = {
 #: 默认筛选 = Spec 的默认计算口径（必修+限选计入，选修剔除）
 DEFAULT_FILTER = CalculationScope.REQUIRED_LIMITED
 
+#: 课程类别的中文名。**从 :class:`core.parser.Category` 取**，界面逐字对上。
+#:
+#: ★ charter 第一节把必修 / 限选 / 选修定成**三个完全独立的类别**，
+#:   所以界面上也必须能一个字一个字地看出来谁被算进去了 ——
+#:   这正是上一版文档把"选修"说成"归限选"时没人发现的原因：
+#:   按钮上写着"全部"，没人知道"全部"到底含不含选修。
+CATEGORY_LABELS: dict[Category, str] = {
+    Category.REQUIRED: "必修",
+    Category.LIMITED: "限选",
+    Category.ELECTIVE: "选修",
+    Category.UNKNOWN: "未标类别",
+}
+
+#: 口径列 / 筛选按钮旁边常驻的那句话（charter 一节的核心纠正）。
+CALC_SCOPE_NOTE = (
+    "必修、限选、选修是三个独立类别：口径① 三类全算，口径② 只算必修＋限选，"
+    "口径③ 只算必修。选修默认剔除，**绝不并进限选**。"
+)
+
+
+def scope_breakdown(scope: CalculationScope) -> str:
+    """把某一档口径"到底算了哪几类课"写成一句人话。
+
+    ★ 真源是 :attr:`core.calculator.CalculationScope.categories`。这里**只做翻译**，
+      不自己判断哪一类算不算数 —— 口径表一旦被口头复述第二遍，
+      就会出现"选修归入限选"那种错误，而且界面上看不出来。
+    """
+    allowed = scope.categories
+    order = (Category.REQUIRED, Category.LIMITED, Category.ELECTIVE)
+    text = "＋".join(CATEGORY_LABELS[cat] for cat in order if cat in allowed)
+    missing = [CATEGORY_LABELS[cat] for cat in order if cat not in allowed]
+    if missing:
+        text += f"（{'、'.join(missing)}不计入）"
+    return text
+
 #: 「操作」列宽度。「侧写」按钮 + 左右各 6px 容器边距，留点余量。
 _ACTION_COLUMN_WIDTH = 96
 
@@ -171,9 +216,24 @@ _ROW_HEIGHT = 44
 #: 操作列里那个小按钮的最小高度
 _ROW_BUTTON_HEIGHT = 28
 
-#: 导入时假设的学期标签。表里没有学期信息，用"未标注学期"，
-#: **不猜** —— 猜错会让纵向档案的排序和趋势全乱。
+#: 导入时可以选的学期标签（**大一上 → 大四下**，本科 8 个学期）。
+#:
+#: ★ **一处真源**：直接取 :data:`core.archival.SEMESTER_ORDER` 的前
+#:   :data:`core.archival.TOTAL_TERMS` 个，不在这里另抄一份。
+#:   档案按什么顺序排（``core.archival.semester_rank``）就是按那张表算的 ——
+#:   抄第二份迟早会漂移，而漂移的表现是"时间轴上大二下排在大一上前头"。
+#:
+#: 大五（五年制）不放进下拉框：本项目的剩余学期数是按
+#: ``TOTAL_TERMS = 8`` 算的，列出来只会让人以为自己读的是五年制。
+SEMESTER_TERMS: tuple[str, ...] = SEMESTER_ORDER[:TOTAL_TERMS]
+
+#: 兜底学期标签。**正常情况下用不到** —— 下拉框永远有选中项。
+#: 它只服务于"绕过界面直接调 :func:`core.archival.build_archive`"的路径
+#: （测试、命令行），那里确实没有学期可问。
 DEFAULT_TERM = "未标注"
+
+#: 学期标签为空时的告警（``build_archive`` 自己也会记一条，这里是界面上的那一句）
+TERM_MISSING_HINT = "没有学期标签，纵向档案会把这次导入归进同一个无名学期"
 
 #: 纵向归档在加密库里的文件名（成长档案页读它）
 ARCHIVE_FILE = "archive.json.enc"
@@ -290,6 +350,22 @@ class AnalysisPage(QWidget):
             "导入时没填会弹窗问你要。"
         )
         head.addWidget(self._class_edit)
+
+        # --- 学期（纵向档案的标签；成长档案页的时间轴 / 趋势 Δ 全靠它）---
+        head.addSpacing(10)
+        term_caption = QLabel("学期")
+        term_caption.setObjectName("H3")
+        head.addWidget(term_caption)
+        self._term_box = QComboBox()
+        self._term_box.addItems(SEMESTER_TERMS)
+        self._term_box.setMinimumHeight(38)
+        self._term_box.setMinimumWidth(92)
+        self._term_box.setToolTip(
+            "这一份成绩属于哪个学期。\n"
+            "成长档案的学期时间轴和趋势 Δ 按它排 —— "
+            "同一学期导入两次会各留一份，绝不互相覆盖。"
+        )
+        head.addWidget(self._term_box)
         head.addStretch(1)
 
         # --- 口径筛选：三个 Toggle，互斥，默认「必修+限选」---
@@ -304,6 +380,12 @@ class AnalysisPage(QWidget):
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.setMinimumHeight(34)
             button.setChecked(scope is DEFAULT_FILTER)
+            # ★ 每一档到底算了哪几类，写在按钮自己的气泡里。
+            #   按钮上的字是简写（"全部"），气泡里是展开的三类别。
+            button.setToolTip(
+                f"计入：{scope_breakdown(scope)}\n"
+                "三档口径是 charter 一节定死的，不新增、不改定义。"
+            )
             button.clicked.connect(
                 lambda _=False, s=scope: self._set_scope(s)
             )
@@ -342,7 +424,8 @@ class AnalysisPage(QWidget):
         root.addWidget(self._table, 1)
 
         self._detail = QLabel(
-            "双击任意一行（或点该行的「侧写」）即可跳到「🎯 侧写辅导」。"
+            "双击任意一行（或点该行的「侧写」）即可跳到「🎯 侧写辅导」。\n"
+            + CALC_SCOPE_NOTE
         )
         self._detail.setObjectName("Muted")
         self._detail.setWordWrap(True)
@@ -358,12 +441,32 @@ class AnalysisPage(QWidget):
 
     # ---------------------------------------------------------------- 外部
     def set_user(self, username: str) -> None:
-        """切账户时调用。班级是**按用户**存的，所以换人要换班级号输入框。"""
+        """切账户时调用。班级是**按用户**存的，所以换人要换班级号输入框。
+
+        ★ 内存里那份归档也要一起丢掉 —— 它是上一个用户的，
+          留着会让下一个人导入时把两个人的学期并进同一份档案。
+        """
         self._username = username or ""
+        self._archive = None
 
     @property
     def store(self) -> CryptoStore:
         return self._store
+
+    @property
+    def term(self) -> str:
+        """当前选中的学期标签（导入、建档、导出都用它）。
+
+        下拉框永远有选中项，所以这里**不会**返回空串；
+        ``DEFAULT_TERM`` 只是给不走界面的调用方兜底的。
+        """
+        text = self._term_box.currentText().strip() if self._term_box else ""
+        return text or DEFAULT_TERM
+
+    def set_term(self, term: str) -> None:
+        """程序化选学期（测试与"接着上学期导"用）。认不出的标签就退回第 1 个。"""
+        index = self._term_box.findText((term or "").strip())
+        self._term_box.setCurrentIndex(index if index >= 0 else 0)
 
     @property
     def class_name(self) -> str:
@@ -482,7 +585,7 @@ class AnalysisPage(QWidget):
         return ClassRecord(
             class_name=class_name,
             source=source,
-            term=DEFAULT_TERM,
+            term=self.term,
             students=students,
         )
 
@@ -566,10 +669,18 @@ class AnalysisPage(QWidget):
             self._set_status("计算失败。", error=True)
             return
 
-        # 归档：侧写辅导页的"趋势 / 定型·可救"从这里来，本页算一次就够
+        # 归档：侧写辅导页的"趋势 / 定型·可救"从这里来，本页算一次就够。
+        #
+        # ★ 必须把**已有归档**一起带上做 append。不带的话每导一次就把上一个
+        #   学期整份覆盖掉 —— 成长档案永远只有一个学期、趋势 Δ 永远显示
+        #   "单次导入，暂无趋势"。这和"学期标签是未标注"是同一个病的两条腿：
+        #   只有把两份成绩都留住，纵向对比才成立。
         try:
             self._archive = build_archive(
-                parsed, DEFAULT_TERM, source=_base_name(path)
+                parsed,
+                self.term,
+                archive=self._load_archive(),
+                source=_base_name(path),
             )
         except Exception:  # noqa: BLE001 - 归档失败不该拦住看数字
             self._archive = None
@@ -600,6 +711,30 @@ class AnalysisPage(QWidget):
         self._save_class(class_name, self._source)
         # 把名单推给侧写辅导页（它靠这个建左侧列表）
         self.roster_changed.emit(self.roster())
+
+    def _load_archive(self) -> Archive | None:
+        """从加密库读回纵向归档，作为本次导入的 append 底座。
+
+        读不出来就返回 ``None`` —— ``build_archive`` 会把 ``None``
+        当成"新建一份"，也就是"这是这个用户的第一次导入"，不是错误。
+
+        ★ 优先用内存里那份（同一会话里连续导入两个学期时省一次解密），
+          但内存那份可能是**上一个用户**的，所以 ``set_user`` 会把它清掉。
+        """
+        if self._archive is not None:
+            return self._archive
+        if not self._username:
+            return None
+        try:
+            payload = load_user_json(self._store, self._username, ARCHIVE_FILE)
+        except (CryptoError, ValueError, OSError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        try:
+            return Archive.from_dict(payload)
+        except Exception:  # noqa: BLE001 - 坏档案不该拦住看数字
+            return None
 
     def _save_archive(self) -> None:
         """把纵向归档写进加密库（成长档案页靠它跨重启存活）。
@@ -854,7 +989,7 @@ class AnalysisPage(QWidget):
                 {
                     "S编号": f"S{index:03d}",
                     "姓名": row.student,
-                    "学期": DEFAULT_TERM,
+                    "学期": self.term,
                     "口径": FILTER_LABELS[scope],
                     "加权均分": result.weighted_average,
                     "总学分": result.total_credit,
@@ -885,9 +1020,11 @@ class AnalysisPage(QWidget):
         else:
             anchor_text = "锚点校验通过"
         text = (
-            f"已导入 {self._source}　·　{len(parsed.courses)} 门课 / "
+            f"已导入 {self._source}　·　学期「{self.term}」　·　"
+            f"{len(parsed.courses)} 门课 / "
             f"{parsed.total_credit:g} 学分　·　{len(self._rows)} 名学生　·　"
-            f"当前口径「{FILTER_LABELS[self._scope]}」　·　"
+            f"当前口径「{FILTER_LABELS[self._scope]}」"
+            f"（{scope_breakdown(self._scope)}）　·　"
             f"红标 {danger} 人 / 黄标 {warning} 人　·　{anchor_text}"
         )
         if missing_ids:

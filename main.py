@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
 #: 仓库根 / PyInstaller 解包目录。必须在 import ui / core 之前进 sys.path，
 #: 否则直接双击 exe 时找不到包。
@@ -319,6 +320,15 @@ def _selfcheck_report() -> tuple[bool, str]:
         if line.startswith("FAIL"):
             failures.append("联网红线检查")
 
+    # --- 课程三类别独立（charter 一节 + 三节铁律 8）------------------------
+    #
+    # "必修 / 限选 / 选修 是三个完全独立的类别，任何将选修归入限选的逻辑都是 bug"
+    # —— 这条不能只写在文档里，得有一条会 FAIL 的检查盯着。
+    for line in _category_policy_report():
+        lines.append(line)
+        if line.startswith("FAIL"):
+            failures.append("课程类别独立检查")
+
     # --- 所有模块能否 import（不创建窗口）----------------------------------
     for name in CHECK_MODULES:
         step(f"import {name}", lambda n=name: "ok" if __import__(n) else "ok")
@@ -329,6 +339,133 @@ def _selfcheck_report() -> tuple[bool, str]:
     else:
         lines.append("RESULT: ALL OK")
     return not failures, "\n".join(lines)
+
+
+def _category_policy_report() -> list[str]:
+    """课程三类别独立（charter 一节 + 三节铁律 8）。
+
+    charter 原话：**"必修、限选、选修是三个完全独立的类别，绝不混同"**、
+    **"任何将选修归入限选的逻辑都是 bug"**。这条不能只写在文档里 ——
+    得有一条会 FAIL 的检查盯着，否则下一次"整理口径表"又会把它揉回去
+    （上一版文档就是这么错的，而且没人发现）。
+
+    ★ 为什么做成**行为验证**而不是"数一数枚举里有几个值"
+    ------------------------------------------------
+
+    造一个三门课的学生，三门各属一个类别、分数两两不同::
+
+        高等数学(4学分)必修 = 80
+        专业英语(2学分)限选 = 90
+        音乐鉴赏(1学分)选修 = 100
+
+    三档口径的结果必然互不相同::
+
+        口径① 三类全算     (320+180+100)/7 = 85.714286
+        口径② 必修+限选    (320+180)/6     = 83.333333
+        口径③ 仅必修        320/4          = 80
+
+    **关键在 ②≠①**：只要有人把选修当成限选算进去，② 立刻变成 85.714286 == ①，
+    这条就 FAIL。只看枚举定义是抓不到这种 bug 的 —— 类别是独立的不等于
+    口径表里用得对。
+    """
+    lines: list[str] = []
+    try:
+        from core.calculator import CalculationScope, calculate_many
+        from core.parser import Category, parse_dataframe
+    except Exception as exc:  # noqa: BLE001
+        return [f"FAIL  课程类别检查：import 失败 {exc.__class__.__name__}: {exc}"]
+
+    wanted = {Category.REQUIRED, Category.LIMITED, Category.ELECTIVE}
+    have = {c for c in Category}
+    missing = wanted - have
+    if missing:
+        return [
+            "FAIL  core.parser.Category 少了独立类别："
+            + "、".join(sorted(c.value for c in missing))
+        ]
+    lines.append(
+        "ok    Category 三个独立类别齐全    "
+        + "/".join(c.value for c in (Category.REQUIRED, Category.LIMITED, Category.ELECTIVE))
+    )
+
+    # --- 口径表：每档到底含哪几类（charter 一节的三口径定义）---------------
+    expect_sets = {
+        CalculationScope.ALL: wanted,
+        CalculationScope.REQUIRED_LIMITED: {Category.REQUIRED, Category.LIMITED},
+        CalculationScope.REQUIRED_ONLY: {Category.REQUIRED},
+    }
+    wrong_sets = [
+        scope.value
+        for scope, want in expect_sets.items()
+        if not want <= scope.categories
+    ]
+    if wrong_sets:
+        lines.append("FAIL  口径类别集合与 charter 一节不一致：" + "、".join(wrong_sets))
+    else:
+        lines.append("ok    三档口径的类别集合 == charter 一节（①全部 ②必修+限选 ③仅必修）")
+
+    folded = [
+        scope.value
+        for scope in expect_sets
+        if scope is not CalculationScope.ALL and Category.ELECTIVE in scope.categories
+    ]
+    if folded:
+        lines.append(
+            "FAIL  选修被并进了这些口径（charter 十节明令禁止）：" + "、".join(folded)
+        )
+    else:
+        lines.append("ok    选修不在口径②③里 —— 没有被并进限选")
+
+    # --- 行为验证：真算一遍，看三档结果是否互不相同 ------------------------
+    expect_avg = {
+        CalculationScope.ALL: 600 / 7,
+        CalculationScope.REQUIRED_LIMITED: 500 / 6,
+        CalculationScope.REQUIRED_ONLY: 80.0,
+    }
+    try:
+        import pandas as pd
+
+        frame = pd.DataFrame(
+            [
+                ["姓名", "学号", "高等数学(4学分)必修",
+                 "专业英语(2学分)限选", "音乐鉴赏(1学分)选修"],
+                ["张三", "2023001", 80, 90, 100],
+            ]
+        )
+        parsed = parse_dataframe(frame)
+        results = calculate_many(parsed)
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"FAIL  三类别样例解析/计算失败 {exc.__class__.__name__}: {exc}")
+        return lines
+
+    got: dict[Any, float | None] = {}
+    for scope in expect_sets:
+        rows = results.get(scope) or []
+        got[scope] = rows[0].weighted_average if rows else None
+
+    off = [
+        f"{scope.value} = {got[scope]!r}，应为 {expect_avg[scope]:.6f}"
+        for scope in expect_sets
+        if got[scope] is None or abs(got[scope] - expect_avg[scope]) > 1e-6
+    ]
+    if off:
+        lines.append("FAIL  三档口径加权与手算不符：" + "；".join(off))
+    else:
+        lines.append(
+            "ok    三档口径加权 == 手算    85.714286 / 83.333333 / 80.000000"
+        )
+
+    all_avg = got[CalculationScope.ALL]
+    rl_avg = got[CalculationScope.REQUIRED_LIMITED]
+    ro_avg = got[CalculationScope.REQUIRED_ONLY]
+    if all_avg is not None and rl_avg is not None and abs(all_avg - rl_avg) < 1e-9:
+        lines.append("FAIL  口径① == ② —— 选修被算进口径②了")
+    elif rl_avg is not None and ro_avg is not None and abs(rl_avg - ro_avg) < 1e-9:
+        lines.append("FAIL  口径② == ③ —— 限选被算进口径③了")
+    else:
+        lines.append("ok    口径① ≠ ② ≠ ③：选修只进①、限选只进①②")
+
+    return lines
 
 
 def _network_policy_report() -> list[str]:
