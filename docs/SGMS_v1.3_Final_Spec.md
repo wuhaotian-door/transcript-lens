@@ -1,7 +1,8 @@
 > ⚠️ **本文件已归档（2026-09-22）**
 > 本 Spec 已被 `docs/SGMS_v1.6_Dev_Charter.md` 全面取代。
 > 所有新开发以 v1.6 为准，本文档仅保留作历史参考，不再更新。
-># 成绩单透镜（transcript-lens）· v1.3 终版技术设计文档
+
+# 成绩单透镜（transcript-lens）· v1.3 终版技术设计文档
 
 > 仓库：`https://gitee.com/wuhaotiansystem/transcript-lens.git`
 > 默认分支：`master`（Gitee 初始化默认，沿用即可，不再改）
