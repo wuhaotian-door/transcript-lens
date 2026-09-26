@@ -360,8 +360,10 @@ class ScholarshipPage(QWidget):
         box.addWidget(save_btn)
 
         self._stack_box = QCheckBox("允许特等叠加一二三等")
+        # ★ 气泡是**纯文本**，别写 Markdown 记号 —— 用户会看到两个星号本身
+        #   （`%TEMP%\tl_label_lint.py` 就是专门抓这个的）
         self._stack_box.setToolTip(
-            "默认不叠加：拿特等的人**不占**名额，后面的同学往前补。\n"
+            "默认不叠加：拿特等的人不占名额，后面的同学往前补。\n"
             "勾上则两个奖都算他的（表格里显示「特等+一等」）。"
         )
         box.addWidget(self._stack_box)
