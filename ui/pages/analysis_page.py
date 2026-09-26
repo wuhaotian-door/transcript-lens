@@ -81,7 +81,7 @@ from core.archival import (
     archive_key,
     build_archive,
 )
-from core.calculator import CalculationScope, calculate_many
+from core.calculator import MAX_SCORE, MIN_SCORE, CalculationScope, calculate_many
 from core.crypto_store import CryptoError, CryptoStore
 from core.parser import Category
 from core.scholarship import ClassRecord, save_class, validate_class_name
@@ -104,6 +104,7 @@ __all__ = [
     "SCOPE_HEADER",
     "SEMESTER_TERMS",
     "AnalysisPage",
+    "out_of_range_scores",
     "scope_breakdown",
 ]
 
@@ -261,6 +262,64 @@ def _read_raw_frame(path: str) -> pd.DataFrame:
 
 def _fmt(value: float | None) -> str:
     return "—" if value is None else f"{value:.6f}"
+
+
+def out_of_range_scores(parsed: Any, limit: int = 8) -> list[str]:
+    """挑出原始分数**不在 0~100** 的格子，写成给人看的一句话列表。
+
+    ★ 为什么要有这个（实测出来的问题，2026-09-26）
+    --------------------------------------------
+
+    ``core/calculator`` 会把超出 0~100 的分数判成**非有效成绩**，那门课就
+    **静默掉出加权分母**（学分也不进分母），可是 ``course_scores`` 里**还留着
+    这个分数**。后果是两边不一致：
+
+    * 智育加权：那门课等于没算；
+    * 奖学金特等奖「每门 ≥90」判的是 ``score is not None``，
+      于是一个录成 **101 的笔误会被当成达标**。
+
+    实测：张三高等数学 91 改成 101 之后，口径② 从 85.052632 掉到 82.928571
+    （``1161/14`` —— 5 个学分凭空少了），而 course_scores 里仍然列着 101.0。
+
+    ★ 为什么在**界面层**拦：修它要改封板的 ``core/calculator.py``（铁律一），
+      所以退一步 —— 导入时把超范围的格子摆到**强制人工确认**弹窗上
+      （红线 3 本来就要求人工回显确认）。不动 calculator，也不会算错。
+
+    Returns:
+        每条形如 ``"张三 · 高等数学 = 101（应 ≤100）"``；超过 ``limit`` 条时
+        最后补一句"还有 N 处"。没有任何越界时返回空列表。
+    """
+    if parsed is None:
+        return []
+    courses = list(getattr(parsed, "courses", ()) or ())
+    out: list[str] = []
+    total = 0
+    for row in getattr(parsed, "rows", ()) or ():
+        if not getattr(row, "is_valid", False):
+            continue
+        scores = list(getattr(row, "score_list", ()) or ())
+        for index, raw in enumerate(scores):
+            if raw is None:
+                continue
+            try:
+                score = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if MIN_SCORE <= score <= MAX_SCORE:
+                continue
+            total += 1
+            if len(out) >= limit:
+                continue
+            name = getattr(courses[index], "name", f"第 {index + 1} 门课") \
+                if index < len(courses) else f"第 {index + 1} 门课"
+            direction = ">100" if score > MAX_SCORE else "<0"
+            out.append(
+                f"{getattr(row, 'student', '?')} · {name} = {score:g}"
+                f"（{direction}，应 {MIN_SCORE:g}~{MAX_SCORE:g}）"
+            )
+    if total > len(out):
+        out.append(f"…… 还有 {total - len(out)} 处越界，请回原始表逐格核对。")
+    return out
 
 
 @dataclass(frozen=True)
@@ -649,10 +708,13 @@ class AnalysisPage(QWidget):
             return
 
         # ★ 红线 3：强制人工回显确认。没确认就绝不进入计算。
+        #   顺带把"分数超出 0~100"的格子摆上来 —— 那些格子会被 calculator
+        #   静默排除出加权分母（见 out_of_range_scores 的说明）。
         confirmed = confirm_courses(
             self,
             parsed.courses,
             extra_alerts=describe_alerts(anchor_report),
+            score_alerts=out_of_range_scores(parsed),
             warnings=parsed.warnings,
         )
         if not confirmed:

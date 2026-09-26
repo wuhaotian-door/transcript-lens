@@ -1,10 +1,12 @@
-"""⚙️ 设置页 —— 激活码 / 导出 / 清库（Spec 七）。
+"""⚙️ 设置页 —— 激活码 / 导出 / 清库 / AI 开关 / 更新检查。
 
-三件事都**真的接通了 core**，不是死按钮：
+五件事都**真的接通了 core**，不是死按钮：
 
 * 激活码 → :func:`core.activation.try_activate`（读状态 → 校验 → 通过了才落盘）
 * 导出   → :mod:`core.exporter`（明文版 / 脱敏版两个按钮）
 * 清库   → 删掉本用户的 ``.enc`` 载荷，**二次确认**
+* AI     → 只有开关和占位，**一个网络请求都没有**（charter 七节）
+* 更新   → :mod:`core.updater`，**只在点按钮时**联网一次，不自动下载
 
 ★ 红线 7：换激活码**只锁「导入」**，绝不清空或改动已有成绩库。
   所以「换码」和「清库」在这里是两个完全独立的按钮，
@@ -15,7 +17,8 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
@@ -25,6 +28,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -33,7 +37,15 @@ from core.activation import load_state, try_activate
 from core.ai.local_assistant import PLACEHOLDER as LOCAL_PLACEHOLDER
 from core.crypto_store import CryptoError, CryptoStore, PAYLOAD_FILES
 from core.exporter import export_anonymized_xlsx, export_plain_xlsx
+from core.updater import (
+    CURRENT_VERSION,
+    GITEE_RELEASES_PAGE,
+    STATUS_ERROR,
+    UpdateCheck,
+    check_for_update,
+)
 from ui.anim import make_card
+from ui.workers import run_async
 
 __all__ = ["AI_SETTINGS_FILE", "SettingsPage"]
 
@@ -61,6 +73,8 @@ class SettingsPage(QWidget):
         self._username = ""
         #: 由主窗口注入：返回当前要导出的记录列表（可能为空）
         self._export_provider: Callable[[], list[dict[str, Any]]] | None = None
+        #: 更新检查正在进行中（防止连点，也防止回调里重复开弹窗）
+        self._checking = False
         self._build()
 
     # ---------------------------------------------------------------- 外部
@@ -72,7 +86,31 @@ class SettingsPage(QWidget):
 
     # ---------------------------------------------------------------- 搭界面
     def _build(self) -> None:
-        box = QVBoxLayout(self)
+        """搭页面。
+
+        ★ 五张卡片摞起来**比一屏高**（实测 sizeHint 1187px > 页面 1119px），
+          所以必须套一层 ``QScrollArea``。不套的话「更新」那张卡片会被
+          挤出可视区 —— 用户根本看不到验收标准里那个「检查更新」按钮，
+          而界面上没有任何东西提示"下面还有内容"（AGENTS.md 4c 那一类事故：
+          断言全绿、界面上却是坏的）。
+        """
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._scroll = QScrollArea()
+        self._scroll.setObjectName("PageScroll")
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        outer.addWidget(self._scroll)
+
+        body = QWidget()
+        self._scroll.setWidget(body)
+
+        box = QVBoxLayout(body)
         box.setContentsMargins(22, 20, 22, 20)
         box.setSpacing(14)
 
@@ -189,6 +227,8 @@ class SettingsPage(QWidget):
         box.addWidget(clr_card)
 
         box.addWidget(self._build_ai_card())
+
+        box.addWidget(self._build_update_card())
 
         box.addStretch(1)
 
@@ -371,6 +411,116 @@ class SettingsPage(QWidget):
         else:
             QMessageBox.warning(self, "激活码不可用", result.message)
         self._refresh_activation()
+
+    # ---------------------------------------------------------------- 更新
+    def _build_update_card(self) -> QFrame:
+        """更新检查（charter v1.7 第七节）。
+
+        ★ **只在用户点按钮时才联网**，没有任何自动检查。
+        ★ 请求走 :func:`ui.workers.run_async`（后台线程）——
+          在按钮回调里直接 ``urlopen`` 的话，断网时要卡满 5 秒超时，
+          期间窗口不重绘（``ui/workers.py`` 开头讲的就是这个）。
+        ★ **不自动下载、不自动替换 exe**（charter 十节明令禁止）：
+          只弹窗问一句，用户点「去下载」才打开浏览器。
+        """
+        card = make_card()
+        box = QVBoxLayout(card)
+        box.setContentsMargins(24, 20, 24, 20)
+        box.setSpacing(10)
+
+        title = QLabel("更新")
+        title.setObjectName("H2")
+        box.addWidget(title)
+
+        note = QLabel(
+            "只在您点「检查更新」时才联网，只读一次版本号；"
+            "不会自动下载，也不会自动替换程序。"
+        )
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        box.addWidget(note)
+
+        row = QHBoxLayout()
+        self._ver_label = QLabel(f"当前版本 v{CURRENT_VERSION}")
+        self._ver_label.setObjectName("H3")
+        row.addWidget(self._ver_label)
+        row.addSpacing(12)
+
+        self._update_btn = QPushButton("检查更新")
+        self._update_btn.setObjectName("Ghost")
+        self._update_btn.setMinimumHeight(38)
+        self._update_btn.setMinimumWidth(110)
+        self._update_btn.clicked.connect(self._do_check_update)
+        row.addWidget(self._update_btn)
+        row.addStretch(1)
+        box.addLayout(row)
+
+        self._upd_status = QLabel(
+            "想确认有没有新版本，点一下「检查更新」。"
+        )
+        self._upd_status.setObjectName("Muted")
+        self._upd_status.setWordWrap(True)
+        box.addWidget(self._upd_status)
+        return card
+
+    def _set_update_status(self, text: str, *, error: bool = False) -> None:
+        self._upd_status.setText(text)
+        self._upd_status.setObjectName("Danger" if error else "Muted")
+        style = self._upd_status.style()
+        style.unpolish(self._upd_status)
+        style.polish(self._upd_status)
+
+    def _do_check_update(self) -> None:
+        """点「检查更新」：后台线程发一次请求，回来再动界面。"""
+        if self._checking:
+            return
+        self._checking = True
+        self._update_btn.setEnabled(False)
+        self._update_btn.setText("检查中…")
+        self._set_update_status("正在检查…")
+
+        def _done(result: Any) -> None:
+            self._checking = False
+            self._update_btn.setEnabled(True)
+            self._update_btn.setText("检查更新")
+            self._apply_update_result(result)
+
+        def _failed(exc: BaseException) -> None:
+            # check_for_update 自己吞掉所有网络异常，走到这里说明是别的问题
+            self._checking = False
+            self._update_btn.setEnabled(True)
+            self._update_btn.setText("检查更新")
+            self._set_update_status(
+                f"检查失败，请手动访问仓库。（{type(exc).__name__}）", error=True
+            )
+
+        run_async(self, check_for_update, on_done=_done, on_error=_failed)
+
+    def _apply_update_result(self, result: UpdateCheck) -> None:
+        """把检查结果落到界面上。**四种状态给四句不同的话**。"""
+        if result.status == STATUS_ERROR:
+            self._set_update_status(
+                "检查失败，请手动访问仓库查看是否有新版本。", error=True
+            )
+            return
+        self._set_update_status(result.detail)
+        if not result.has_newer:
+            return
+        answer = QMessageBox.question(
+            self,
+            "发现新版本",
+            f"发现新版本 v{result.version}（当前 v{CURRENT_VERSION}），是否前往下载？\n\n"
+            "程序不会自动下载，也不会自动替换 —— 到页面上自己下载即可。",
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Ok,
+            QMessageBox.StandardButton.Ok,
+        )
+        if answer == QMessageBox.StandardButton.Ok:
+            QDesktopServices.openUrl(QUrl(GITEE_RELEASES_PAGE))
+            # ★ 别把"发现新版本"那句话冲掉 —— 用户回来还得知道刚才发现了什么。
+            #   换成"已打开浏览器"会把结论吞掉（测试里就是这么抓到的）。
+            self._set_update_status(
+                f"{result.detail} 已打开浏览器：{GITEE_RELEASES_PAGE}"
+            )
 
     # ---------------------------------------------------------------- 导出
     def _do_export(self, *, anonymized: bool) -> None:

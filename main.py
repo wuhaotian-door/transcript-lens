@@ -32,7 +32,9 @@ PyInstaller 以入口脚本所在目录作为模块搜索起点。``ui/`` 里的
 
 from __future__ import annotations
 
+import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -329,6 +331,12 @@ def _selfcheck_report() -> tuple[bool, str]:
         if line.startswith("FAIL"):
             failures.append("课程类别独立检查")
 
+    # --- v1.7 版本标记 + 备份可用性（charter 八节 / 任务书 4）---------------
+    for line in _version_migration_report():
+        lines.append(line)
+        if line.startswith("FAIL"):
+            failures.append("版本迁移检查")
+
     # --- 所有模块能否 import（不创建窗口）----------------------------------
     for name in CHECK_MODULES:
         step(f"import {name}", lambda n=name: "ok" if __import__(n) else "ok")
@@ -465,6 +473,91 @@ def _category_policy_report() -> list[str]:
     else:
         lines.append("ok    口径① ≠ ② ≠ ③：选修只进①、限选只进①②")
 
+    return lines
+
+
+def _version_migration_report() -> list[str]:
+    """v1.7 版本标记 + 迁移备份（charter 八节 / 任务书任务四）。
+
+    四件事，每件都**真跑一遍**，不是在源码里找关键字：
+
+    1. 版本号只有一个真源（``core.version``），``core.updater`` 是 import 来的；
+    2. 新建一个临时加密库，``users.json`` 里**必须**有 ``__vault_version__``；
+    3. 老库（没有标记）**必须**被判成 1.0 且"需要迁移"；
+    4. 备份路径**真的可写** —— 建临时库、真备份一次、核对内容。
+
+    ★ 全程用 ``tempfile`` 建的临时目录，**绝不碰用户真实的 %LOCALAPPDATA%/SGMS**。
+    """
+    import json
+    import shutil
+    import tempfile
+    from pathlib import Path as _Path
+
+    lines: list[str] = []
+    work = _Path(tempfile.mkdtemp(prefix="tl_selfcheck_mig_"))
+    try:
+        from core import updater as _updater
+        from core.crypto_store import CryptoStore
+        from core.migrator import backup_vault, check_compatibility, migrate
+        from core.version import CURRENT_VERSION, VAULT_VERSION_KEY
+
+        # --- 1. 版本号真源 -------------------------------------------------
+        if _updater.CURRENT_VERSION is not CURRENT_VERSION:
+            lines.append(
+                "FAIL  core.updater.CURRENT_VERSION 和 core.version 不是同一个值："
+                f"{_updater.CURRENT_VERSION!r} vs {CURRENT_VERSION!r}"
+            )
+        else:
+            lines.append(f"ok    版本号一处真源（core.version）        v{CURRENT_VERSION}")
+
+        # --- 2. 新库自带版本标记 -------------------------------------------
+        root = work / "fresh"
+        root.mkdir(parents=True, exist_ok=True)
+        store = CryptoStore(root=root)
+        store.register("自检用户", "selfcheck123")
+        raw = json.loads((root / "users.json").read_text(encoding="utf-8"))
+        got = raw.get(VAULT_VERSION_KEY)
+        if got != CURRENT_VERSION:
+            lines.append(
+                f"FAIL  新建的加密库没有版本标记：{VAULT_VERSION_KEY}={got!r}，"
+                f"应为 {CURRENT_VERSION!r}"
+            )
+        else:
+            lines.append(f"ok    新库自带版本标记                      {VAULT_VERSION_KEY}={got}")
+
+        # --- 3. 老库被判成 1.0 且需要迁移 -----------------------------------
+        legacy_root = work / "legacy"
+        legacy_root.mkdir(parents=True, exist_ok=True)
+        legacy = CryptoStore(root=legacy_root)
+        legacy.register("老用户", "selfcheck123")
+        path = legacy_root / "users.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.pop(VAULT_VERSION_KEY, None)
+        data.pop("vault_version", None)
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        needs, old = check_compatibility(data)
+        if (needs, old) != (True, "1.0"):
+            lines.append(f"FAIL  无标记的老库应判成 (True, '1.0')，实际 ({needs}, {old!r})")
+        else:
+            lines.append("ok    无标记的老库 → 1.0 且需要迁移")
+        migrated = migrate(old, data)
+        if migrated.get(VAULT_VERSION_KEY) != CURRENT_VERSION:
+            lines.append("FAIL  migrate() 之后版本标记还是没写上")
+        else:
+            lines.append(f"ok    migrate() 只动版本标记        1.0 → {CURRENT_VERSION}")
+
+        # --- 4. 备份路径真的可写 -------------------------------------------
+        backup = backup_vault(legacy_root, old)
+        if not (backup / "users.json").exists():
+            lines.append(f"FAIL  备份里没有 users.json：{backup}")
+        elif backup.parent != legacy_root or not backup.name.startswith("backup_v1.0_"):
+            lines.append(f"FAIL  备份路径不符合 charter 8.2 规范：{backup}")
+        else:
+            lines.append(f"ok    备份路径可写且规范                    {backup.name}")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"FAIL  版本迁移自检抛异常 {exc.__class__.__name__}: {exc}")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
     return lines
 
 
@@ -620,6 +713,125 @@ def _network_policy_report() -> list[str]:
     except Exception as exc:  # noqa: BLE001
         lines.append(f"FAIL  SMTP 路径不可用：{type(exc).__name__}: {exc}")
 
+    # --- 5. 更新检查：**唯一**被允许的 stdlib 联网（charter 第四节）---------
+    #
+    # charter v1.7 把"更新检查"加进了白名单：用户点「检查更新」时，
+    # 允许用 urllib.request 只读一次 Gitee 的版本号。
+    #
+    # ★ 但"允许"不等于"不管"：这里守三件事 ——
+    #   1) 它真的只用 stdlib，没偷偷引第三方 HTTP 客户端；
+    #   2) **import 期绝不联网**（没有自动检查，必须等用户点按钮）；
+    #   3) 超时就是 5 秒（不然按钮会卡很久）。
+    lines.extend(_updater_policy_lines())
+
+    return lines
+
+
+def _updater_policy_lines() -> list[str]:
+    """更新检查的三条守卫（charter 第四节 / 任务书任务四）。
+
+    ★ 源码模式 / 打包版**分两层**，和 ``core/ai`` 那条扫描同一个套路：
+
+    * **源码模式**（``core/updater.py`` 在磁盘上）：静态扫 import + 把
+      ``urlopen`` 换成"一调用就抛"的桩**重新 import 一遍**。两条都是真的。
+    * **打包版**：模块在 **PYZ 归档**里，磁盘上**没有** ``.py`` ——
+      静态扫描无从下手。这时改查**命名空间**（模块真的拉了 ``urllib.request``、
+      而且没有任何被禁的库进了 ``sys.modules``），并且**明说**哪一项只在源码
+      模式生效，不装作查过了。
+
+    ★ 第一版忘了分支，打包版直接报
+      ``FAIL  core/updater.py 不存在 —— 更新检查没有实现``，
+      可它明明就在包里跑着 —— 打包被自检拦下了（闸门起作用了，但结论是假的）。
+      和当初 ``core/ai`` 扫到 0 个文件报 ok 是同一个坑的两面：
+      **"扫不到"不等于"没问题"，得按打包形态换一种查法。**
+    """
+    import importlib
+    import re as _re
+    import sys as _sys
+    import urllib.request
+
+    lines: list[str] = []
+    try:
+        module = importlib.import_module("core.updater")
+    except Exception as exc:  # noqa: BLE001
+        return [f"FAIL  core.updater import 失败：{type(exc).__name__}: {exc}"]
+
+    banned = ("requests", "httpx", "aiohttp", "urllib3", "openai", "anthropic")
+    updater_path = PROJECT_ROOT / "core" / "updater.py"
+
+    # --- 1. 只用 stdlib，绝不引第三方 HTTP 客户端 --------------------------
+    if updater_path.exists():
+        source = updater_path.read_text(encoding="utf-8")
+        offenders = [
+            name
+            for name in banned
+            if _re.search(rf"^\s*(?:import|from)\s+{name}\b", source, _re.MULTILINE)
+        ]
+        if offenders:
+            lines.append(f"FAIL  core/updater.py 引了第三方 HTTP 客户端：{offenders}")
+        elif not _re.search(
+            r"^\s*(?:import|from)\s+urllib\.request\b", source, _re.MULTILINE
+        ):
+            lines.append(
+                "FAIL  core/updater.py 没有用 urllib.request（charter 7.3 唯一允许的方式）"
+            )
+        else:
+            lines.append(
+                f"ok    {'更新检查只用 stdlib':<32} urllib.request，无 requests/httpx"
+            )
+    else:
+        # 打包版：源码进了 PYZ。改查命名空间 + sys.modules
+        uses_stdlib = hasattr(module, "urllib") and hasattr(module.urllib, "request")
+        leaked = [name for name in banned if name in _sys.modules]
+        if leaked:
+            lines.append(f"FAIL  打包版里出现了被禁的联网库：{leaked}")
+        elif not uses_stdlib:
+            lines.append(
+                "FAIL  打包版 core.updater 的命名空间里没有 urllib.request —— "
+                "更新检查没接上"
+            )
+        else:
+            lines.append(
+                f"ok    {'更新检查（打包版）':<32} 无 .py 源码（打进 PYZ），"
+                "改由命名空间检查兜底"
+            )
+
+    # --- 2. import 期不许联网（没有自动检查）------------------------------
+    #
+    # 做法：把 urlopen 换成一个"一调用就抛"的桩，再把模块重新 import 一遍。
+    # 只要模块体里有任何一次网络调用，这条就 FAIL。
+    # 这比"在源码里 grep 有没有调用"结实得多 —— 常量折叠、间接调用都躲不掉。
+    real_urlopen = urllib.request.urlopen
+
+    def _boom(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("import core.updater 的时候联网了")
+
+    urllib.request.urlopen = _boom  # type: ignore[assignment]
+    try:
+        importlib.reload(module)
+    except AssertionError as exc:
+        lines.append(f"FAIL  core.updater 在 import 期联网：{exc}")
+    except Exception as exc:  # noqa: BLE001
+        # 打包版重载可能不被支持（源码在 PYZ 里）。**明说**，不装作查过了 ——
+        # 这道检查真正生效的地方是打包前的**源码自检**（build_exe.ps1 先跑它）。
+        lines.append(
+            f"ok    {'更新检查不自动跑':<32} 打包版无法重载（{type(exc).__name__}），"
+            "本项以打包前的源码自检为准"
+        )
+    else:
+        lines.append(
+            f"ok    {'更新检查不自动跑':<32} import 期零网络调用（只有点按钮才发请求）"
+        )
+    finally:
+        urllib.request.urlopen = real_urlopen  # type: ignore[assignment]
+
+    # --- 3. 超时 5 秒 ------------------------------------------------------
+    from core.updater import DEFAULT_TIMEOUT
+
+    if DEFAULT_TIMEOUT != 5:
+        lines.append(f"FAIL  更新检查超时应为 5 秒（charter 7.2），实际 {DEFAULT_TIMEOUT}")
+    else:
+        lines.append(f"ok    {'更新检查超时':<32} {DEFAULT_TIMEOUT}s（charter 7.2）")
     return lines
 
 
@@ -1186,6 +1398,115 @@ def run_bootcheck() -> int:
     return 1 if failed else 0
 
 
+@dataclass(frozen=True)
+class VaultStatus:
+    """启动时对加密库的体检结论（**不带界面**，方便自检直接断言）。"""
+
+    exists: bool
+    version: str
+    #: ``"none"`` 不用管 / ``"migrate"`` 该问用户要不要迁 / ``"too-new"`` 库比程序新
+    action: str
+    detail: str
+
+
+def vault_status(root: str | None = None) -> VaultStatus:
+    """看一眼加密库的版本，决定启动时要做什么（charter 8.2 的启动检测）。
+
+    ★ 这一步**必须在登录之前**做得出来 —— 所以数据版本标记写在
+      ``users.json``（明文索引）里，而不是某个要密码才打得开的密文里。
+      不然"要不要迁移"这个问题得先登录才能回答，而登录本身可能就
+      因为版本不对而失败。
+    """
+    from core.crypto_store import CryptoStore, default_root
+    from core.migrator import check_compatibility
+    from core.version import CURRENT_VERSION, compare_versions
+    from pathlib import Path as _Path
+
+    target = _Path(root) if root else default_root()
+    store = CryptoStore(target)
+    if not store.users_path.exists():
+        return VaultStatus(False, CURRENT_VERSION, "none", "还没有加密库，不需要迁移。")
+    try:
+        data = store.load_users().to_dict()
+    except Exception as exc:  # noqa: BLE001 - 读不出来也得让程序能启动
+        return VaultStatus(
+            True, "?", "none",
+            f"users.json 读不出来（{type(exc).__name__}: {exc}），本次不做迁移。",
+        )
+
+    needs, old = check_compatibility(data)
+    if compare_versions(old, CURRENT_VERSION) > 0:
+        return VaultStatus(
+            True, old, "too-new",
+            f"检测到数据版本 v{old}，高于程序版本 v{CURRENT_VERSION}。请先更新程序。",
+        )
+    if needs:
+        return VaultStatus(
+            True, old, "migrate",
+            f"检测到旧版数据 (v{old})，可以迁移到 v{CURRENT_VERSION}。",
+        )
+    return VaultStatus(True, old, "none", f"数据版本 v{old}，与程序一致。")
+
+
+def run_startup_migration(root: str | None = None) -> None:
+    """启动检测（charter 8.2 / 任务书 2.4）：问用户要不要迁移，然后照做。
+
+    三条硬约束：
+
+    1. **备份失败 = 拒绝迁移**（``core.migrator.migrate_store`` 里保证）；
+    2. 用户选「取消」→ **继续运行**，旧数据一个字节都不动；
+    3. 库比程序新 → **只提示，绝不动它**。
+    """
+    from core.crypto_store import CryptoStore
+    from core.migrator import MigrationError, migrate_store
+    from core.version import CURRENT_VERSION as _CUR
+    from PySide6.QtWidgets import QMessageBox
+
+    # 自动化（截图脚本、真实时序测试）里不该弹模态框 —— 会一直等人点。
+    # 只有显式设了这个环境变量才跳过；正常启动永远会走完检测。
+    if str(os.environ.get("TL_SKIP_MIGRATION", "")).strip() not in ("", "0"):
+        return
+
+    status = vault_status(root)
+    if status.action == "none":
+        return
+
+    if status.action == "too-new":
+        QMessageBox.warning(None, "数据版本比程序新", status.detail)
+        return
+
+    answer = QMessageBox.question(
+        None,
+        "检测到旧版数据",
+        f"{status.detail}\n\n"
+        "迁移前会把整个数据目录完整备份一份（放在数据目录里的 backup_ 文件夹），"
+        "备份失败就拒绝迁移；迁移过程中只改版本标记，成绩、意愿、档案都不动。\n\n"
+        "要现在迁移吗？",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.Yes,
+    )
+    if answer != QMessageBox.StandardButton.Yes:
+        QMessageBox.information(
+            None,
+            "已跳过迁移",
+            f"程序继续以 v{_CUR} "
+            f"运行，旧数据保持 v{status.version} 不动。下次启动还会再问一次。",
+        )
+        return
+
+    store = CryptoStore(_Path(root) if root else None)
+    try:
+        outcome = migrate_store(store)
+    except MigrationError as exc:
+        QMessageBox.critical(
+            None,
+            "迁移失败",
+            f"{exc}\n\n旧数据没有被改动，程序仍可继续使用。",
+        )
+        return
+    QMessageBox.information(None, "迁移完成", outcome.detail)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
 
@@ -1219,6 +1540,9 @@ def main(argv: list[str] | None = None) -> int:
 
     app = make_app([sys.argv[0], *args])
     flow = AppFlow(app)
+    # ★ 放在开屏**之前**：迁移可能弹模态框，让模态框跟开屏动画抢屏幕
+    #   会变成一团乱。这里按次序问完，再让开屏出场。
+    run_startup_migration(flow.root)
     flow.start()
     return app.exec()
 

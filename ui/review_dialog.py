@@ -58,6 +58,7 @@ class ReviewDialog(QDialog):
         *,
         title: str = "请核对提取结果",
         extra_alerts: Iterable[str] = (),
+        score_alerts: Iterable[str] = (),
         warnings: Iterable[str] = (),
         parent: QWidget | None = None,
     ) -> None:
@@ -129,6 +130,18 @@ class ReviewDialog(QDialog):
             box.setWordWrap(True)
             root.addWidget(box)
 
+        # ★ 分数超出 0~100 的格子：必须单独说，不能混进上面那个"锚点校验"框
+        #   ——那个标题写的就不是这件事。见 analysis_page.out_of_range_scores。
+        score_notes = [str(line) for line in score_alerts if str(line).strip()]
+        if score_notes:
+            box = QLabel(
+                "⚠ 成绩超出 0~100（请核对原始表）：\n"
+                + "\n".join(f"· {line}" for line in score_notes)
+            )
+            box.setObjectName("Warn")
+            box.setWordWrap(True)
+            root.addWidget(box)
+
         notes = [str(line) for line in warnings if str(line).strip()]
         if notes:
             box = QLabel("解析提示：\n" + "\n".join(f"· {line}" for line in notes[:6]))
@@ -192,17 +205,24 @@ def confirm_courses(
     *,
     title: str = "请核对提取结果",
     extra_alerts: Iterable[str] = (),
+    score_alerts: Iterable[str] = (),
     warnings: Iterable[str] = (),
 ) -> bool:
     """弹窗让人核对。**返回 True 才允许进入计算。**
 
     这是红线 3 的唯一入口 —— 调用方拿到 ``False`` 就必须停下来，
     不显示任何数字。
+
+    Args:
+        score_alerts: 原始分数超出 0~100 的格子（见
+            :func:`ui.pages.analysis_page.out_of_range_scores`）。
+            单独一栏显示，不混进锚点校验。
     """
     dialog = ReviewDialog(
         courses,
         title=title,
         extra_alerts=extra_alerts,
+        score_alerts=score_alerts,
         warnings=warnings,
         parent=parent,
     )

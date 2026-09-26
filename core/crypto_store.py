@@ -101,6 +101,12 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
+from core.version import (
+    CURRENT_VERSION,
+    LEGACY_VAULT_VERSION_KEY,
+    VAULT_VERSION_KEY,
+)
+
 __all__ = [
     "APP_DIR_NAME",
     "ENC_SUFFIX",
@@ -396,10 +402,24 @@ class UserRecord:
 
 @dataclass(frozen=True)
 class UserIndex:
-    """``users.json`` 的内容。有盐、校验值和被包裹的库密钥，**没有任何明文密码**。"""
+    """``users.json`` 的内容。有盐、校验值和被包裹的库密钥，**没有任何明文密码**。
+
+    ``version`` 和 ``vault_version`` 是**两件事**，别合并：
+
+    ==================  ==========  ============================================
+    字段                 类型        含义
+    ==================  ==========  ============================================
+    ``version``          ``int``     **这个文件自己的结构版本**（``USERS_VERSION``）
+    ``vault_version``    ``str``     **数据版本**，如 ``"1.7"``（charter 8.1）
+    ==================  ==========  ============================================
+
+    数据版本空串 = 老库（v1.6 及以前没写过这个标记）→ 迁移那边按 ``1.0`` 处理。
+    """
 
     users: tuple[UserRecord, ...] = ()
     version: int = USERS_VERSION
+    #: 数据版本标记，写进 JSON 时叫 ``__vault_version__``（charter 8.1）
+    vault_version: str = ""
 
     def __len__(self) -> int:
         return len(self.users)
@@ -430,7 +450,13 @@ class UserIndex:
         return replace(self, users=tuple(u for u in self.users if u.uid != uid))
 
     def to_dict(self) -> dict[str, Any]:
-        return {"version": self.version, "users": [u.to_dict() for u in self.users]}
+        data: dict[str, Any] = {
+            "version": self.version,
+            "users": [u.to_dict() for u in self.users],
+        }
+        if self.vault_version:
+            data[VAULT_VERSION_KEY] = self.vault_version
+        return data
 
     @classmethod
     def from_dict(cls, data: Any) -> "UserIndex":
@@ -439,9 +465,17 @@ class UserIndex:
         raw = data.get("users", [])
         if not isinstance(raw, list):
             raise StoreCorruptError("users.json 的 users 字段不是数组")
+        # 兼容读：charter 8.1 的键优先，任务书 2.1 那个旧键名也认
+        vault_version = ""
+        for key in (VAULT_VERSION_KEY, LEGACY_VAULT_VERSION_KEY):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                vault_version = value.strip()
+                break
         return cls(
             users=tuple(UserRecord.from_dict(item) for item in raw if isinstance(item, dict)),
             version=int(data.get("version", USERS_VERSION)),
+            vault_version=vault_version,
         )
 
 
@@ -560,12 +594,29 @@ class CryptoStore:
         return self.users_path
 
     # -- 注册 / 登录 --------------------------------------------------------
+    def init_vault(self, index: UserIndex | None = None) -> UserIndex:
+        """给加密库盖**数据版本**标记（charter v1.7 8.1）。返回（可能是新的）索引。
+
+        ★ **只在没有标记时盖**，绝不覆盖已有的标记：
+          库是 v1.6、程序是 v1.7 的时候，直接盖成 1.7 会让
+          "检测到旧版数据 → 提示迁移"这一步**永远发现不了旧数据**，
+          版本保护就白做了。**升级标记是** :func:`core.migrator.migrate_store`
+          的事，不是这里的。
+        """
+        current = self.load_users() if index is None else index
+        if current.vault_version:
+            return current
+        return replace(current, vault_version=CURRENT_VERSION)
+
     def register(self, username: str, password: str) -> UserSession:
         """建一个新用户，返回可直接用的 session（顺带省掉两次派生）。
 
         库密钥是随机生成的，只被 ``PBKDF2(密码)`` 包裹这一次。**没有第二种
         解开方式** —— 密码忘了，库里所有东西就再也打不开了。调用方（注册页）
         有责任把这句话明确告诉用户。
+
+        ★ 建第一个用户 = **初始化这个加密库**，所以顺手盖数据版本标记
+          （见 :meth:`init_vault`）。
         """
         name = (username or "").strip()
         if not name:
@@ -593,7 +644,7 @@ class CryptoStore:
             iterations=self._iterations,
             created_at=_now(),
         )
-        self.save_users(index.with_user(record))
+        self.save_users(self.init_vault(index.with_user(record)))
         self.user_dir(record.uid).mkdir(parents=True, exist_ok=True)
         return UserSession(record=record, key=library_key)
 
