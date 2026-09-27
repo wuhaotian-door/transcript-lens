@@ -57,9 +57,9 @@ if ($err.Count) { $err | % { "L$($_.Extent.StartLineNumber): $($_.Message)" } } 
 - 加权算术**全部本地完成**，绝不调用任何大模型 API 做数字
 - **空 ≠ 0**：空 / `-` / `/` / `未选` = 没选这门课，学分不进分母；数字 `0` = 缺考，学分进分母
 - 学分提取必须有人工回显确认
-- 真实成绩文件、真实激活码**一律不入库**。仓库里唯一允许存在的 xlsx 是
-  `tests/fixtures/fake_*.xlsx`
-- `config/` 下只允许 `.example.json`，绝不生成真实的 `activation.json`
+- 真实成绩文件、真实凭据（邮件授权码等）**一律不入库**。仓库里唯一允许存在的
+  xlsx 是 `tests/fixtures/fake_*.xlsx`
+- `config/` 下只允许 `.example.json`
 - 不写注册表。**联网：v1.6 起改为有条件放行 —— 见第 13 节**（SMTP +
   用户主动启用云端 AI 允许；自动更新 / telemetry / 静默请求仍然禁止）
 
@@ -67,7 +67,7 @@ if ($err.Count) { $err | % { "L$($_.Extent.StartLineNumber): $($_.Message)" } } 
 
 - 明文成绩**任何时候都不落盘**；磁盘上只有 `.enc` 密文
 - 用户数据在 `%LOCALAPPDATA%\SGMS\`，**不在仓库里**
-- 换激活码只锁「导入」，绝不清空或改动已有成绩库
+- 任何"校验 / 解锁"动作都**绝不清空或改动已有成绩库**（第 30 节）
 
 ## 4. Qt / PySide6 界面：踩过的坑（4a–4m）
 
@@ -197,12 +197,11 @@ for option, radio in buttons.items():
 状态栏写着"还没有选意愿"、按钮却亮着上一个学生的志愿 —— 看着像串号，
 其实是单选组的行为。**换人回填必须先 `setExclusive(False)`，填完再打开。**
 
-### 4j. `QGraphicsDropShadowEffect` 挂在整个窗口上的代价：约 40ms/次切页
+### 4j. `QGraphicsDropShadowEffect` 挂整窗的代价：约 40ms/次切页
 
-实测（1900×1200 窗口，150% DPI）：阴影开中位 523ms、关 483ms，
-**+8%**。Qt 会缓存效果的源 pixmap，页面淡入淡出**不会**每帧重新模糊整窗
-（否则会是 +1200ms）。所以这个代价可以接受，但**别在动画期间额外触发整窗
-`update()`**。要更省的话，把阴影挪到一个没有子控件的图层上。
+实测（1900×1200，150% DPI）：阴影开中位 523ms、关 483ms（**+8%**）。
+Qt 会缓存效果的源 pixmap，页面淡入淡出**不会**每帧重新模糊整窗（否则 +1200ms），
+所以这个代价可以接受 —— 但**别在动画期间额外触发整窗 `update()`**。
 
 ### 4k. ★★★ 窗口动画的 `finished` 回调里**不许销毁那个窗口** —— 会静默炸进程
 
@@ -238,113 +237,58 @@ anim.finished.connect(lambda: QTimer.singleShot(0, window, on_done))
 同样地，`ui/anim.py` 的 `_drop` 必须是 `finished` 上的**第一个**槽，
 并且用 `shiboken6.isValid()` 判活之后再碰动画对象（见 `is_alive`）。
 
-**为什么 400 多项测试一条都没抓到？**
+**为什么 400 多项测试一条都没抓到？** 因为那条路径**从来没被跑过** ——
+所有测试为省 1.5 秒一律 `skip_to_end()`，而这 bug 只在"欢迎页**真的**淡出"
+时才成立。所以现有两道闸门**都别再拆掉**：`%TEMP%\tl_boot_test.py`
+（`auto` / `login` / `switch` 三个真实时序，每个**单独进程**，退出码即断言）
+和 `transcript-lens.exe --bootcheck`（打包产物里的真启动流程写进
+`%TEMP%\transcript-lens-bootcheck.txt`）。`build_exe.ps1` 打完包**两个都跑**，
+非 0 直接判失败。
 
-因为那条路径**从来没被跑过**：所有测试为了省 1.5 秒，欢迎页一律
-`skip_to_end()`。而这个 bug 恰好只在"欢迎页**真的**淡出"时才成立。
-
-**所以现在有两道新的闸门，都别再拆掉**：
-
-| 闸门 | 跑什么 | 为什么 `--selfcheck` 顶不上 |
-|---|---|---|
-| `%TEMP%\tl_boot_test.py` | `auto` / `login` / `switch` 三个**真实时序**场景，每个**单独进程**（退出码本身就是断言） | 它跑的是源码，但至少跑的是**真动画** |
-| `transcript-lens.exe --bootcheck` | 打包产物里的真启动流程，结果写进 `%TEMP%\transcript-lens-bootcheck.txt` | `--selfcheck` 是**无窗口**的，一行 GUI 代码都不碰 |
-
-`build_exe.ps1` 打完包会**两个都跑**，退出码非 0 直接判失败。
-
-**规矩**：任何"动画结束后销毁触发它的那个对象"的代码，
-回调必须延后一拍；并且**必须有测试真的把动画跑完**，不许 skip。
+**规矩**：任何"动画结束后销毁触发它的那个对象"的代码，回调必须延后一拍；
+并且**必须有测试真的把动画跑完**，不许 skip。
 
 ### 4l. ★★ 启动慢的两个真凶：`QSplashScreen` 和标题里的 emoji
 
-用户反馈"启动非常卡顿"。量完之后发现**跟动画时长、跟机器性能都无关**，
-是两笔一次性的、谁也没想到的开销。两条都已被 `%TEMP%\tl_splash_probe.py`
-和 `tl_perf_bench.py` 实测钉死（对照组 `sleep(0.15)` 量到 150.3ms，校准正常）。
+量完发现**跟动画时长、跟机器性能都无关**，是两笔一次性开销
+（`%TEMP%\tl_splash_probe.py` / `tl_perf_bench.py` 实测，
+对照组 `sleep(0.15)` 量到 150.3ms，校准正常）：
 
-**（一）`QSplashScreen` 本身比普通 `QWidget` 慢 865ms**
+* **`QSplashScreen` 本身比 `QWidget` 慢 865ms**（`QWidget` 164~167ms vs
+  `QSplashScreen` 1028~1035ms；每个变体**单独起进程**测，排除"第一次创建原生窗口"
+  这笔一次性成本）。跟半透明 / 无边框 / 透明度**全都无关** ——
+  那 865ms 用户盯着全黑屏幕。`ui/splash.py` 已改成自绘 `QWidget`。
+* **开屏标题里的 📊 一个字 241.7ms**（去掉 emoji 只要 0.2ms）：emoji 要现场加载
+  Segoe UI Emoji 做彩色字形合成，是**启动链上最贵的单个字符**。已删。
+  > 只删开屏 pixmap 里的；侧栏 / 页面标题的 emoji 在**已映射好的窗口**里，不占启动时间。
+* 改完还剩 **765ms 全黑**，`tl_splash_trace.py` 打点定位到：开屏**先发 finished
+  再淡出**。现在**先叫下一个窗口、再淡出自己**（`ui/splash.py._start_fade_out`），
+  这段就落在开屏背后。
 
-每个变体**单独起一个进程**测（排除"第一次创建原生窗口"这个一次性成本
-被算到错误对象头上）：
+**预热的三条规矩**（`AppFlow._prewarm_main` 把主窗提前建好并 `show()`，
+`MainWindow.__init__` 里已经 `setWindowOpacity(0.0)`，映射出来全透明、看不见）：
 
-| 变体 | `show()` |
-|---|---|
-| `QWidget`（普通） | 165 ms |
-| `QWidget` + 无边框 + 半透明 | 167 ms |
-| `QWidget` + 无边框 + 半透明 + `opacity 0` | 164 ms |
-| **`QSplashScreen`（原样）** | **1030 ms** |
-| `QSplashScreen` + 无边框 / 半透明 / `opacity 0` | 1028 ~ 1035 ms |
-
-**跟半透明、无边框、透明度全都无关 —— 只要用了 `QSplashScreen` 就慢 865ms。**
-那 865ms 里用户盯着一个全黑的屏幕。`ui/splash.py` 已改成自绘 `QWidget`。
-
-**（二）标题里的 emoji 一个字 241ms**
-
-| pixmap 内容 | 绘制耗时 |
-|---|---|
-| `📊 成绩单透镜` 22pt Bold | **241.7 ms** |
-| `成绩单透镜` 22pt Bold | 0.2 ms |
-| `transcript-lens` ASCII | 0.8 ms |
-
-emoji 要现场加载 Segoe UI Emoji 并做彩色字形合成。开屏标题里那一个 📊 是
-**启动链上最贵的单个字符**。已删。
-
-> 注意范围：侧栏、页面标题里的 emoji 都在**已经映射好的窗口**里，
-> 不占启动时间，**不用删**。只有开屏那张 pixmap 里的要去掉。
-
-**（三）开屏的职责是"盖住"，不是"过场"**
-
-改完上面两条之后还剩一段 **765ms 全黑**。逐拍打点（`%TEMP%\tl_splash_trace.py`）
-定位到：开屏**先把 finished 发出去、再淡出**，所以淡完到下一个窗口出现之间
-是空的。那 765ms 是：
-
-```
-load_token              150 ms
-MainWindow() 构造       253 ms   ← 6 个页面 + 全量 QSS polish
-MainWindow.show()        39 ms
-set_user()（解密意愿）   ~310 ms   ← ProfilePage 的意愿解密 + 激活状态
-WelcomeWindow + show     14 ms
-```
-
-现在的次序是**先叫下一个窗口、再淡出自己**（`ui/splash.py` 的
-`_start_fade_out`）：`finished.emit()` 是同步的，等它返回时下一个窗口
-已经在屏幕上了，然后才淡出。这 765ms 就落在开屏背后。
-
-**（四）预热要藏在"用户正在看的东西"后面，而且要扣时间**
-
-`AppFlow._prewarm_main` 把主窗提前建好并 `show()`（`MainWindow.__init__`
-里已经 `setWindowOpacity(0.0)`，所以映射出来是全透明的，看不见）。
-
-★ 但**不能在 `run()` 之后紧接着预热**：`run()` 只是把淡入动画 start 出去，
-那一刻窗口还一帧都没画。在那时跑 600ms 同步工作，事件循环被占住，
-**淡入动画会冻在第一帧**上 —— 用户看到的是"点了一下，半天没反应"。
-所以挂在 `WelcomeWindow` 的 `on_shown`（淡入结束）上。
-
-★ 而且停留时间要**扣掉**预热的耗时（`HOLD_MS - spent`）。第一版写成
-"干完活再计时"，结果欢迎页实际停留 `HOLD_MS + 600ms` —— 白等 600ms。
-
-★ `HOLD_MS` 现在是 **1500**（charter 6.3 写死的："欢迎页（1.5s 时间问候）"）。
-中间一度压到 900ms —— 那是性能整改时自己按"扫一眼够了"定的，不是文档要求。
-因为扣时间，这 1500 里含主窗构造那 ~600ms，**不是** 1500 + 600。
+★ **不能在 `run()` 之后紧接着预热** —— `run()` 只是把淡入动画 start 出去，那一刻
+窗口还一帧都没画；跑 600ms 同步工作会把**淡入动画冻在第一帧**，用户看到"点了没反应"。
+所以挂在 `on_shown` 上。
+★ 停留时间要**扣掉**预热耗时（`HOLD_MS - spent`）。第一版"干完活再计时"，
+欢迎页实际停留 `HOLD_MS + 600ms` —— 白等 600ms。
+★ `HOLD_MS` = **1500**（charter 6.3 写死的）。因为扣时间，这 1500 里含主窗构造
+那 ~600ms，**不是** 1500 + 600。
 
 ### 4m. 切页卡顿：淡出那一段是纯粹的等待
 
 实测一次切页的耗时 vs 两段动画时长（真跑 `StackSwitcher`，取中位数）：
 
-| 淡出 + 淡入 | 实测切页 |
-|---|---|
-| 180 + 240（原） | **439 ms** |
-| 120 + 180 | 326 ms |
-| 90 + 150 | 260 ms |
-| 0 + 150 | 166 ms |
-| **0 + 130（现在）** | **~137 ms** |
+| 淡出 + 淡入 | 180+240（原） | 120+180 | 90+150 | 0+150 | **0+130（现在）** |
+|---|---|---|---|---|---|
+| 实测切页 | **439 ms** | 326 ms | 260 ms | 166 ms | **~137 ms** |
 
 `180 → 0` 一项就省掉近 300ms，是整条链上最划算的一刀。用户感知的界线大致是
 "100ms 以内算瞬时、200ms 以上能感到迟滞"。
-
-**为什么砍淡出是对的**：淡出那一段旧页在变淡、新页还没出现，
-用户盯着一个越来越空的屏幕 —— 它不传递任何信息。想要回淡出的话，
-把 `ui/anim.py` 的 `FADE_OUT_MS` 设回 180 即可，`switch()` 会自动走回
-淡出分支，**两条路径都有测试覆盖**。
+**砍淡出是对的**：那一段旧页在变淡、新页还没出现，用户盯着一个越来越空的屏幕，
+它不传递任何信息。要回淡出就把 `ui/anim.py` 的 `FADE_OUT_MS` 设回 180，
+`switch()` 会自动走回淡出分支，**两条路径都有测试覆盖**。
 
 ## 5. 密码找回：已接通邮箱（网易 163 SMTP）
 
@@ -571,7 +515,7 @@ self._stack.setCurrentIndex(self._pending); clear_effect(...); self._land(...)
 
 ```
 ❌ 自动更新/静默下载 · telemetry · 埋点 · 崩溃上报 ·
-   激活码联网校验 · requests/httpx 用于上述场景之外
+   任何形式的「输码解锁 / 联网校验用户资格」 · requests/httpx 用于上述场景之外
 ```
 
 所以"允许下载"的准确含义是：**每一次下载前面都必须有一个用户点过确认的弹窗**。
@@ -581,7 +525,8 @@ self._stack.setCurrentIndex(self._pending); clear_effect(...); self._land(...)
 
 ### ❌ 禁止
 
-自动更新检查 · 静默下载 · telemetry / 埋点 / 崩溃上报 · 激活码联网校验 ·
+自动更新检查 · 静默下载 · telemetry / 埋点 / 崩溃上报 ·
+任何形式的「输码解锁 / 联网校验用户资格」 ·
 拿 `requests` / `httpx` 干**非** SMTP、**非**用户主动下载/AI 的事。
 
 ### selfcheck 怎么守（`main._network_policy_report`）
@@ -1202,3 +1147,29 @@ parse_excel(path, engine=engine_for(path))   # 调用方传引擎进去
   —— **防目录穿越**：`download(url, "../../evil")` 不该写到 models/ 外面去。
 * `ModelDownloader.progress` 发**百分比 0~100**；**总大小未知时发 `-1`**
   （界面切不确定态）。字节数在 `downloaded_bytes` / `total_bytes` 上读。
+
+## 30. ★★ 激活码系统**已整套删除**（Owner 决定）—— 不许复活
+
+注册登录 + 邮箱找回密码已经跑通，**登录即全部功能可用**。于是整套删除：
+`core/activation.py`（675 行）、`config/activation.example.json`、
+设置页那张卡片、主窗顶栏「● 已激活」小圆点。
+完整清单与遗留文件处置见 `docs/ACTIVATION_REMOVAL.md`。
+
+**四条硬约束**：
+
+1. **不许以任何形式复活**「输一个码才能解锁功能」：没有闸门、没有试用期、
+   没有"激活才能导入"。
+2. 准入只有三个门：**注册 → 登录 → 忘记密码**。加第四种之前先问 Owner。
+3. `core/` `ui/` `ai/` 里不许再出现激活码的标识符；`ui/` 的**界面文案**
+   不许出现「激活」二字。
+4. 老机器上可能残留 `%LOCALAPPDATA%\SGMS\activation.enc` —— **它是惰性的**，
+   没有任何代码读它。**不许**写"启动时顺手删掉"那种代码：
+   删用户数据必须是用户主动的动作。
+
+**判据**：`main._removed_gate_report()`（`--selfcheck` 里跑，三层：文件层 /
+AST 源码层 / `CHECK_MODULES` 接线层）+ `%TEMP%\tl_qt_drive.py`（运行时遍历
+主窗与登录窗全部控件文字、占位符、气泡，0 处「激活」）+
+`%TEMP%\tl_noact_gate_test.py`（24 项，注入违规会 FAIL，跑完逐字节还原）。
+
+★ 用 `ast` 而不是 grep `activ`：`ui/pages/scholarship_page.py` 里有 openpyxl 的
+`book.active`，一刀切地搜必然误报 —— **误报的闸门最后一定会被关掉**。

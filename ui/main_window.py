@@ -1,7 +1,7 @@
 """主界面 —— 无边框窗口 + 深色侧栏 + 顶部窄条（兼自定义标题栏） + 内容区。
 
      ╭──────────────────────────────────────────────────────────╮  ← 圆角 12px + 阴影
-     │ 成绩单    |  张老师            ● 已激活        📊 智育分析  — □ ✕ │
+     │ 成绩单    |  张老师                            📊 智育分析  — □ ✕ │
      │ 透镜      ├──────────────────────────────────────────────┤
      │           │                                              │
      │ 📊 智育   │                                              │
@@ -17,8 +17,12 @@
 
 系统标题栏被 :func:`ui.frameless.apply_frameless` 拿掉了，所以"拖窗口 /
 最小化 / 最大化 / 关闭"都得自己做。做法是把最上面那条顶栏直接当标题栏用
-（``WindowTitleBar`` 的 ``content`` 参数塞的就是原来那一排用户名 + 激活状态），
+（``WindowTitleBar`` 的 ``content`` 参数塞的就是那一排用户名 + 当前页名），
 而不是再加一条空条 —— 那样白占 36px 高度，还难看。
+
+★ 顶栏**只有用户名和当前页名**：v1.8 删掉了整套激活码系统，所以原来那个
+  "● 已激活"小圆点连同它的文字一起没了。注册登录之后所有功能即可用，
+  界面上不该再有任何"解锁 / 激活"的字样。
 
 ★ 圆角不会裁剪子控件
 --------------------
@@ -51,7 +55,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.activation import load_state
 from core.crypto_store import CryptoStore
 from core.version import CURRENT_VERSION
 from ui.anim import StackSwitcher, window_fade_in
@@ -238,8 +241,8 @@ class MainWindow(QMainWindow):
     def _build_topbar(self) -> WindowTitleBar:
         """顶栏 = 自定义标题栏。
 
-        左边那排（用户名 / 激活圆点 / 状态）塞进 ``content``；
-        右边三个窗口按钮由 :class:`ui.frameless.WindowTitleBar` 自己加。
+        左边是用户名，右边是当前页名；中间 ``addStretch(1)`` 顶开。
+        三个窗口按钮由 :class:`ui.frameless.WindowTitleBar` 自己加。
         """
         strip = QWidget()
         box = QHBoxLayout(strip)
@@ -249,15 +252,6 @@ class MainWindow(QMainWindow):
         self._user_label = QLabel("（未登录）")
         self._user_label.setObjectName("TopUser")
         box.addWidget(self._user_label)
-
-        box.addWidget(self._sep())
-        self._dot = QLabel()
-        self._dot.setFixedSize(10, 10)
-        box.addWidget(self._dot)
-
-        self._act_label = QLabel("激活状态未知")
-        self._act_label.setObjectName("TopMeta")
-        box.addWidget(self._act_label)
 
         box.addStretch(1)
 
@@ -278,12 +272,6 @@ class MainWindow(QMainWindow):
         bar.maximize_requested.connect(lambda: toggle_maximize(self))
         bar.close_requested.connect(self.close)
         return bar
-
-    @staticmethod
-    def _sep() -> QLabel:
-        line = QLabel("|")
-        line.setObjectName("TopMeta")
-        return line
 
     # ---------------------------------------------------------------- 接线
     def _wire(self) -> None:
@@ -311,7 +299,6 @@ class MainWindow(QMainWindow):
         self.scholarship_page.set_user(self._username)
         self.settings_page.set_user(self._username)
         self.account_page.set_user(self._username)
-        self._refresh_activation()
 
     def _on_class_saved(self, class_name: str) -> None:
         """刚导入了一个班 —— 让奖学金页和成长档案页立刻能看到新数据。
@@ -374,22 +361,6 @@ class MainWindow(QMainWindow):
             button.setChecked(position == index)
         if 0 <= index < len(NAV_ITEMS):
             self._page_title.setText(NAV_ITEMS[index][1].replace("  ", " "))
-
-    def _refresh_activation(self) -> None:
-        """顶部那个小圆点：绿=已激活，灰=未激活（Spec 四）。"""
-        try:
-            state = load_state(self._data_root)
-        except Exception:  # noqa: BLE001 - 读不到就当未激活，不拦界面
-            state = None
-        activated = bool(getattr(state, "activated", False))
-        color = "#22C55E" if activated else "#CBD5E1"
-        self._dot.setStyleSheet(f"background:{color}; border-radius:5px;")
-        if activated:
-            self._act_label.setText(
-                f"已激活（版本 {state.active_version}，{state.activated_year} 年）"
-            )
-        else:
-            self._act_label.setText("未激活")
 
     # ---------------------------------------------------------------- 自检用
     @property

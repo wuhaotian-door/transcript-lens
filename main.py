@@ -99,7 +99,6 @@ CHECK_MODULES: tuple[str, ...] = (
     "core.validator",
     "core.exporter",
     "core.archival",
-    "core.activation",
     "core.crypto_store",
     "core.user_store",
     "core.scholarship",
@@ -200,8 +199,10 @@ def _selfcheck_report() -> tuple[bool, str]:
             failures.append("邮件凭据泄漏检查")
 
     # --- ★ v1.8：铁律 1 的封印 + 版本号真源 + Excel 引擎 + 替换机制 --------
+    #     ★ v1.8.1：激活码系统已整套删除，多一条"不许复活"的闸门
     for label, report in (
         ("封板文件封印（铁律 1）", _frozen_files_report),
+        ("激活码系统已删除", _removed_gate_report),
         ("版本号唯一真源", _version_source_report),
         ("Excel 读取引擎", _excel_engine_report),
         ("启动替换机制", _apply_mechanism_report),
@@ -933,6 +934,195 @@ def _frozen_files_report() -> list[str]:
         # ★ 源码版却找不到文件 = **检查本身失效了**（路径写错/被改名），必须 FAIL
         lines.append(
             f"FAIL  封板文件封印检查扫不到文件（{missing}）—— 检查已经失效，不是通过"
+        )
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# ★ 激活码系统已删除（v1.8.1，Owner 决定）—— 这条闸门守的是"它不许复活"
+# ---------------------------------------------------------------------------
+
+#: 已删除的文件。**必须一直不存在** —— 回来一个就算是复活了。
+REMOVED_GATE_PATHS: tuple[str, ...] = (
+    "core/activation.py",
+    "config/activation.example.json",
+)
+
+#: 标识符里出现这些词根 = 激活码系统复活。
+#: ★ 刻意**不**收 ``active`` —— openpyxl 的 ``book.active`` 就在
+#:   ``ui/pages/scholarship_page.py`` 里，收进来必然误报，
+#:   而误报的闸门最后一定会被人关掉（比没有闸门更糟）。
+_REVIVED_GATE_STEMS: tuple[str, ...] = (
+    "activation",
+    "activate",
+    "active_version",
+    "activated_year",
+)
+
+#: 界面文案里出现这个词 = 又在向用户要激活码了
+_REVIVED_GATE_WORD = "激活"
+
+
+def _removed_gate_report() -> list[str]:
+    """激活码系统**已经被整套删除**，这里守的是"它不许悄悄回来"。
+
+    Owner 决定（注册登录 + 邮箱找回密码跑通之后）：**用户登录即全部功能可用**，
+    不再需要激活码。于是删掉了 ``core/activation.py``（675 行）、
+    ``config/activation.example.json``、设置页那张卡片、主窗顶栏「● 已激活」小圆点。
+
+    三件事，缺一件都不算数：
+
+    1. **文件层** —— 两个已删路径必须不存在；
+    2. **源码层** —— ``core/`` / ``ui/`` / ``ai/`` 的 ``.py`` 里不许再出现
+       激活码的**标识符**（AST 层面）或界面文案里的「激活」二字；
+    3. **接线层** —— ``CHECK_MODULES`` 里不许再列出那个模块。
+
+    ★ 为什么**不**扫 ``main.py`` 自己：本函数和它上面那串常量就住在这里，
+      扫自己必然自报家门。``main.py`` 那边改判 ``CHECK_MODULES`` 的**值**
+      （行为断言），而不是扫自己的源码。
+
+    ★ 为什么用 AST 而不是 grep ``activ``：``ui/pages/scholarship_page.py``
+      里有 openpyxl 的 ``book.active``，一刀切地搜会误报。
+      文档字符串也显式跳过 —— 记录"这里原来是什么、为什么删掉"正是该留下的东西。
+    """
+    import ast
+
+    lines: list[str] = []
+
+    # --- 1. 文件层 --------------------------------------------------------
+    alive = [relative for relative in REMOVED_GATE_PATHS if (PROJECT_ROOT / relative).exists()]
+    if alive:
+        lines.append(
+            "FAIL  已删除的激活码系统文件又回来了："
+            + "、".join(alive)
+            + " —— 注册登录即全部功能可用，这套东西不许复活"
+        )
+        return lines
+
+    # --- 1b. ★ 行为层：那个模块真的 import 不到了 ---------------------------
+    #   ★ 这一条**打包版也查得动** —— 上面两层在 frozen 下都只能"以打包前的
+    #     源码自检为准"（源码进了 PYZ，磁盘上没有 .py）。
+    #     而"import 不到"是运行期事实，源码版和 exe 里都成立。
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec("core.activation")
+    except (ImportError, ValueError):
+        spec = None
+    if spec is not None:
+        lines.append(
+            f"FAIL  core.activation 仍然能被 import（{spec.origin}）—— "
+            "模块被放回来了，或者有谁在 sys.path 上又挂了一份"
+        )
+        return lines
+    lines.append(
+        f"ok    {'core.activation 已 import 不到':<32} "
+        f"find_spec 返回 None（frozen={IS_FROZEN}）"
+    )
+
+    # --- 2. 源码层 --------------------------------------------------------
+    packages = [name for name in ("core", "ui", "ai") if (PROJECT_ROOT / name).is_dir()]
+    sources: list[Path] = []
+    for name in packages:
+        sources.extend(sorted((PROJECT_ROOT / name).rglob("*.py")))
+
+    if not sources:
+        if IS_FROZEN:
+            # ★ 必须带上 lines —— 上面那条"import 不到"是**打包版唯一查得动**的
+            #   一层。第一版写成 return [ ... ] 把它丢了，于是 exe 的报告里
+            #   只剩一句"以打包前的源码自检为准"，等于这一层白加。
+            lines.append(
+                f"ok    {'激活码系统已删除（打包版）':<32} 无 .py 源码（打进 PYZ），"
+                "AST 那两层以打包前的源码自检为准"
+            )
+            return lines
+        return ["FAIL  激活码残留检查扫到 0 个文件 —— 检查已经失效，不是通过"]
+
+    offenders: list[str] = []
+    for source in sources:
+        relative = source.relative_to(PROJECT_ROOT)
+        try:
+            tree = ast.parse(source.read_text(encoding="utf-8", errors="ignore"))
+        except SyntaxError as exc:  # pragma: no cover
+            offenders.append(f"{relative} 解析失败：{exc}")
+            continue
+
+        # 文档字符串不算"界面文案"，也不该被当成引用
+        docstrings: set[int] = set()
+        for node in ast.walk(tree):
+            if isinstance(
+                node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                body = getattr(node, "body", None)
+                if (
+                    body
+                    and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)
+                ):
+                    docstrings.add(id(body[0].value))
+
+        def _flag(lineno: int, what: str) -> None:
+            offenders.append(f"{relative}:{lineno} -> {what}")
+
+        for node in ast.walk(tree):
+            # 标识符：变量 / 属性 / 函数名 / 类名 / 参数名 / 关键字参数 / import 别名
+            names: list[str] = []
+            if isinstance(node, ast.Name):
+                names.append(node.id)
+            elif isinstance(node, ast.Attribute):
+                names.append(node.attr)
+            elif isinstance(node, ast.arg):
+                names.append(node.arg)
+            elif isinstance(node, ast.keyword) and node.arg:
+                names.append(node.arg)
+            elif isinstance(node, ast.alias):
+                names.append(node.name.rsplit(".", 1)[-1])
+            elif isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                names.append(node.name)
+
+            for name in names:
+                lowered = name.lower()
+                if any(stem in lowered for stem in _REVIVED_GATE_STEMS):
+                    _flag(getattr(node, "lineno", 0), name)
+
+            # import 的模块全路径也算
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                module = getattr(node, "module", None) or ""
+                if "activation" in module.lower():
+                    _flag(node.lineno, f"import {module}")
+
+            # 界面文案
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and id(node) not in docstrings
+                and _REVIVED_GATE_WORD in node.value
+            ):
+                _flag(node.lineno, f"文案里出现「{_REVIVED_GATE_WORD}」")
+
+    if offenders:
+        shown = "；".join(dict.fromkeys(offenders[:6]))
+        more = f"（共 {len(offenders)} 处）" if len(offenders) > 6 else ""
+        lines.append(
+            "FAIL  源码里还有激活码系统的残留（登录即全部功能可用，"
+            "不许再向用户要码）：" + shown + more
+        )
+    else:
+        lines.append(
+            f"ok    {'激活码系统已删除（无残留）':<32} "
+            f"core/ ui/ ai/ 共 {len(sources)} 个文件，0 处引用"
+        )
+
+    # --- 3. 接线层 --------------------------------------------------------
+    revived = [name for name in CHECK_MODULES if "activation" in name.lower()]
+    if revived:
+        lines.append(f"FAIL  CHECK_MODULES 里又列出了激活码模块：{revived}")
+    else:
+        lines.append(
+            f"ok    {'CHECK_MODULES 已摘掉激活码':<32} {len(CHECK_MODULES)} 个模块"
         )
     return lines
 
@@ -1978,6 +2168,7 @@ def run_startup_migration(root: str | None = None) -> None:
     from core.crypto_store import CryptoStore
     from core.migrator import MigrationError, migrate_store
     from core.version import CURRENT_VERSION as _CUR
+    from pathlib import Path as _Path
     from PySide6.QtWidgets import QMessageBox
 
     # 自动化（截图脚本、真实时序测试）里不该弹模态框 —— 会一直等人点。

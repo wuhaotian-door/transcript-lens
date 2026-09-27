@@ -1,16 +1,15 @@
-"""⚙️ 设置页 —— 激活码 / 导出 / 清库 / AI 开关 / 更新检查。
+"""⚙️ 设置页 —— 导出 / 清库 / AI 开关 / 更新检查。
 
-五件事都**真的接通了 core**，不是死按钮：
+四件事都**真的接通了 core**，不是死按钮：
 
-* 激活码 → :func:`core.activation.try_activate`（读状态 → 校验 → 通过了才落盘）
 * 导出   → :mod:`core.exporter`（明文版 / 脱敏版两个按钮）
 * 清库   → 删掉本用户的 ``.enc`` 载荷，**二次确认**
 * AI     → 只有开关和占位，**一个网络请求都没有**（charter 七节）
 * 更新   → :mod:`core.updater`，**只在点按钮时**联网一次，不自动下载
 
-★ 红线 7：换激活码**只锁「导入」**，绝不清空或改动已有成绩库。
-  所以「换码」和「清库」在这里是两个完全独立的按钮，
-  换码那条路径上一行删文件的代码都没有。
+★ **本页没有激活码卡片**（v1.8 已删除整套激活码系统）。见
+  `docs/ACTIVATION_REMOVAL.md`。
+  注册登录即全部功能可用，本页不再有、也不许再加任何形式的「解锁」输入框。
 """
 
 from __future__ import annotations
@@ -37,11 +36,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.activation import load_state, try_activate
 from core.ai.local_assistant import PLACEHOLDER as LOCAL_PLACEHOLDER
 from core.ai.local_assistant import MODEL_LOADED_PLACEHOLDER
 from core.ai.model_downloader import ModelDownloader, model_dir
-from core.crypto_store import CryptoError, CryptoStore, PAYLOAD_FILES
+from core.crypto_store import CryptoStore, PAYLOAD_FILES
 from core.exporter import export_anonymized_xlsx, export_plain_xlsx
 from core import update_apply
 from core.updater import (
@@ -82,7 +80,6 @@ class SettingsPage(QWidget):
     ) -> None:
         super().__init__(parent)
         self._store = store if store is not None else CryptoStore(root)
-        self._data_root = root
         self._username = ""
         #: 由主窗口注入：返回当前要导出的记录列表（可能为空）
         self._export_provider: Callable[[], list[dict[str, Any]]] | None = None
@@ -133,46 +130,6 @@ class SettingsPage(QWidget):
         title = QLabel("⚙️  设置")
         title.setObjectName("H1")
         box.addWidget(title)
-
-        # --- 激活码 ---
-        act_card = make_card()
-        act = QVBoxLayout(act_card)
-        act.setContentsMargins(24, 20, 24, 20)
-        act.setSpacing(10)
-
-        act_title = QLabel("激活码")
-        act_title.setObjectName("H2")
-        act.addWidget(act_title)
-
-        act_note = QLabel(
-            "激活码只管「导入」这一件事。换码、过期、未激活都不会动已有成绩库。"
-        )
-        act_note.setObjectName("Muted")
-        act_note.setWordWrap(True)
-        act.addWidget(act_note)
-
-        row = QHBoxLayout()
-        self._code_edit = QLineEdit()
-        self._code_edit.setPlaceholderText("粘贴或输入激活码")
-        self._code_edit.setMinimumHeight(38)
-        self._code_edit.setMinimumWidth(280)
-        row.addWidget(self._code_edit, 1)
-
-        verify = QPushButton("验证")
-        verify.setObjectName("Primary")
-        verify.setMinimumHeight(38)
-        verify.setMinimumWidth(96)
-        verify.clicked.connect(self._do_activate)
-        row.addWidget(verify)
-        act.addLayout(row)
-
-        self._act_status = QLabel("")
-        self._act_status.setObjectName("Muted")
-        self._act_status.setWordWrap(True)
-        act.addWidget(self._act_status)
-        self._refresh_activation()
-
-        box.addWidget(act_card)
 
         # --- 导出 ---
         exp_card = make_card()
@@ -596,36 +553,6 @@ class SettingsPage(QWidget):
             return {}
         data = load_user_json(self._store, self._username, AI_SETTINGS_FILE, {})
         return data if isinstance(data, dict) else {}
-
-    # ---------------------------------------------------------------- 激活
-    def _refresh_activation(self) -> None:
-        state = load_state(self._data_root)
-        if state.activated:
-            self._act_status.setText(
-                f"当前状态：已激活（版本 {state.active_version}，"
-                f"{state.activated_year} 年）"
-            )
-        else:
-            self._act_status.setText("当前状态：未激活（导入功能受闸门管控）")
-
-    def _do_activate(self) -> None:
-        code = self._code_edit.text().strip()
-        if not code:
-            QMessageBox.warning(self, "还没填", "请先输入激活码。")
-            return
-        try:
-            result = try_activate(code, root=self._data_root)
-        except (CryptoError, ValueError) as exc:
-            QMessageBox.critical(self, "激活失败", str(exc))
-            self._act_status.setText(f"激活失败：{exc}")
-            return
-
-        self._code_edit.clear()
-        if result.ok:
-            QMessageBox.information(self, "激活成功", result.message)
-        else:
-            QMessageBox.warning(self, "激活码不可用", result.message)
-        self._refresh_activation()
 
     # ---------------------------------------------------------------- 更新
     def _build_update_card(self) -> QFrame:

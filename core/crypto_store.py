@@ -10,21 +10,22 @@
        └─ sessions.json.enc       ← 学期导入记录（加密）
 
 上面那套是**按用户**的：解密要先有 ``UserSession``。但有一类数据在**任何用户登录之前**
-就要能读 —— 最典型的是「这台机器激活到哪个版本了」。所以本模块额外提供一对
+就要能读 —— 最典型的是「7 天内自动登录」的会话令牌（决定要不要再问一次密码），
+以及找回码包裹的库密钥。所以本模块额外提供一对
 **应用级**函数，只认路径、不认用户：
 
     app.salt                      ← 应用级随机盐（明文，盐本来就不是秘密）
-    activation.enc                ← 激活状态（加密，只有 {"active_version", "activated_year"}）
+    session.enc                   ← 自动登录令牌（加密，只有 {"username", "issued", "exp"}）
 
 .. code-block:: python
 
-    save_encrypted({"active_version": 1}, path)   # 磁盘上只出现密文
+    save_encrypted({"username": "张三"}, path)    # 磁盘上只出现密文
     load_encrypted(path)                          # 文件不存在 → {}；解不开 → 抛异常
 
 **必须说清楚的威胁模型**：应用级这层的密码材料是代码里的常量，盐就在旁边那个文件里，
 所以**能读到源码 + 拿到盐文件的人可以自己把密钥推出来**。它挡的不是这种攻击，它挡的是：
 
-* 用记事本打开 ``activation.enc`` 把 ``active_version`` 改成 99 —— **改不动**
+* 用记事本打开 ``session.enc`` 把 ``username`` 改成别人 —— **改不动**
   （Fernet 带 HMAC，改一个字节就 ``InvalidToken``）
 * 文件被截断/半截写入 —— 解不开，而不是解出一个看似合法的半截状态
 
@@ -179,7 +180,7 @@ USERS_VERSION = 1
 SALT_FILE = "app.salt"
 
 #: 应用级载荷只许用这个后缀。"磁盘上永远只有 .enc" 不是口号，是这里挡下来的：
-#: 谁手滑把 ``activation.json`` 传进来会直接 ValueError，而不是写出一个明文谜题。
+#: 谁手滑把 ``grades.json`` 传进来会直接 ValueError，而不是写出一个明文谜题。
 ENC_SUFFIX = ".enc"
 
 #: 应用级 PBKDF2 的密码材料。**它不是秘密**（仓库是公开的），
@@ -255,7 +256,7 @@ def load_app_salt(root: str | Path | None = None, *, create: bool = True) -> byt
 
 
 def app_fernet(root: str | Path | None = None) -> Fernet:
-    """应用级 Fernet（用于激活状态这类"还没有用户"的数据）。"""
+    """应用级 Fernet（用于自动登录令牌这类"还没有用户"的数据）。"""
     salt = load_app_salt(root)
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
@@ -883,7 +884,7 @@ def save_encrypted(
     ``save_encrypted``  应用级盐文件（``app.salt``）  **还没有任何用户登录**的数据
     ==================  ==========================  ============================
 
-    激活状态属于右边那一列：它是一台机器的属性，不是某个用户的属性，
+    自动登录令牌属于右边那一列：它是一台机器的属性，不是某个用户的属性，
     在登录之前就要能读能写。
 
     Raises:
@@ -907,11 +908,11 @@ def save_encrypted(
 def load_encrypted(path: str | Path, *, root: str | Path | None = None) -> dict[str, Any]:
     """解密读回。**解不开就抛异常，绝不返回空。**
 
-    * 文件不存在 → ``{}``（"还没写过"，正常状态；激活状态靠它表示"从未激活"）
+    * 文件不存在 → ``{}``（"还没写过"，正常状态；自动登录令牌靠它表示"没勾过记住我"）
     * 解不开 / 不是 dict → :class:`StoreCorruptError`
 
     「不存在」和「解不开」必须分开，理由和 :meth:`CryptoStore.load` 一样：
-    把损坏降级成空值，用户看到的就是"我的激活状态没了"，然后可能去重新激活 ——
+    把损坏降级成空值，用户看到的就是"我的设置没了"，然后可能去重新配一遍 ——
     真正该做的是报错、让人来看一眼。
     """
     target = Path(path)

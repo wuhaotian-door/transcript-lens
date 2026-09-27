@@ -160,7 +160,7 @@ class WindowTitleBar(QFrame):
 
     Args:
         content: 塞在标题和按钮中间、并且会吃掉剩余宽度的控件。
-            主窗口用它放"用户名 + 激活状态 + 当前页名" —— 那条顶栏本来就是
+            主窗口用它放"用户名 + 当前页名" —— 那条顶栏本来就是
             窗口最上面的一条，直接当标题栏用，不必再多一条。
         bar_height: 这一条多高。默认 :data:`TITLE_BAR_HEIGHT`。
         object_name: 换一个 objectName 就能换一套 QSS。主窗口传 ``"TopBar"``
@@ -208,7 +208,7 @@ class WindowTitleBar(QFrame):
         if content is None:
             # 没有内容才用弹性空白把标题顶到左边。
             # ★ 有内容时**绝不能**再加这一条：两侧各一个 stretch，内容就被挤到
-            #   正中间去了（踩过：顶栏的"用户名 + 激活状态"跑到了窗口正中）。
+            #   正中间去了（踩过：顶栏的"用户名 + 当前页名"跑到了窗口正中）。
             box.addStretch(1)
         else:
             box.addWidget(content, 1)
