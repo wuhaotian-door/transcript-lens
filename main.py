@@ -199,14 +199,32 @@ def _selfcheck_report() -> tuple[bool, str]:
         if line.startswith("FAIL"):
             failures.append("邮件凭据泄漏检查")
 
+    # --- ★ v1.8：铁律 1 的封印 + 版本号真源 + Excel 引擎 + 替换机制 --------
+    for label, report in (
+        ("封板文件封印（铁律 1）", _frozen_files_report),
+        ("版本号唯一真源", _version_source_report),
+        ("Excel 读取引擎", _excel_engine_report),
+        ("启动替换机制", _apply_mechanism_report),
+    ):
+        for line in report():
+            lines.append(line)
+            if line.startswith("FAIL"):
+                failures.append(label)
+
     # --- 主链路：假数据 xlsx → parser → 三口径算分 ---------------------------
     from core.calculator import CalculationScope, calculate_many
+    from core.excel_io import engine_for
     from core.parser import parse_excel
     from core.validator import check_credit_anchor
 
     parsed = None
     try:
-        parsed = parse_excel(str(FAKE_FIXTURE))
+        # ★ v1.8：显式指定引擎（charter 第七节"pd.read_excel 显式指定 engine"）。
+        #   ``core.parser.parse_excel`` 是**封板文件**（铁律 1），但它的签名里
+        #   本来就有 ``**read_excel_kwargs`` 并原样转发给 ``pd.read_excel`` ——
+        #   所以引擎从**调用方**给进去，"显式指定"这条要求逐字满足，
+        #   而 parser.py 一个字符都不用动。见 core/excel_io 模块开头。
+        parsed = parse_excel(str(FAKE_FIXTURE), engine=engine_for(FAKE_FIXTURE))
         lines.append(
             f"ok    {'解析假数据':<32} {len(parsed.courses)} 门课 / "
             f"{parsed.total_credit} 学分 / {len(parsed.rows)} 个学生"
@@ -277,11 +295,12 @@ def _selfcheck_report() -> tuple[bool, str]:
 
     # --- 锚点校验（Spec 第 6.5 节）-----------------------------------------
     try:
-        import pandas as pd
-
-        frame = pd.read_excel(FAKE_ANCHOR_FIXTURE, header=None, dtype=object)
+        from core.excel_io import read_frame
         from core.parser import parse_dataframe
 
+        # ★ v1.8：**每次都显式指定引擎**（charter 第七节）。
+        #   走 core.excel_io 就自动带上 —— 不靠 pandas 自己猜。
+        frame = read_frame(FAKE_ANCHOR_FIXTURE, header=None, dtype=object)
         direct = parse_dataframe(frame)
         report = check_credit_anchor(frame, direct)
         check("锚点列被识别", bool(report.anchors), f"{[a.label for a in report.anchors]}")
@@ -723,6 +742,7 @@ def _network_policy_report() -> list[str]:
     #   2) **import 期绝不联网**（没有自动检查，必须等用户点按钮）；
     #   3) 超时就是 5 秒（不然按钮会卡很久）。
     lines.extend(_updater_policy_lines())
+    lines.extend(_download_policy_lines())
 
     return lines
 
@@ -832,6 +852,504 @@ def _updater_policy_lines() -> list[str]:
         lines.append(f"FAIL  更新检查超时应为 5 秒（charter 7.2），实际 {DEFAULT_TIMEOUT}")
     else:
         lines.append(f"ok    {'更新检查超时':<32} {DEFAULT_TIMEOUT}s（charter 7.2）")
+    return lines
+
+
+#: 铁律 1：这四个文件**封板**，一个字符都不许改。
+#:
+#: ★ 为什么把哈希写进代码里，而不是"靠自觉"：
+#:   charter v1.7 和 v1.8 都把"calculator/parser/validator/tests 不改"
+#:   列为**第一条铁律**，而 v1.8 的任务书里偏偏又有一条"改 core/parser.py
+#:   显式指定 engine"。文档自己打架的时候，最容易发生的事就是
+#:   "为了满足某一条，悄悄动了封板文件，而且没人发现"。
+#:   有了这个封印，动没动是一句话的事。
+#:
+#: ★ 要改这些文件（比如 Owner 决定解冻 calculator）→ **同时更新这里的哈希**。
+#:   那个动作必须是**有意的**：它不是"顺手改一下让它绿"，
+#:   而是"我们决定解冻铁律 1"。改哈希这件事本身就是审批记录。
+FROZEN_FILE_SHA256: dict[str, str] = {
+    "core/calculator.py": (
+        "44dc25e1b796476c748a6327201c03c50e7722cf9d7167389bf21e112899be60"
+    ),
+    "core/parser.py": (
+        "d246bf5c373f0960ace2c140c8b2cce8aaacfac144cc25542ef2e07e6a6056cc"
+    ),
+    "core/validator.py": (
+        "a6241d5b9db84df10b5bafb04d0d8e6d1dc9fada8f4a8d967ac0277a57782a40"
+    ),
+    "tests/test_calc.py": (
+        "285cabee23812e8d40f1864cfb7c2cc4e5778f59303c377b679f02685c0d90b2"
+    ),
+}
+
+
+def _frozen_files_report() -> list[str]:
+    """铁律 1 的封印：封板文件是否真的一个字符没动。
+
+    ★ 源码模式 / 打包版**分两层**（和 ``core/ai``、``core/updater`` 那两条
+      同一个套路）：打包后这些模块进了 PYZ 归档，磁盘上没有 ``.py``，
+      静态哈希无从算起。那时**明说**"本项以打包前的源码自检为准"，
+      不装作查过了。
+    """
+    import hashlib
+
+    lines: list[str] = []
+    missing: list[str] = []
+    changed: list[str] = []
+    checked = 0
+
+    for relative, expected in FROZEN_FILE_SHA256.items():
+        path = PROJECT_ROOT / relative
+        if not path.exists():
+            missing.append(relative)
+            continue
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as exc:  # pragma: no cover
+            lines.append(f"FAIL  封板文件读不出来 {relative}：{exc}")
+            continue
+        checked += 1
+        if digest != expected:
+            changed.append(f"{relative}（{digest[:16]}… ≠ {expected[:16]}…）")
+
+    if changed:
+        lines.append(
+            "FAIL  封板文件被改动（铁律 1：一个字符都不许改）："
+            + "；".join(changed)
+            + " —— 如果这是**有意解冻**，请同时更新 FROZEN_FILE_SHA256"
+        )
+    elif checked == len(FROZEN_FILE_SHA256):
+        lines.append(
+            f"ok    {'封板文件未被改动（铁律 1）':<32} "
+            f"{checked} 个文件的 sha256 全部吻合"
+        )
+    elif IS_FROZEN:
+        # 打包版：源文件在 PYZ 里，磁盘上没有 —— 不是失败，但不能装作查过
+        lines.append(
+            f"ok    {'封板文件（打包版）':<32} 无 .py 源码（打进 PYZ），"
+            "本项以打包前的源码自检为准"
+        )
+    else:
+        # ★ 源码版却找不到文件 = **检查本身失效了**（路径写错/被改名），必须 FAIL
+        lines.append(
+            f"FAIL  封板文件封印检查扫不到文件（{missing}）—— 检查已经失效，不是通过"
+        )
+    return lines
+
+
+def _version_source_report() -> list[str]:
+    """版本号唯一真源（charter v1.8 第三节铁律 10 / 第五节）。
+
+    两件事，缺一件都不算数：
+
+    1. **静态**：用 ``ast`` 扫 ``ui/`` 下所有**字符串字面量**，
+       出现"纯版本号字面量"（``"v1.0"`` / ``"1.8"``）就 FAIL。
+    2. **行为**：把几个关键显示点**真的读出来**，必须等于
+       ``f"v{CURRENT_VERSION}"``。
+
+    ★ 为什么不是"在源码里 grep 有没有 1.0"：
+      那样会误伤**引用**（``ui/anim.py`` 的注释里写着"charter v1.6 第 5.2 节"、
+      ``ui/splash.py`` 提到 ``docs/SGMS_v1.3_Final_Spec.md``）。
+      用 ``ast`` 只扫**字符串字面量**、再用"整串就是个版本号"这条判据，
+      引用（注释和文档字符串）自然被排除 —— 注释根本不在 AST 里，
+      文档字符串则被显式跳过。
+
+    ★ 这条闸门是有牙的：v1.8 开工时它在 ``ui/`` 里抓到**三处**硬编码
+      ``"v1.0"``（``login_window.APP_VERSION``、``splash`` 的默认参数、
+      ``account_page._ABOUT`` 的"版本"行）—— 三处都不报错，
+      只是一直在说假话（程序是 1.8、界面写着 1.0）。
+    """
+    import ast
+    import re as _re
+
+    from core.version import CURRENT_VERSION
+
+    lines: list[str] = []
+    ui_dir = PROJECT_ROOT / "ui"
+    #: 整串就是一个版本号：``"v1.0"`` / ``"1.8"`` / ``"1.7.2"``
+    pure_version = _re.compile(r"^v?\d+\.\d+(?:\.\d+)*$")
+
+    sources = sorted(ui_dir.rglob("*.py")) if ui_dir.is_dir() else []
+    if not sources and IS_FROZEN:
+        return [
+            f"ok    {'版本号真源（打包版）':<32} 无 .py 源码（打进 PYZ），"
+            "本项以打包前的源码自检为准"
+        ]
+    if not sources:
+        return [
+            f"FAIL  版本号真源检查扫到 0 个文件（{ui_dir}）—— 检查已经失效，不是通过"
+        ]
+
+    offenders: list[str] = []
+    for source in sources:
+        try:
+            tree = ast.parse(source.read_text(encoding="utf-8", errors="ignore"))
+        except SyntaxError as exc:  # pragma: no cover
+            offenders.append(f"{source.name} 解析失败：{exc}")
+            continue
+
+        # 先把所有"文档字符串"节点标出来（模块/类/函数的第一个语句）
+        docstrings: set[int] = set()
+        for node in ast.walk(tree):
+            if isinstance(
+                node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                body = getattr(node, "body", None)
+                if (
+                    body
+                    and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)
+                ):
+                    docstrings.add(id(body[0].value))
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            if id(node) in docstrings:
+                continue
+            text = node.value.strip()
+            if pure_version.match(text):
+                offenders.append(
+                    f"{source.relative_to(PROJECT_ROOT)}:{node.lineno} -> {text!r}"
+                )
+
+    if offenders:
+        lines.append(
+            "FAIL  ui/ 里有硬编码的版本号（charter v1.8 铁律 10："
+            "必须从 core.version 读）：" + "；".join(offenders)
+        )
+    else:
+        lines.append(
+            f"ok    {'版本号唯一真源（ui/ 无字面量）':<32} "
+            f"扫了 {len(sources)} 个文件，0 处硬编码"
+        )
+
+    # --- 行为验证：关键显示点真的读出来看一眼 ----------------------------
+    expected = f"v{CURRENT_VERSION}"
+    checks: list[tuple[str, str]] = []
+    try:
+        from ui import login_window as _lw
+
+        checks.append(("login_window.APP_VERSION", _lw.APP_VERSION))
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"FAIL  读 ui.login_window.APP_VERSION 失败：{exc}")
+    try:
+        from ui import splash as _sp
+        import inspect as _inspect
+
+        checks.append(
+            (
+                "SplashScreen(version=)",
+                str(_inspect.signature(_sp.SplashScreen.__init__)
+                    .parameters["version"].default),
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"FAIL  读 SplashScreen 默认版本号失败：{exc}")
+    try:
+        from ui.pages import account_page as _ap
+
+        row = [value for name, value in _ap._ABOUT if name == "版本"]
+        checks.append(("account_page 关于·版本", row[0] if row else ""))
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"FAIL  读 account_page 关于版本失败：{exc}")
+
+    wrong = [f"{name}={value!r}" for name, value in checks if value != expected]
+    if wrong:
+        lines.append(f"FAIL  界面上的版本号不等于 {expected}：{'；'.join(wrong)}")
+    else:
+        names = "、".join(name for name, _ in checks)
+        lines.append(
+            f"ok    {'界面版本号都等于 ' + expected:<32} {len(checks)} 处：{names}"
+        )
+    return lines
+
+
+def _excel_engine_report() -> list[str]:
+    """Excel 读取引擎（charter v1.8 第七节 / 任务书任务三）。
+
+    四件事，都是**行为验证**，不是找关键字：
+
+    1. ``openpyxl`` 和 ``xlrd`` 都 import 得动；
+    2. ``xlrd`` 版本 **>= 2.0.1** —— 这是实测出来的硬底线，
+       不是抄任务书的（任务书写 ``xlrd<2.0``，那个版本 pandas 直接拒收，
+       见 :mod:`core.excel_io` 开头的实测表）；
+    3. 两个假数据 xlsx 都能被 :func:`core.excel_io.read_frame` 读出来；
+    4. **友好文案里不许出现包管理指令** —— 拿真的 pandas ImportError
+       喂给 :func:`core.excel_io.friendly_error`，断言输出里没有
+       ``pip`` / ``conda``（验收标准 5）。
+
+    另外查一条不变量：``core/parser.py``（封板）里**没有** ``engine=`` ——
+    证明"显式指定引擎"是靠调用方传 ``**read_excel_kwargs`` 做到的，
+    没有靠改封板文件（见 ``core/excel_io`` 开头那段说明）。
+    """
+    lines: list[str] = []
+
+    # --- 1/2. 引擎可用 + 版本底线 -----------------------------------------
+    versions: dict[str, str] = {}
+    for name in ("openpyxl", "xlrd"):
+        try:
+            module = __import__(name)
+            versions[name] = str(getattr(module, "__version__", "?"))
+        except ImportError as exc:
+            lines.append(
+                f"FAIL  {name} 不可用：{exc} —— "
+                "老格式/新格式 Excel 至少有一种读不了"
+            )
+    if "openpyxl" in versions and "xlrd" not in versions:
+        lines.append(
+            "FAIL  xlrd 没装 —— 老格式 .xls（以及扩展名写着 .xlsx 的"
+            "老格式文件）会读不了"
+        )
+    if versions:
+        lines.append(
+            f"ok    {'Excel 引擎可用':<32} "
+            + "，".join(f"{k} {v}" for k, v in versions.items())
+        )
+    try:
+        from core.excel_io import minimum_xlrd_ok, xlrd_version
+
+        if xlrd_version() and not minimum_xlrd_ok():
+            lines.append(
+                f"FAIL  xlrd 版本过低（{xlrd_version()}）：pandas 2.x 要求 "
+                ">= 2.0.1，低了会直接抛 ImportError（实测）"
+            )
+        elif xlrd_version():
+            lines.append(
+                f"ok    {'xlrd 版本满足 pandas 要求':<32} "
+                f"{xlrd_version()} >= 2.0.1（实测底线）"
+            )
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"FAIL  xlrd 版本检查失败：{type(exc).__name__}: {exc}")
+
+    # --- 3. 真的读一份表 ---------------------------------------------------
+    try:
+        from core.excel_io import read_frame, sniff_engine
+
+        for fixture in (FAKE_FIXTURE, FAKE_ANCHOR_FIXTURE):
+            engine = sniff_engine(fixture)
+            frame = read_frame(fixture, header=None, dtype=object)
+            rows = len(frame)
+            if rows <= 0:  # pragma: no cover
+                lines.append(f"FAIL  {fixture.name} 读出来是空的")
+            else:
+                lines.append(
+                    f"ok    {'按内容选引擎读 ' + fixture.name:<32} "
+                    f"engine={engine}，{rows} 行"
+                )
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"FAIL  excel_io 读假数据失败：{type(exc).__name__}: {exc}")
+
+    # --- 4. 友好文案里不许有 pip / conda ----------------------------------
+    try:
+        from core.excel_io import friendly_error
+
+        raw = ImportError(
+            "Missing optional dependency 'xlrd'. Install xlrd >= 2.0.1 for xls "
+            "Excel support Use pip or conda to install xlrd."
+        )
+        message = friendly_error(raw, "某班的成绩表.xlsx")
+        lowered = message.lower()
+        banned = ("pip install", "conda install", "use pip or conda", "install xlrd")
+        hits = [word for word in banned if word in lowered]
+        if hits:
+            lines.append(f"FAIL  Excel 错误文案里还在教用户装包：{hits}")
+        else:
+            lines.append(
+                f"ok    {'Excel 错误文案不含装包指令':<32} "
+                f"{len(message)} 字，0 处 pip/conda（验收标准 5）"
+            )
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"FAIL  Excel 友好文案检查失败：{type(exc).__name__}: {exc}")
+
+    # --- 5. 封板文件没被"顺手改一下" --------------------------------------
+    parser_path = PROJECT_ROOT / "core" / "parser.py"
+    if parser_path.exists():
+        text = parser_path.read_text(encoding="utf-8", errors="ignore")
+        if "engine=" in text:
+            lines.append(
+                "FAIL  core/parser.py（封板）里出现了 engine= —— "
+                "显式引擎应该由调用方通过 **read_excel_kwargs 传进去"
+            )
+        elif "**read_excel_kwargs" not in text:
+            lines.append(
+                "FAIL  core/parser.py 的 **read_excel_kwargs 扩展点不见了 —— "
+                "调用方没法显式指定引擎了"
+            )
+        else:
+            lines.append(
+                f"ok    {'封板 parser 仍靠 kwargs 传引擎':<32} "
+                "parser.py 无 engine=，扩展点在"
+            )
+    elif IS_FROZEN:
+        lines.append(
+            f"ok    {'封板 parser（打包版）':<32} 无 .py 源码，"
+            "本项以打包前的源码自检为准"
+        )
+    return lines
+
+
+def _apply_mechanism_report() -> list[str]:
+    """启动替换机制存在且没退化（任务书 2.3 / 2.4 / 任务六）。
+
+    ★ 这条检查**真的把 bat 生成出来跑一遍纯文本断言**，而不是在源码里
+      grep ``apply_update.bat`` 这个词 —— 后者在文件被改名之后照样通过。
+      这里断言的是脚本**内容**里必须有的四件事：
+
+      1. ``copy /Y`` 把新 exe 复制到目标（替换的核心动作）；
+      2. ``del`` 清掉交接文件和临时 exe；
+      3. ``start`` 把新版本拉起来；
+      4. 重试循环存在（刚退出的进程可能还占着文件锁几秒）。
+
+    另外断言：bat 正文**全是 ASCII** —— 中文注释会被 cmd.exe 按当前代码页
+    错位解码，错位的尾字节正好能吃掉后面那句 copy 的引号
+    （AGENTS.md 1b 记的就是这个坑；第一版真的写成了中文注释，被这条逮住）。
+    """
+    lines: list[str] = []
+    try:
+        from core.update_apply import (
+            APPLY_LOG_NAME,
+            backup_exe_dir,
+            render_apply_bat,
+            update_json_path,
+        )
+
+        text = render_apply_bat("/tmp/new.exe", "/tmp/target.exe", "/tmp/update.json",
+                                "/tmp/apply.log")
+        required = {
+            "copy /Y": 'copy /Y "%SRC%" "%DST%"',
+            "del 交接文件": 'del "%JSN%"',
+            "start 新 exe": 'start "" "%DST%"',
+            "重试循环": "for /L %%i in (1,1,60) do (",
+            "失败不改动": "goto :giveup",
+        }
+        missing = [label for label, needle in required.items() if needle not in text]
+        if missing:
+            lines.append(f"FAIL  替换脚本缺少关键动作：{missing}")
+        elif not all(ord(ch) < 128 for ch in text):
+            bad = sorted({ch for ch in text if ord(ch) >= 128})
+            lines.append(
+                f"FAIL  替换脚本正文里有非 ASCII 字符 {bad} —— "
+                "cmd.exe 会按当前代码页错位解码并吃掉后面的引号（AGENTS.md 1b）"
+            )
+        else:
+            lines.append(
+                f"ok    {'启动替换机制存在（bat 内容）':<32} "
+                f"{len(text)} 字符，5 个关键动作齐全且全 ASCII"
+            )
+
+        lines.append(
+            f"ok    {'更新交接路径规范':<32} "
+            f"{update_json_path().parent.name}/{update_json_path().name}、"
+            f"{backup_exe_dir().name}/、{APPLY_LOG_NAME}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"FAIL  启动替换机制检查失败：{type(exc).__name__}: {exc}")
+    return lines
+
+
+def _download_policy_lines() -> list[str]:
+    """更新**下载**的三条守卫（charter v1.8 第四 / 六节）。
+
+    v1.7 只查"检查"（一次只读 GET）。v1.8 加了下载，所以要多守三件事：
+
+    1. 下载函数**只用 stdlib**（和检查同一条规则，静态扫 ``core/updater.py``）；
+    2. **下载目标必须先写 ``.part``** —— 任务书 2.4 的"下载失败不损坏已有
+       exe"就是靠这个保证的。这条用**行为**验证：真去下一个 404，
+       断言已存在的目标文件一个字节没动；
+    3. **``core/ai/`` 里不许出现 HTTP import**（那条 v1.6 立的闸门
+       在 v1.8 依然有效）—— 模型下载器刻意把字节流交给
+       ``core.updater.download_exe``，所以扫描范围**不需要放宽**。
+       ``core.ai`` 那一段已经查过这条，这里只把"为什么不用放宽"记一句。
+    """
+    lines: list[str] = []
+    updater_path = PROJECT_ROOT / "core" / "updater.py"
+
+    # --- 1. 下载只用 stdlib -----------------------------------------------
+    if updater_path.exists():
+        import re as _re
+
+        source = updater_path.read_text(encoding="utf-8", errors="ignore")
+        banned = (
+            "requests", "httpx", "aiohttp", "urllib3", "openai", "anthropic",
+        )
+        offenders = [
+            name
+            for name in banned
+            if _re.search(rf"^\s*(?:import|from)\s+{name}\b", source, _re.MULTILINE)
+        ]
+        if offenders:
+            lines.append(f"FAIL  更新下载引了第三方 HTTP 客户端：{offenders}")
+        elif "def download_exe(" not in source:
+            lines.append("FAIL  core/updater.py 里没有 download_exe（下载没实现）")
+        else:
+            lines.append(
+                f"ok    {'更新下载只用 stdlib':<32} "
+                "download_exe 在，无 requests/httpx/aiohttp"
+            )
+    else:
+        try:
+            from core import updater as _u
+
+            if not callable(getattr(_u, "download_exe", None)):  # pragma: no cover
+                lines.append("FAIL  打包版 core.updater 里没有 download_exe")
+            else:
+                lines.append(
+                    f"ok    {'更新下载（打包版）':<32} 无 .py 源码（打进 PYZ），"
+                    "download_exe 已就位"
+                )
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"FAIL  打包版更新下载检查失败：{type(exc).__name__}: {exc}")
+
+    # --- 2. 行为：下载失败不损坏已有文件 ----------------------------------
+    try:
+        import tempfile
+        from pathlib import Path as _Path
+
+        from core.updater import DownloadError, download_exe
+
+        with tempfile.TemporaryDirectory(prefix="tl_selfcheck_dl_") as work:
+            target = _Path(work) / "existing.exe"
+            target.write_bytes(b"PRECIOUS")
+            try:
+                # 一个必定连不上的地址（保留域名，RFC 2606）
+                download_exe(
+                    "http://invalid.invalid/none.exe", target, timeout=2, min_bytes=0
+                )
+            except DownloadError:
+                pass
+            if target.read_bytes() != b"PRECIOUS":
+                lines.append("FAIL  下载失败时把已有文件改掉了（任务书 2.4）")
+            else:
+                lines.append(
+                    f"ok    {'下载失败不损坏已有文件':<32} "
+                    "真跑一次失败下载，目标文件逐字节未变"
+                )
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"FAIL  下载安全行为检查失败：{type(exc).__name__}: {exc}")
+
+    # --- 3. AI 下载器不引入 HTTP import（那条闸门不需要放宽）--------------
+    downloader = PROJECT_ROOT / "core" / "ai" / "model_downloader.py"
+    if downloader.exists():
+        import re as _re
+
+        source = downloader.read_text(encoding="utf-8", errors="ignore")
+        hits = _re.findall(
+            r"^\s*(?:import|from)\s+(urllib|requests|httpx|socket|http)\b",
+            source,
+            _re.MULTILINE,
+        )
+        if hits:
+            lines.append(
+                f"FAIL  core/ai/model_downloader.py 里出现了 HTTP import {hits} —— "
+                "模型下载应复用 core.updater.download_exe"
+            )
+        else:
+            lines.append(
+                f"ok    {'AI 模型下载器无 HTTP import':<32} "
+                "复用 core.updater，core/ai 的扫描范围无需放宽"
+            )
     return lines
 
 
@@ -1507,6 +2025,56 @@ def run_startup_migration(root: str | None = None) -> None:
     QMessageBox.information(None, "迁移完成", outcome.detail)
 
 
+def run_pending_update(root: str | None = None) -> bool:
+    """启动**最早期**检测待应用的更新（任务书 2.3）。返回 ``True`` = 立刻退出。
+
+    ★ 为什么放在 ``make_app`` **之前**、比迁移检测还早：
+
+    1. 这一步的结论可能是"交接给替换脚本，本进程马上退出" ——
+       越早退出，旧 exe 的文件锁松得越快，bat 里那个 copy 越容易一次成功。
+       先建 QApplication、再开屏、再退出，等于白等两秒还占着锁。
+    2. 它**不碰 Qt**（``core.update_apply`` 是纯文件操作），所以放在这里
+       没有任何代价。真正需要 Qt 的是"弹窗问用户"，而那个问题在
+       **下载的时候**就已经问过了 —— 这里是"用户上次点了稍后，现在补上"，
+       不需要再问一遍。
+
+    Returns:
+        ``True`` 表示已经把替换工作交给 ``apply_update.bat``，
+        调用方**必须立刻 return**，不能再走启动流程 ——
+        否则新旧两个版本会同时跑，而旧进程还占着 exe 文件锁。
+    """
+    # 自动化（截图脚本、真实时序测试）里不该让程序突然退出。
+    # 只有显式设了这个环境变量才跳过；正常启动永远会走完检测。
+    if str(os.environ.get("TL_SKIP_UPDATE", "")).strip() not in ("", "0"):
+        return False
+
+    try:
+        from core.update_apply import apply_pending_update
+
+        result = apply_pending_update(root=root)
+    except Exception as exc:  # noqa: BLE001 - 启动路径绝不能被这件事搞挂
+        _say(f"检查待应用的更新时出错（已忽略）：{type(exc).__name__}: {exc}")
+        return False
+
+    if result.handed_off:
+        _say(result.detail)
+        return True
+    if result.detail:
+        _say(result.detail)
+    return False
+
+
+def _say(text: str) -> None:
+    """能打印就打印一行。``--windowed`` 的 exe 没有 stdout，所以静默跳过。"""
+    stream = getattr(sys, "stdout", None)
+    if stream is None:
+        return
+    try:
+        stream.write(str(text) + "\n")
+    except OSError:  # pragma: no cover
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
 
@@ -1540,8 +2108,15 @@ def main(argv: list[str] | None = None) -> int:
 
     app = make_app([sys.argv[0], *args])
     flow = AppFlow(app)
-    # ★ 放在开屏**之前**：迁移可能弹模态框，让模态框跟开屏动画抢屏幕
-    #   会变成一团乱。这里按次序问完，再让开屏出场。
+
+    # ★ 次序有讲究，两步都不许挪到开屏后面：
+    #
+    # 1. 待应用的更新**最先** —— 它的结论可能是"马上退出让 bat 去替换"，
+    #    越早退出文件锁松得越快（见 run_pending_update）。
+    # 2. 迁移检测 —— 可能弹模态框，让模态框跟开屏动画抢屏幕会变成一团乱。
+    #    这里按次序问完，再让开屏出场。
+    if run_pending_update(flow.root):
+        return 0
     run_startup_migration(flow.root)
     flow.start()
     return app.exec()

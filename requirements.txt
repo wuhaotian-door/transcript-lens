@@ -5,6 +5,25 @@
 # 铁律九：不引入任何联网请求库（requests / httpx 全禁）。
 pandas>=2.0
 openpyxl>=3.1
+
+# ★ v1.8 新增：读**老格式** .xls（Excel 97-2003 / BIFF）必须靠 xlrd。
+#
+#   为什么不是 xlrd<2.0（任务书 3.2 写的是那个）—— **实测过，那个版本更坏**：
+#
+#     xlrd 1.2.0  →  ImportError: Pandas requires version '2.0.1' or newer
+#                    of 'xlrd' (version '1.2.0' currently installed).
+#     xlrd 2.0.2  →  正常读出
+#
+#   pandas 2.3.3 自己带版本闸门（pandas/io/excel/_xlrd.py）。装 1.2.0 等于
+#   把"缺 xlrd"换成了"xlrd 太老"，错误信息里照样带着版本指令 ——
+#   正好是 v1.8 要修掉的那个体验。
+#
+#   ★ 还有一层必要性：教务系统导出的"Excel"有很大一部分是**老格式**，
+#     只是文件名被存成了 .xlsx。pandas 不看扩展名、看魔数，一见 OLE2 头
+#     就去调 xlrd —— 没装就在导入 .xlsx 时弹出 xlrd 的错。
+#     详见 core/excel_io.py 开头的实测表。
+xlrd>=2.0.1
+
 cryptography>=42.0
 
 # 界面：**只用 PySide6**（铁律九：不引入 PyQt6）

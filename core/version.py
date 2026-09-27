@@ -1,14 +1,29 @@
-"""版本号的**唯一真源**（charter v1.7 第八节）。
+"""版本号的**唯一真源**（charter v1.7 第八节 / v1.8 第三节铁律 10）。
 
 三样东西名字很像，别搞混：
 
 ======================  =========================  ================================
 名字                    值                         含义
 ======================  =========================  ================================
-``CURRENT_VERSION``     ``"1.7"``                   **程序**版本（这个 exe 是哪一版）
+``CURRENT_VERSION``     ``"1.8"``                   **程序**版本（这个 exe 是哪一版）
 ``VAULT_VERSION_KEY``   ``"__vault_version__"``     写进 ``users.json`` 的那个键名
 ``DEFAULT_VAULT_VERSION`` ``"1.0"``                 老库**没有标记**时按 1.0 算
 ======================  =========================  ================================
+
+★ v1.8：界面上的版本号**一律从这里读**
+--------------------------------------
+
+charter v1.8 第五节把"版本号硬编码在 UI 里"列为必须修正的旧 bug ——
+实测确实有三处写死了 ``"v1.0"``：
+
+* ``ui/login_window.py`` 的 ``APP_VERSION``
+* ``ui/splash.py`` 的开屏版本号默认参数
+* ``ui/pages/account_page.py`` 的"关于"表
+
+三处都不报错，只是**一直在说假话**（程序是 1.8、界面写着 1.0）。
+``main._version_source_report()`` 里有一条闸门：用 AST 扫 ``ui/`` 下所有
+**字符串字面量**，出现纯版本号字面量（``"v1.0"`` / ``"1.8"``）就 FAIL。
+注释和文档字符串不算 —— 那里写 "charter v1.7 第七节" 是**引用**，不是版本显示。
 
 ★ 为什么程序版本号只写在这里一份
 --------------------------------
@@ -39,22 +54,35 @@ __all__ = [
     "CURRENT_VERSION",
     "DEFAULT_VAULT_VERSION",
     "LEGACY_VAULT_VERSION_KEY",
+    "VAULT_VERSION_KEYS",
     "VAULT_VERSION_KEY",
     "compare_versions",
     "is_newer",
     "normalize_version",
     "parse_version",
+    "stamp_vault_version",
     "vault_version_of",
 ]
 
 #: 程序版本。**改版本号只改这一行。**
-CURRENT_VERSION = "1.7"
+CURRENT_VERSION = "1.8"
 
 #: 加密库里存数据版本用的键（charter 8.1）
 VAULT_VERSION_KEY = "__vault_version__"
 
 #: 兼容读取：任务书 2.1 里写的那个键名，万一有版本写过它就还能读出来
 LEGACY_VAULT_VERSION_KEY = "vault_version"
+
+#: ★ 写盘时**两个键都写**，读取时**哪个有值认哪个**。
+#:
+#: 这不是洁癖，是因为"用哪个键名"这件事在文档之间对不上：
+#: charter 8.1 写 ``__vault_version__``，任务书（v1.7 2.1 和 v1.8 1.1 两次）
+#: 写 ``vault_version``。两边都是权威文档，让实现去猜哪边赢，风险是
+#: **某次真迁移把标记写到一个启动检测读不到的键上** —— 而那正是版本保护
+#: 唯一要防的事。写两份的成本是两个 JSON 字段，收益是"谁读都对"。
+#: 两个键的值**永远是同一个**（:func:`stamp_vault_version` 是唯一写入点），
+#: 自检里有一条断言它们相等。
+VAULT_VERSION_KEYS: tuple[str, ...] = (VAULT_VERSION_KEY, LEGACY_VAULT_VERSION_KEY)
 
 #: 没有版本标记的老库一律按这个版本算（任务书 2.2）
 DEFAULT_VAULT_VERSION = "1.0"
@@ -132,8 +160,27 @@ def vault_version_of(vault_data: Mapping[str, Any] | None) -> str:
     """从加密库数据里读数据版本；没有标记 → :data:`DEFAULT_VAULT_VERSION`。"""
     if not isinstance(vault_data, Mapping):
         return DEFAULT_VAULT_VERSION
-    for key in (VAULT_VERSION_KEY, LEGACY_VAULT_VERSION_KEY):
+    for key in VAULT_VERSION_KEYS:
         value = normalize_version(vault_data.get(key))
         if value:
             return value
     return DEFAULT_VAULT_VERSION
+
+
+def stamp_vault_version(data: Any, version: str = CURRENT_VERSION) -> Any:
+    """把数据版本标记写进一份 ``users.json`` 字典（**唯一写入点**）。
+
+    ★ 两个键名**同时写**，值永远相同（原因见 :data:`VAULT_VERSION_KEYS`）。
+      写之前会把旧键名里可能残留的、和 canonical 不一致的值**覆盖掉**，
+      所以"两个键打架"这种状态从写入这一侧就不可能产生。
+
+    Args:
+        data: ``users.json`` 反序列化出来的 dict（**原地改**）。
+        version: 要盖的版本号。
+
+    Returns:
+        同一个 dict（方便链式用）。
+    """
+    for key in VAULT_VERSION_KEYS:
+        data[key] = version
+    return data

@@ -556,33 +556,52 @@ self._stack.setCurrentIndex(self._pending); clear_effect(...); self._land(...)
 
 ## 13. ★ 联网红线（**有条件放行**）
 
-真源：`docs/SGMS_v1.7_Dev_Charter.md` **第四节**（它取代 v1.6 及之前所有规格）。
+真源：`docs/SGMS_v1.8_Dev_Charter.md` **第四节**（它取代 v1.7 及之前所有规格）。
 
-### ✅ 允许（**只有这三件**）
+### ✅ 允许（**只有这四件**）
 
 | 场景 | 条件 | 实现 |
 |---|---|---|
 | SMTP 发邮件 | 仅找回密码流程，用户主动点「发送验证码」触发 | `core/email_recovery.py` |
 | 辅导员手动启用云端大模型 | 设置页手动开 + 手动填 API Key，**只在点「深度评估」时**调用 | `core/ai/`（骨架） |
 | **更新检查** | 用户点「检查更新」→ `urllib.request` 只读一次 Gitee 版本号 | `core/updater.py` |
+| **更新下载 / AI 模型下载** | 用户点「开始下载」并勾选文件 → `urllib.request` 流式下载 | `core/updater.download_exe` |
+
+★ **v1.8 把"更新下载"加进了白名单，但 ❌ 那一条没变**：
+
+```
+❌ 自动更新/静默下载 · telemetry · 埋点 · 崩溃上报 ·
+   激活码联网校验 · requests/httpx 用于上述场景之外
+```
+
+所以"允许下载"的准确含义是：**每一次下载前面都必须有一个用户点过确认的弹窗**。
+代码里不许有"启动时顺便检查/下载一下"的路径 —— 判据之一是
+`_updater_policy_lines()` 里那条"import 期零网络"
+（把 `urlopen` 换成炸弹再重新 import 一遍模块，见第 21 节）。
 
 ### ❌ 禁止
 
-自动更新检查 · telemetry / 埋点 / 崩溃上报 · 激活码联网校验 ·
-拿 `requests` / `httpx` 干**非** SMTP、**非**用户主动 AI 的事。
+自动更新检查 · 静默下载 · telemetry / 埋点 / 崩溃上报 · 激活码联网校验 ·
+拿 `requests` / `httpx` 干**非** SMTP、**非**用户主动下载/AI 的事。
 
 ### selfcheck 怎么守（`main._network_policy_report`）
 
 ★ **守卫要落在行为上，不能落在"这个包在不在"上。** 原来那条
 "打包里见到 requests 就 FAIL"在 charter 之后语义就错了，而且它只能查打包版，
-源码版什么都查不到。现在三条：
+源码版什么都查不到。现在五条：
 
 1. **静态扫 `core/ai/*.py`**，源码里出现任何
    `import requests/httpx/urllib.request/socket/http.client/openai/anthropic`
    就 FAIL（正则只认真正的 import 语句，不认注释里提到的名字）；
 2. **拿脏数据调一次 `redact_student`**，看姓名/学号/身份证会不会漏出去；
 3. 非白名单联网库**仍然**不该在包里 —— 但报错文案改成
-   "AI/更新都还是骨架，是不是有人偷偷加了依赖"，不再是"违反铁律"。
+   "AI/更新都还是骨架，是不是有人偷偷加了依赖"，不再是"违反铁律"；
+4. **更新检查**三条（`_updater_policy_lines`，见第 21 节）；
+5. **更新下载**三条（`_download_policy_lines`，见第 26 节）。
+
+★ 第 1 条**不需要为了 v1.8 放宽** —— `core/ai/model_downloader.py`
+刻意一行 `urllib` 都没有，字节流复用 `core.updater.download_exe`。
+所以"`core/ai/` 零 HTTP import"这条闸门照旧全量生效，扫描范围一个字没动。
 
 ## 14. 奖学金测算（charter v1.7 第五节，**规则已定死**）
 
@@ -787,19 +806,13 @@ charter v1.7 第七节把它加进了白名单。**"允许"不等于"不管"**�
 在按钮回调里直接 `urlopen` 的话，**断网时要卡满 5 秒超时**，
 期间窗口不重绘（`ui/workers.py` 开头讲的就是这个）。
 
-### 21b. ★ 实测：`/releases/latest` 现在是 404，那不是"故障"
+### 21b. ★ 实测：`/releases/latest` 是 404，那不是"故障"
 
-2026-09-26 实测：
+2026-09-27 实测：仓库公开可读（200），但 `/releases` 返回 `200 []`、
+`/releases/latest` 返回 **404** —— **一个发行版都没发过**。
 
-| 请求 | 结果 |
-|---|---|
-| `/repos/.../transcript-lens` | 200（仓库公开，匿名可读） |
-| `/repos/.../releases` | 200 → `[]`（**一个发行版都没发**） |
-| `/repos/.../releases/latest` | **404** |
-
-所以只打 `latest` 的话，**在发布第一个发行版之前这个功能永远只能报"检查失败"**
-—— 而那不是实话。`check_for_update()` 因此有四种状态，
-界面对每种说不同的话：
+所以只打 `latest` 的话，在发布第一个发行版之前这功能永远只能报"检查失败"，
+而那不是实话。`check_for_update()` 因此有四种状态，界面对每种说不同的话：
 
 | status | 界面上的话 | 含义 |
 |---|---|---|
@@ -814,10 +827,25 @@ charter v1.7 第七节把它加进了白名单。**"允许"不等于"不管"**�
 ★ **列表非空但读不出版本号** ≠ "没有发行版"。第一版把这两种混成一种，
 界面上会说"仓库里还没有发布任何发行版"，而仓库里明明挂着东西 —— **那是句假话**。
 
-### 21c. 绝不自动下载、绝不自动替换
+### 21c. ★ v1.8 起：**可以下载，但绝不自动**
 
-只 `QDesktopServices.openUrl()` 打开浏览器让用户自己下载。
-写自动替换 exe 的逻辑是 charter 十节明令禁止的。
+v1.7 时这里写的是"绝不自动下载、绝不自动替换，只打开浏览器"。
+**v1.8 的 charter 改了这条**（第四节把"更新下载"加进白名单，
+第六节给了完整的下载 → 重启 → 替换流程），所以那段话已被取代。
+
+**现在正确的说法是**：
+
+| | |
+|---|---|
+| ✅ 可以 | 用户点「开始下载」之后流式下载；用户点「立即重启」之后备份 + 替换 |
+| ❌ 仍然禁止 | **静默/自动下载** —— 启动时、定时、后台，一律不许 |
+| ❌ 仍然禁止 | **热替换**（趁自己还活着去覆盖自己的 exe）—— 那是必失败或写出半截文件 |
+
+每一次下载前面都必须有一个**用户点过确认的弹窗**，
+代码里不许有"启动时顺便查一下/下一下"的路径。
+
+★ 判断"是不是偷偷联网了"的判据仍然是第 21 节那条**行为**检查
+（`urlopen` 换成炸弹后重新 import 模块），不是读源码找关键字。
 
 ## 22. ★ 数据迁移与版本保护（charter v1.7 第八节）
 
@@ -846,17 +874,22 @@ charter v1.7 第七节把它加进了白名单。**"允许"不等于"不管"**�
 
 ### 22b. 标记写在哪、什么时候写
 
-* 键：`__vault_version__`（charter 8.1）。**常量名**是
-  `core.version.VAULT_VERSION_KEY`（任务书 2.1 说的那个）。
-  兼容读 `vault_version` 这个旧键名。
+* 键：**两个键同时写**（`core.version.VAULT_VERSION_KEYS`）：
+  `__vault_version__`（charter 8.1 的值）和 `vault_version`
+  （任务书 2.1 / v1.8 1.1 两次给的值）。**读取时哪个有值认哪个。**
+  * 为什么写两份：这件事在文档之间**对不上**，而让实现去猜哪边赢的风险是
+    **某次真迁移把标记写到一个启动检测读不到的键上** —— 那正是版本保护
+    唯一要防的事。写两份的成本是两个 JSON 字段，收益是"谁读都对"。
+  * 唯一写入点是 `core.version.stamp_vault_version()`，
+    所以"两个键打架"这种状态从写入这一侧就不可能产生。
+    `--selfcheck` 里断言两个键都在且相等。
 * 位置：`users.json` 顶层，跟着 `UserIndex` 走 —— 因为 `save_users()`
   每次都从 `UserIndex.to_dict()` 重写整个文件，标记**不挂在 UserIndex 上
   就会被下一次写盘悄悄抹掉**。
 * 时机：`CryptoStore.register()`（建第一个用户 = 初始化这个库）调
-  `init_vault()`。**只在没有标记时盖** —— 覆盖已有标记会让
-  "检测到旧版数据 → 提示迁移"永远发现不了旧数据。
-* ★ 为什么写在**明文**的 `users.json` 里：启动检测发生在**登录之前**，
-  那时候没有密码，密文一概打不开。
+  `init_vault()`。**只在没有标记时盖** —— 覆盖已有标记会让"检测到旧版数据"
+  永远发现不了旧数据。写在**明文**的 `users.json` 里，是因为启动检测发生在
+  **登录之前**，那时没有密码，密文一概打不开。
 
 ### 22c. 流程（`core.migrator`）
 
@@ -900,18 +933,64 @@ if needs_migration(data):                   # ★ 判真假**必须**用这个
 | `core/migrator.py` | 同上，另加 `compare_versions` |
 | 设置页 | 同上 |
 | `main.vault_status()` | 同上 |
+| `ui/login_window.APP_VERSION` | `f"v{CURRENT_VERSION}"`（模块级常量） |
+| `ui/splash.SplashScreen(version=)` | 默认参数 `f"v{CURRENT_VERSION}"` |
+| `ui/welcome.py` 底部版本小字 | `f"v{CURRENT_VERSION}"` |
+| `ui/pages/account_page._ABOUT` | `("版本", f"v{CURRENT_VERSION}")` |
+| 三个顶层窗口标题 | `setWindowTitle(f"... v{CURRENT_VERSION}")` |
 
-★ 四个地方各写一份字符串，迟早出现"设置页写着 1.7、更新检查却按 1.6 比"
+★ 各写一份字符串，迟早出现"设置页写着 1.7、更新检查却按 1.6 比"
 这种事，而且**不报错，只是行为不对**。`--selfcheck` 里有一条断言
 `core.updater.CURRENT_VERSION is core.version.CURRENT_VERSION`。
+
+### 23a. ★★ UI 里**一个版本号字面量都不许有**（charter v1.8 铁律 10）
+
+这不是假想风险 —— v1.8 开工时在 `ui/` 里抓到**三处**写死的 `"v1.0"`：
+
+| 位置 | 症状 |
+|---|---|
+| `ui/login_window.py` 的 `APP_VERSION` | 登录窗左栏永远显示 `v1.0` |
+| `ui/splash.py` 的 `version` 默认参数 | 开屏版本号永远 `v1.0` |
+| `ui/pages/account_page.py` 的"关于"表 | 个人中心永远写着 `v1.0` |
+
+三处都**不报错**，只是一直在说假话（程序是 1.8、界面写着 1.0）。
+而且**静态 grep 查不出来** —— `ui/anim.py` 的注释里合法地写着
+"charter v1.6 第 5.2 节"、`ui/splash.py` 提到 `docs/SGMS_v1.3_Final_Spec.md`，
+一刀切地搜 `1.0` / `1.6` 全是误报。
+
+**判据**（`main._version_source_report()`，`--selfcheck` 里跑）：
+
+1. **静态**：用 `ast` 扫 `ui/**/*.py` 的**字符串字面量**，
+   出现"整串就是个版本号"（`^v?\d+\.\d+(\.\d+)*$`）就 FAIL。
+   注释根本不在 AST 里，文档字符串被显式跳过 —— 所以"引用"不会误伤。
+2. **行为**：把 `login_window.APP_VERSION`、`SplashScreen` 的默认参数、
+   `account_page._ABOUT` 真的读出来，必须等于 `f"v{CURRENT_VERSION}"`。
+
+★ 闸门**验过有牙**：往 `ui/splash.py` 注入一处 `version: str = "v1.0"`，
+立刻 FAIL 并指名 `ui\splash.py:183`（见 `%TEMP%\tl_v18_gate_test.py`）。
+
+★ 写文档（`.md`）时该写版本号就写 —— 这条只管**界面代码**。
 
 ★ 比较一律走 `compare_versions()`（**数值**逐位比）。
 `"1.10" > "1.9"` 用字符串比会得出 False，等真出 1.10 那天才暴露。
 
-★ `normalize_version()` **不削末尾的 0**。第一版削了，于是 `"1.0"` 变成 `"1"`：
-备份目录名成了 `backup_v1_...`，迁移链按 `"1.0"` 查表查不到，
-直接报"没有从 v1 升级的路径"。`"1.7.0"` 和 `"1.7"` 该不该算同一个版本，
-**是 `compare_versions()` 的事**（缺的位按 0 补），不是规范化的事。
+★ `normalize_version()` **不削末尾的 0**（第一版削了，`"1.0"`→`"1"`，
+备份名和迁移链查表同时坏掉）。`"1.7.0"` 和 `"1.7"` 算不算同一个版本
+**是 `compare_versions()` 的事**（缺位按 0 补），不是规范化的事。
+
+### 23b. 升版本号 = **同时补迁移链的一跳**
+
+改完 `CURRENT_VERSION`，必须去 `core/migrator.py` 的 `_STEPS` 补一跳 ——
+**哪怕什么数据结构都没改，也要写个 `return data` 的空函数**。
+
+不补的后果是**老用户启动时直接报错**：
+
+```
+MigrationError: 没有从 v1.7 升级的路径（已知：1.0, 1.6, 1.7, 1.8）
+```
+
+v1.7 → v1.8 时实测踩到（`--selfcheck` 的迁移检查当场 FAIL，拦住了）。
+补一跳只要三行，忘掉的代价是老用户升不了级。
 
 ## 24. ★ 界面上不许出现 Markdown 记号（charter v1.7 铁律 9）
 
@@ -970,4 +1049,156 @@ charter v1.7 六节写的是"欢迎页 1.5s 时间问候"。
 
 **这是文档定义值，不是 Agent 自定的**，不要再"优化"掉。要动先问。
 
+## 26. ★★ 自动更新器：四个"绝不"（charter v1.8 第六节）
 
+完整流程与排查手册见 `docs/UPDATE_GUIDE.md` / `docs/DISTRIBUTION.md`；
+这里只列**不许违反的硬约束**。
+
+### 26a. 四个绝不
+
+| 绝不 | 靠什么保证 |
+|---|---|
+| **绝不静默下载** | 每个下载前面都有用户点过的弹窗；`download_exe` 没有任何自动调用点 |
+| **绝不热替换** | 只生成 `.bat`，本进程退出后由 bat 复制（运行中的 exe 是锁着的） |
+| **绝不在下载失败时损坏已有 exe** | 全程只写 `<dest>.part`，成功了才 `os.replace` |
+| **绝不在备份失败时替换** | `backup_current_exe()` 抛异常 → 直接放弃，旧 exe 一个字节不动 |
+
+### 26b. ★ `.bat` 正文必须是纯 ASCII（踩过一次）
+
+第一版 `rem` 注释写了中文，被自己的断言逮住。**中文注释在这里真会出事**：
+`cmd.exe` 按当前代码页逐字节解码 bat，中文按 GBK 解错位后，
+错位配对的尾字节范围（`0x40~0xFE`）正好包含 `"` 和 `\` ——
+会把后面那句 `copy /Y "%SRC%" "%DST%"` 的引号**吃掉**，报错完全看不出根因。
+和 §1b（`.ps1` 的 BOM）是同一个根因。
+
+### 26c. ★ 路径不写进 bat，走命令行参数（`%~1..%~4`）
+
+路径里可能有中文（用户名）。参数走 Windows 的 UTF-16 API，不受代码页影响；
+写进文件就要赌用户机器的代码页。
+
+### 26d. 复制要重试，失败就什么都不做
+
+`for /L %%i in (1,1,60)` 每秒重试（刚退出的进程可能还占着句柄几秒）。
+60 次全失败 → `goto :giveup`，旧 exe 原样留着。
+**最坏情况是"更新没生效"，不是"程序没了"。**
+
+### 26e. 必须写日志
+
+bat 在**本进程退出之后**跑，那时没有控制台、没有异常、没有反馈。
+每次交接都往 `%TEMP%\SGMS_Update\apply_update.log` 写一行 ——
+没有它，"点了立即重启但版本没变"完全查不下去。
+
+### 26f. 启动次序（`main()` 里）
+
+```
+run_pending_update()      ← 最先。结论可能是"马上退出让 bat 去替换"
+run_startup_migration()   ← 可能弹模态框，必须早于开屏
+flow.start()              ← 开屏
+```
+
+`run_pending_update()` 自己**不碰 Qt**；越早退出，exe 文件锁松得越快。
+自动化环境用 `TL_SKIP_UPDATE=1` 跳过（和 `TL_SKIP_MIGRATION` 同套路）。
+
+### 26g. 判据
+
+| 测试 | 覆盖 |
+|---|---|
+| `%TEMP%\tl_apply_probe.py`（17 项） | **真的用 cmd 跑一遍生成的 bat**：目标 exe 被换掉、临时文件被删、exit code 0/2 正确 |
+| `%TEMP%\tl_download_probe.py`（24 项） | 本地 HTTP 服务器：续传 / **服务器忽略 Range 时从头重下** / 取消 / sha256 / 失败不损坏已有文件 |
+| `%TEMP%\tl_v18_test.py`（96 项） | 交接全路径（源码模式不替换 / 哈希不符拒绝 / 备份失败拒绝 / 正常交接） |
+| `main._apply_mechanism_report()` | bat 内容五要素齐全 + **全 ASCII** |
+| `main._download_policy_lines()` | 只用 stdlib + **真跑一次失败下载**验证目标文件未变 |
+
+★ `tl_v18_test.py` 里所有会走到"拉起脚本"的用例**都注入了假 `Popen`** ——
+第一版没注入，于是真的把 bat 跑起来了。**测试绝不能有这种不受控的副作用。**
+
+## 27. ★ Excel 引擎依赖（charter v1.8 第七节）
+
+### 27a. 引擎按**内容**选，不按扩展名（`core/excel_io.py` 是唯一真源）
+
+| 文件头 | 引擎 | 是什么 |
+|---|---|---|
+| `PK\x03\x04` | `openpyxl` | 真 xlsx/xlsm（zip 容器） |
+| `D0 CF 11 E0 A1 B1 1A E1` | `xlrd` | 老格式 xls（OLE2 复合文档） |
+| `09 00 04 00` + version | `xlrd` | 裸 BIFF 流（Excel 2.0/3.0，无 OLE2 外壳） |
+
+★ **必须显式指定引擎**：实测即使 xlrd 装好了，`pd.read_excel("真的.xls")`
+对**裸 BIFF 流**依然报 `ValueError: Excel file format cannot be determined,
+you must specify an engine manually.` —— pandas 自己的 sniff 只认 zip 和 OLE2。
+
+### 27b. ★★ "导 .xlsx 却弹出 xlrd 错误"的根因（实测复现）
+
+pandas **不看扩展名，看内容的魔数**。一个"扩展名 `.xlsx`、内容其实是 OLE2"
+的文件（**教务系统导出的老格式表经常长这样**）被判成 `"xls"` → 调 xlrd →
+没装就抛 `ImportError: Missing optional dependency 'xlrd'. … Use pip or conda
+to install xlrd.` —— 用户看到的是"我导的是 xlsx，为什么跟我说 xlrd"，
+而且错误里还带着 pip 指令。
+**修法**：按内容选引擎 + 兜底链（认定的引擎失败就换另一个试）。
+
+### 27c. ★ `xlrd` 必须 **>= 2.0.1**，任务书写的 `<2.0` 是错的
+
+| xlrd 版本 | pandas 2.3.3 读 .xls |
+|---|---|
+| 1.2.0（`<2.0`） | `ImportError: Pandas requires version '2.0.1' or newer of 'xlrd'` |
+| 2.0.2 | 正常读出 |
+
+1.2.0 那条例外里**同样带着版本指令** —— 等于花力气把错误信息换了个写法。
+`requirements.txt` 已写 `xlrd>=2.0.1`，自检里断言这个底线。
+
+### 27d. ★ 铁律 1 与 charter 第七节的冲突，怎么解的
+
+charter v1.8 第七节说"`core/parser.py`：`pd.read_excel(path, engine='openpyxl')`
+显式指定"，第三节铁律 1 又说"parser 一个字符不许改"。**同一份文档自己打架。**
+
+**解法**：`core/parser.parse_excel` 的签名里本来就有 `**read_excel_kwargs`
+并原样转发给 `pd.read_excel` —— 那个扩展点就是为这种情况留的：
+
+```python
+# core/parser.py:947（冻结，未改动）
+df = pd.read_excel(path, sheet_name=sheet_name, header=None, **read_excel_kwargs)
+
+parse_excel(path, engine=engine_for(path))   # 调用方传引擎进去
+```
+
+"显式指定"逐字满足，**封板文件零改动**。自检里两条不变量护着：
+`core/parser.py` 无 `engine=`，且 `**read_excel_kwargs` 扩展点还在。
+
+### 27e. 错误文案绝不含包管理指令
+
+`core/excel_io.friendly_error()` 把任何异常翻成人话，`sanitize_message()`
+在**出口**抹掉 `pip install` / `conda install` / `Use pip or conda to install` /
+`Missing optional dependency` / `install xlrd`。自检拿真 pandas ImportError
+喂进去，断言 0 处 pip/conda。
+
+### 27f. 铁律 1 的封印（`main.FROZEN_FILE_SHA256`）
+
+四个封板文件（`core/calculator.py`、`core/parser.py`、`core/validator.py`、
+`tests/test_calc.py`）的 sha256 写死在 `main.py` 里，`--selfcheck` 每次核对。
+
+**要解冻 → 同时更新哈希。** 那个动作必须是**有意的**：不是"顺手改一下让它绿"，
+而是"我们决定解冻铁律 1"，改哈希本身就是审批记录。
+★ 验过有牙：给 `core/parser.py` 末尾加一个换行，`--selfcheck` 立刻 FAIL。
+
+## 28. ★ `core/ai/` 的零 HTTP import 规则**没有**为模型下载放宽
+
+那条"`core/ai/*.py` 出现任何 HTTP import 就 FAIL"（v1.6 立的）**一个字没改**。
+做法：`core/ai/model_downloader.py` 里**一行 `urllib` 都没有** ——
+字节流复用 `core.updater.download_exe`，本模块只管"下到哪、叫什么、装好没有"。
+
+于是两条规则都不用让步：`core/ai/` 仍然零 HTTP import（**扫描范围无需放宽**），
+模型下载仍然是 `urllib.request`（在 `core.updater` 里）。
+
+★ 以后往 `core/ai/` 加下载类功能**照这个模式做**：把网络关在 `core.updater` 里。
+口子一开，那条闸门就只能放宽 —— 而放宽之后的闸门等于没有。
+
+## 29. 模型文件的落盘位置与判据
+
+* 位置：**`%LOCALAPPDATA%\SGMS\models\<名字>\`**，不是仓库里的 `models/`。
+  理由：1~3GB 进仓库是灾难；打包后程序目录常常只读；数据目录才是它的家。
+* 落盘顺序：`models/temp/<名字>__<文件名>` → 校验 → **原子改名**进 `models/<名字>/`。
+* ★ 判据是"目录里有一个非空的 `.gguf`"，**不是"目录存在"** ——
+  下载中途断电会留下空目录，那个不算装好。
+* ★ `_safe_name()` 清洗目录名，`delete_model()` 再验一次"解析后仍在 models/ 里"
+  —— **防目录穿越**：`download(url, "../../evil")` 不该写到 models/ 外面去。
+* `ModelDownloader.progress` 发**百分比 0~100**；**总大小未知时发 `-1`**
+  （界面切不确定态）。字节数在 `downloaded_bytes` / `total_bytes` 上读。

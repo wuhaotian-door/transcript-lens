@@ -47,10 +47,11 @@ from core.crypto_store import CryptoStore, UserIndex
 from core.version import (
     CURRENT_VERSION,
     DEFAULT_VAULT_VERSION,
-    VAULT_VERSION_KEY,
     LEGACY_VAULT_VERSION_KEY,
+    VAULT_VERSION_KEY,
     compare_versions,
     normalize_version,
+    stamp_vault_version,
     vault_version_of,
 )
 
@@ -101,6 +102,21 @@ def _lift_1_6_to_1_7(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def _lift_1_7_to_1_8(data: dict[str, Any]) -> dict[str, Any]:
+    """1.7 → 1.8：**没有数据结构变化**。
+
+    v1.8 加的是自动更新器和 AI 模型下载器骨架 —— 两者都只在
+    ``%LOCALAPPDATA%/SGMS/`` 下**新建自己的目录**（``backup_exe/`` /
+    ``models/``），加密库里一个字段都没增删。
+
+    ★ 顺带一提：v1.8 确实动了版本标记的**键名策略**（canonical +
+      兼容别名两个键都写），但那是 :func:`core.version.stamp_vault_version`
+      在**每一次写盘**时做的，不属于"把老数据抬到新格式"，
+      所以这里依然什么都不用改 —— 迁移只需要把标记从 1.7 抬到 1.8。
+    """
+    return data
+
+
 #: 版本链：``(起点, 终点, 变换函数)``。
 #:
 #: ★ 这是"未来版本在此添加分支"的那张表（任务书 2.3）。加一跳只需要
@@ -108,6 +124,7 @@ def _lift_1_6_to_1_7(data: dict[str, Any]) -> dict[str, Any]:
 _STEPS: tuple[tuple[str, str, Callable[[dict[str, Any]], dict[str, Any]]], ...] = (
     ("1.0", "1.6", _lift_1_0_to_1_6),
     ("1.6", "1.7", _lift_1_6_to_1_7),
+    ("1.7", "1.8", _lift_1_7_to_1_8),
 )
 
 
@@ -315,9 +332,13 @@ def migrate(
         hops.append(f"v{current}→v{target}")
         current = target
 
-    # 盖上新版本标记，并清掉兼容读的旧键
-    data[VAULT_VERSION_KEY] = CURRENT_VERSION
-    data.pop(LEGACY_VAULT_VERSION_KEY, None)
+    # 盖上新版本标记。
+    #
+    # ★ v1.8 改：不再"写 canonical + 删旧键"，而是**两个键都写**。
+    #   旧写法会让启动检测读到哪个键取决于上次是谁写的 —— 而 charter 8.1
+    #   和任务书 1.1 用的键名不一样。两个都写、值相同，谁读都对
+    #   （见 core.version.VAULT_VERSION_KEYS）。
+    stamp_vault_version(data, CURRENT_VERSION)
     data["_migration"] = {"from": start, "to": CURRENT_VERSION, "hops": hops,
                           "at": datetime.now().isoformat(timespec="seconds")}
     return data

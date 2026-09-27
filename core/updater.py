@@ -1,22 +1,24 @@
-"""更新检查（charter v1.7 第七节）—— **只在用户点「检查更新」时联网**。
+"""更新检查 + 更新下载（charter v1.8 第四 / 六节）。
 
-三条设计原则（charter 7.1，一条都不能松）：
+三条设计原则（charter 7.1 → v1.8 第六节，一条都不能松）：
 
-1. **用户主动触发**：没有任何自动检查。这个模块里**没有定时器、没有线程、
-   没有 import 期副作用** —— 只有人调 :func:`check_latest_version` 才会发请求。
-2. **不自动下载**：只告诉用户"有新版本"，然后打开浏览器让他自己去下载。
-   写自动替换 exe 的逻辑是被明令禁止的（charter 十节）。
-3. **不引入第三方库**：只用标准库 ``urllib.request``（charter 7.3）。
+1. **用户主动触发**：没有任何自动检查、没有定时器、没有 import 期副作用 ——
+   只有人点了「检查更新」才发请求，只有人在弹窗上点了「开始下载」才下载。
+2. **不静默下载**：v1.7 时这里只做到"打开浏览器让用户自己下"；
+   v1.8 起了变化 —— charter v1.8 第四节把 **更新下载** 也加进了白名单，
+   第六节给了完整的下载 → 重启 → 替换流程。但
+   **❌ 禁止 一栏里"自动更新/静默下载"仍然在**，所以本模块的边界是：
+   每一次下载都必须**先有一个用户点头的弹窗**，代码里没有任何
+   "启动时顺便下一下"的路径。
+3. **不引入第三方库**：只用标准库 ``urllib.request``（charter 7.3 / v1.8 二节）。
 
 ★ 为什么是 ``urllib.request`` 而不是 ``requests``
 ---------------------------------------------
 
-这是 charter 第三节/第四节里**唯一**被点名的 stdlib 联网方式。
-``core/ai/`` 那边仍然是一条 HTTP 客户端都不许有（那条自检的扫描范围就是
-``core/ai/*.py``，不包括本模块）。两条规则不冲突：
-
-* ``core/ai/`` —— 骨架期，**禁止**任何网络代码；
-* ``core/updater.py`` —— 用户主动点按钮时，**允许**一次只读 GET。
+这是 charter 第四节里被点名的 stdlib 联网方式。``core/ai/`` 那边有它自己的
+一条更严的规则（见 :func:`main._network_policy_report`）：除了
+``model_downloader`` 这个明确被 charter v1.8 第八节允许的下载器之外，
+别的 AI 模块仍然一个 HTTP 客户端都不许有。
 
 ★ 实测：``/releases/latest`` 现在是 404
 ------------------------------------
@@ -39,31 +41,47 @@
 两者都空 → :data:`NO_RELEASE` 状态，界面上说"仓库还没有发布发行版"，
 **不说"检查失败"**。等真发了 release，走的是同一条路径，不需要改代码。
 
-★ 超时 5 秒是硬要求
+★ 超时：检查 5 秒，下载 30 秒/块
 ------------------
 
 不设超时或者设得很长，网络不通时用户会盯着一个卡死的按钮。
 而且设置页**必须把它丢到后台线程**跑（``ui/workers.run_async``）——
 在按钮回调里直接 ``urlopen`` 就是 ``ui/workers.py`` 开头说的那个坑。
-本模块只负责"发一次请求、失败返回 None"，**不碰任何 UI**。
+本模块只负责"发请求 / 收字节"，**不碰任何 UI**。
+
+★ 下载安全：先写 ``.part``，验完再改名
+-----------------------------------
+
+:func:`download_exe` 全程只往 ``<dest>.part`` 里写，**成功之后才** ``replace``
+成目标文件。所以"下载到一半断网/取消"永远不会留下一个半截的 exe
+去覆盖用户手里那个好的 —— 这是任务书 2.4 的硬约束"下载失败不损坏已有 exe"。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 
 from core.version import CURRENT_VERSION, compare_versions, is_newer, normalize_version
 
 __all__ = [
+    "CHUNK_SIZE",
     "CURRENT_VERSION",
     "DEFAULT_TIMEOUT",
+    "DOWNLOAD_TIMEOUT",
+    "DownloadCancelled",
+    "DownloadError",
     "GITEE_API",
     "GITEE_RELEASES_API",
     "GITEE_RELEASES_PAGE",
+    "MIN_EXE_BYTES",
     "NO_RELEASE",
     "STATUS_CURRENT",
     "STATUS_ERROR",
@@ -72,7 +90,11 @@ __all__ = [
     "UpdateCheck",
     "check_for_update",
     "check_latest_version",
+    "download_exe",
     "latest_release",
+    "normalize_sha256",
+    "parse_release_body",
+    "verify_checksum",
 ]
 
 #: Gitee 的"最新发行版"接口（charter 7.2）。只读 GET，不需要 token。
@@ -103,6 +125,37 @@ STATUS_CURRENT = "current"
 NO_RELEASE = "no-release"
 STATUS_ERROR = "error"
 
+# ---------------------------------------------------------------------------
+# 下载（charter v1.8 第六节）
+# ---------------------------------------------------------------------------
+
+#: 每次 ``read()`` 读多少字节（任务书 2.1 指定 8192）。
+CHUNK_SIZE = 8192
+
+#: 下载超时（秒/块）。**不是整个文件的总超时** —— 230MB 按块读，
+#: 每块之间给 30 秒，断流就抛。任务书 2.1 指定 30s。
+DOWNLOAD_TIMEOUT = 30
+
+#: 一个"主程序 exe"至少该有多大。低于这个数说明下回来的
+#: **不是 exe**（多半是网盘的错误页 / 登录页 / 一段 JSON），
+#: 拿它去替换用户的程序是灾难。实测打包出来的 exe 是 228MB 量级。
+MIN_EXE_BYTES = 1 * 1024 * 1024
+
+
+class DownloadCancelled(Exception):
+    """用户点了「取消下载」。
+
+    ★ 单独一个异常类型，是为了让调用方能把它和"网络出错"分开：
+      取消**不是错误**，界面上不该弹红色报错框。
+    """
+
+
+class DownloadError(RuntimeError):
+    """下载过程中的可预期失败（网络断、文件太小、校验不过）。
+
+    ``str(exc)`` 已经是可以直接显示给用户的一句话。
+    """
+
 
 @dataclass(frozen=True)
 class UpdateCheck:
@@ -117,11 +170,17 @@ class UpdateCheck:
 
     ``detail`` 是给状态行直接用的一句话（**纯文本，不写 Markdown** ——
     QLabel 不渲染，charter 铁律 9）。
+
+    ``body`` 是发行版描述原文（v1.8 新增）。更新向导要拿它解析出
+    "主程序直链 / 各 AI 模块直链 / sha256 / 体积"（:func:`parse_release_body`）。
+    ★ 只有 :data:`STATUS_NEWER` 时才会填 —— 没有新版本就没必要
+      把整段描述带着满世界传。
     """
 
     status: str
     version: str = ""
     detail: str = ""
+    body: str = ""
 
     @property
     def reachable(self) -> bool:
@@ -228,8 +287,10 @@ def check_for_update(
     """
     latest_status, latest_data = _get_json(GITEE_API, timeout)
     version = ""
+    release: dict[str, Any] | None = None
     if latest_status == 200 and isinstance(latest_data, dict):
         version = _version_from_release(latest_data)
+        release = latest_data
 
     if not version:
         # latest 没给出可用版本：区分"还没发过版"和"真失败"
@@ -247,6 +308,7 @@ def check_for_update(
             for item in list_data:
                 version = _version_from_release(item)
                 if version:
+                    release = item
                     break
             if not version:
                 # ★ 列表**非空**却读不出版本号 —— 这不是"没发行版"，
@@ -273,10 +335,14 @@ def check_for_update(
         )
 
     if is_newer(version, current):
+        body = ""
+        if isinstance(release, dict):
+            body = str(release.get("body") or release.get("description") or "")
         return UpdateCheck(
             status=STATUS_NEWER,
             version=version,
             detail=f"发现新版本 v{version}（当前 v{current}）。",
+            body=body,
         )
 
     relation = compare_versions(version, current)
@@ -296,3 +362,404 @@ def check_for_update(
         version=version,
         detail=f"当前已是最新版本 (v{current})。",
     )
+
+
+# ---------------------------------------------------------------------------
+# Release 描述解析（任务书 2.1）
+# ---------------------------------------------------------------------------
+
+#: 认 URL。中文括号、引号、``<>`` 都排除掉，免得把描述里的标点吃进来。
+_URL_RE = re.compile(r"https?://[^\s<>()\[\]{}\"'`,，。）】]+")
+
+#: ``sha256: <64 hex>`` / ``SHA256 = <64 hex>``
+_SHA_LABELED_RE = re.compile(r"sha-?256\s*[:=]\s*([0-9a-fA-F]{64})")
+
+#: 裸的 64 位十六进制串（描述里直接贴一行哈希）
+_SHA_BARE_RE = re.compile(r"\b([0-9a-fA-F]{64})\b")
+
+#: ``大小: 230MB`` / ``size: 1.2 GB``
+_SIZE_RE = re.compile(r"(?:大小|size|体积)\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?\s*[KMGTP]?i?B)", re.I)
+
+#: ``AI模型-1.5B`` / ``AI 模型 - 3B`` / ``AI模型：Qwen-1.5B``
+_AI_HEADER_RE = re.compile(r"^AI\s*模型\s*[-–—:：]?\s*(.+)$", re.I)
+
+#: ``主程序`` 那一节的开头（可以带"更新""（必须）"之类的后缀）
+_MAIN_HEADER_RE = re.compile(r"^主程序\b.*$")
+
+#: 解析结果里代表主程序的键
+KEY_MAIN = "main"
+
+
+def _strip_markup(line: str) -> str:
+    """去掉 Markdown 的行首记号（``##`` / ``**`` / ``-`` / ``>``）和行尾星号。
+
+    这样 ``## 主程序``、``**主程序**``、``- 主程序`` 都能被认成同一件事 ——
+    发版的人不会每次都写成一样。
+    """
+    text = line.strip()
+    text = text.lstrip("#>*-•· \t")
+    text = text.strip()
+    if text.endswith("**") or text.endswith("__"):
+        text = text[:-2]
+    return text.strip().strip("*_`").strip()
+
+
+def parse_release_body(body: Any) -> dict[str, Any]:
+    """从 Release 描述里解析出下载链接（任务书 2.1）。
+
+    约定格式（``docs/DISTRIBUTION.md`` 的发版 SOP 里写的就是这个）::
+
+        主程序
+        https://pan.example.com/transcript-lens-v1.8.exe
+        sha256: 3f2a...（64 位）
+        大小: 230MB
+
+        AI模型-1.5B
+        https://pan.example.com/qwen-1.5b.gguf
+        sha256: ...
+
+        AI模型-3B
+        https://pan.example.com/qwen-3b.gguf
+
+    也认这些等价写法（发版的人手滑不算罕见，没必要让功能因此失效）：
+
+    * ``## 主程序`` / ``**主程序**`` / ``- 主程序``
+    * ``主程序: https://...``（标题和链接同一行）
+    * ``AI 模型 - 3B`` / ``AI模型：3B``
+    * 直接给一段 JSON：``{"main": "...", "ai_models": {"1.5B": "..."}}``
+    * ``sha256`` 写成 ``SHA256 = ...`` 或直接把 64 位哈希裸贴一行
+
+    ★ 一个刻意的取舍：描述里**一个能认的 URL 都没有**时返回空字典结构
+      （``main`` 为空串），而不是抛异常 —— 调用方（设置页）要能说
+      "这个发行版没有提供直链，请点「打开下载页」"，那比一个 traceback 有用。
+
+    Args:
+        body: Release 描述原文。``None`` / 非字符串一律当成空串。
+
+    Returns:
+        ``{"main": str, "ai_models": {名字: url}, "checksums": {键: sha256},
+        "sizes": {键: 文字}}``。
+
+        ``checksums`` / ``sizes`` 的键是 ``"main"`` 或模型名。
+        ★ 任务书 2.1 只点名了前两个键；后两个是**附加**信息，
+          用于 :func:`verify_checksum` 和弹窗里的"~230MB"。
+    """
+    result: dict[str, Any] = {
+        KEY_MAIN: "",
+        "ai_models": {},
+        "checksums": {},
+        "sizes": {},
+    }
+    text = body if isinstance(body, str) else ""
+    if not text.strip():
+        return result
+
+    # --- 先试 JSON（有人喜欢把描述写成一段 JSON）--------------------------
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        try:
+            data = json.loads(stripped)
+        except (ValueError, TypeError):
+            data = None
+        if isinstance(data, dict) and ("main" in data or "ai_models" in data):
+            result[KEY_MAIN] = str(data.get("main") or "").strip()
+            models = data.get("ai_models")
+            if isinstance(models, dict):
+                for name, url in models.items():
+                    if url:
+                        result["ai_models"][str(name).strip()] = str(url).strip()
+            checksums = data.get("checksums")
+            if isinstance(checksums, dict):
+                for key, value in checksums.items():
+                    if value:
+                        result["checksums"][str(key)] = str(value).strip().lower()
+            return result
+
+    # --- 按行扫 -----------------------------------------------------------
+    section = ""            # "" / "main" / 模型名
+    urls_seen: list[str] = []
+
+    for raw_line in text.splitlines():
+        line = _strip_markup(raw_line)
+        if not line:
+            continue
+
+        # 1) 这一行是不是小标题？
+        ai_match = _AI_HEADER_RE.match(line)
+        if ai_match:
+            name = ai_match.group(1).strip().strip("*_`").strip()
+            # `AI模型-3B: https://...` —— 标题和链接同一行
+            inline = _URL_RE.search(name)
+            if inline:
+                name = name[: inline.start()].strip().rstrip(":：-–—").strip()
+                section = name or "model"
+                result["ai_models"].setdefault(section, inline.group(0))
+                urls_seen.append(inline.group(0))
+            else:
+                section = name or "model"
+            continue
+        if _MAIN_HEADER_RE.match(line):
+            section = KEY_MAIN
+            # `主程序: https://...`
+            inline = _URL_RE.search(line)
+            if inline:
+                result[KEY_MAIN] = result[KEY_MAIN] or inline.group(0)
+                urls_seen.append(inline.group(0))
+            continue
+
+        # 2) 链接
+        found = _URL_RE.findall(line)
+        for url in found:
+            urls_seen.append(url)
+            if section == KEY_MAIN:
+                if not result[KEY_MAIN]:
+                    result[KEY_MAIN] = url
+            elif section:
+                result["ai_models"].setdefault(section, url)
+
+        # 3) 校验和（优先带 label 的；没有 label 才认裸哈希）
+        sha = _SHA_LABELED_RE.search(line)
+        if sha is None:
+            bare = _SHA_BARE_RE.search(line)
+            # ★ 裸哈希只在"这一行没有 URL"时认 —— 否则 URL 里恰好出现
+            #   一段 64 位十六进制（网盘直链很常见）会被误当成哈希。
+            sha = bare if (bare and not found) else None
+        if sha is not None and section:
+            key = KEY_MAIN if section == KEY_MAIN else section
+            result["checksums"].setdefault(key, sha.group(1).lower())
+
+        # 4) 体积
+        size = _SIZE_RE.search(line)
+        if size is not None and section:
+            key = KEY_MAIN if section == KEY_MAIN else section
+            result["sizes"].setdefault(key, " ".join(size.group(1).split()))
+
+    # --- 兜底：一个标题都没认出来、但整段只有一个 URL → 那就是主程序 -------
+    if not result[KEY_MAIN] and not result["ai_models"] and len(urls_seen) == 1:
+        result[KEY_MAIN] = urls_seen[0]
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 校验和（任务书 2.1）
+# ---------------------------------------------------------------------------
+
+
+def normalize_sha256(text: Any) -> str:
+    """把 ``sha256: <hex>`` / 大写 / 带空格 的写法收敛成 64 位小写十六进制。
+
+    认不出来返回空串。
+    """
+    if text is None:
+        return ""
+    candidate = str(text).strip().lower()
+    candidate = candidate.removeprefix("sha256").lstrip(":：= ").strip()
+    match = re.search(r"\b([0-9a-f]{64})\b", candidate)
+    return match.group(1) if match else ""
+
+
+def verify_checksum(file_path: str | Path, expected_sha256: str) -> bool:
+    """SHA256 校验（任务书 2.1）。**一致返回 True，其余一律 False。**
+
+    ★ 空期望值返回 **False**，不是 True。
+      "没给校验和"和"校验通过"是**两件事** —— 让空值通过等于把这道闸门
+      变成默认敞开。调用方想跳过校验就自己判断
+      ``if expected and not verify_checksum(...)``，让"跳过"这个决定
+      留在调用点上、写在代码里，而不是藏在这个函数的默认行为里。
+
+    Args:
+        file_path: 待校验的文件。
+        expected_sha256: 期望的哈希（``sha256:`` 前缀 / 大写 / 空白都能认）。
+
+    Returns:
+        一致 → ``True``；不一致 / 期望为空 / 认不出 / 文件读不了 → ``False``。
+    """
+    expected = normalize_sha256(expected_sha256)
+    if not expected:
+        return False
+    digest = hashlib.sha256()
+    try:
+        with open(file_path, "rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError:
+        return False
+    import hmac
+
+    # 定时安全比较：哈希不是密钥，但没有理由在这里用 ==（也免得哪天被当成
+    # "可以拿它做旁路"的坏样板抄走）。
+    return hmac.compare_digest(digest.hexdigest(), expected)
+
+
+# ---------------------------------------------------------------------------
+# 下载（任务书 2.1）
+# ---------------------------------------------------------------------------
+
+
+def _content_length(response: Any, offset: int) -> int | None:
+    """算出"这个文件一共多大"。拿不到返回 ``None``（界面上显示"未知"）。"""
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+
+    def _int(name: str) -> int | None:
+        try:
+            raw = headers.get(name)
+        except Exception:  # noqa: BLE001 - headers 不是 dict 的假实现
+            return None
+        if raw is None:
+            return None
+        text = str(raw).strip()
+        if not text.isdigit():
+            return None
+        return int(text)
+
+    # 断点续传时 Content-Length 只是**这一段**的长度，总量在 Content-Range 里：
+    #   Content-Range: bytes 1024-9999/10000
+    content_range = ""
+    try:
+        content_range = str(headers.get("Content-Range") or "")
+    except Exception:  # noqa: BLE001
+        content_range = ""
+    if "/" in content_range:
+        tail = content_range.rsplit("/", 1)[-1].strip()
+        if tail.isdigit():
+            return int(tail)
+
+    length = _int("Content-Length")
+    if length is None:
+        return None
+    return length + offset
+
+
+def download_exe(
+    download_url: str,
+    dest_path: str | Path,
+    progress_callback: Callable[[int, int | None], None] | None = None,
+    *,
+    timeout: float = DOWNLOAD_TIMEOUT,
+    resume: bool = True,
+    cancel: Callable[[], bool] | None = None,
+    expected_sha256: str = "",
+    min_bytes: int = MIN_EXE_BYTES,
+) -> Path:
+    """流式下载到 ``dest_path``（任务书 2.1）。**只用 stdlib**。
+
+    流程与保证：
+
+    1. 全程只往 ``<dest>.part`` 写，**成功之后才** ``os.replace`` 成目标文件
+       —— 所以中途失败/取消**绝不会**损坏已经存在的那个 exe
+       （任务书 2.4："下载失败不损坏已有 exe"）。
+    2. ``resume=True`` 且 ``.part`` 已存在 → 带 ``Range: bytes=<已有>-`` 续传。
+       服务器**忽略 Range**（返回 200 而不是 206）时**自动从头重下**，
+       不会把新内容追加到旧字节后面拼出一个坏文件。
+    3. ``cancel()`` 返回真 → 抛 :class:`DownloadCancelled`，
+       ``.part`` **留在原地**（下次续传用得上），目标文件不动。
+    4. ``expected_sha256`` 非空 → 校验；不一致抛 :class:`DownloadError`，
+       目标文件不动。
+    5. ``min_bytes`` → 下回来的东西太小（网盘错误页 / 登录页）直接判失败。
+
+    Args:
+        download_url: 直链。
+        dest_path: 目标文件路径。
+        progress_callback: ``callback(已下载字节, 总字节或 None)``。
+            **在调用线程里同步调用** —— 调用方自己负责把它丢到后台。
+        timeout: 每块之间的超时（秒）。
+        resume: 允不允许断点续传。
+        cancel: 无参可调用对象，返回真表示用户要取消。
+        expected_sha256: 期望哈希；空串 = 不校验。
+        min_bytes: 最小可接受字节数。
+
+    Returns:
+        真正的目标路径（:class:`pathlib.Path`）。
+
+    Raises:
+        DownloadCancelled: 用户取消。
+        DownloadError: 网络失败 / 太小 / 校验不过。
+    """
+    dest = Path(dest_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(dest.name + ".part")
+
+    offset = 0
+    if resume and part.exists():
+        try:
+            offset = part.stat().st_size
+        except OSError:
+            offset = 0
+    elif part.exists():
+        try:
+            part.unlink()
+        except OSError:
+            pass
+
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/octet-stream",
+    }
+    if offset:
+        headers["Range"] = f"bytes={offset}-"
+
+    request = urllib.request.Request(download_url, headers=headers, method="GET")
+
+    try:
+        response = urllib.request.urlopen(request, timeout=timeout)  # noqa: S310
+    except urllib.error.HTTPError as exc:
+        raise DownloadError(f"下载失败：服务器返回 HTTP {exc.code}。") from exc
+    except urllib.error.URLError as exc:
+        raise DownloadError(f"下载失败：连不上服务器（{exc.reason}）。") from exc
+    except (OSError, ValueError) as exc:
+        raise DownloadError(f"下载失败：{exc}") from exc
+
+    mode = "ab"
+    with response:
+        status = int(getattr(response, "status", 200) or 200)
+        if offset and status != 206:
+            # ★ 服务器不支持/忽略了 Range：它给的是**整个文件**，
+            #   必须从头写，否则旧的那截会留在前面拼成垃圾。
+            offset = 0
+            mode = "wb"
+        total = _content_length(response, offset)
+
+        written = offset
+        try:
+            with open(part, mode) as sink:
+                while True:
+                    if cancel is not None and cancel():
+                        raise DownloadCancelled("用户取消了下载")
+                    chunk = response.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    sink.write(chunk)
+                    written += len(chunk)
+                    if progress_callback is not None:
+                        progress_callback(written, total)
+                sink.flush()
+                os.fsync(sink.fileno())
+        except DownloadCancelled:
+            raise
+        except (OSError, ValueError) as exc:
+            raise DownloadError(
+                f"下载中断：{exc}。已下载的部分留在 {part.name}，"
+                "下次点「开始下载」会从断点继续。"
+            ) from exc
+
+    if min_bytes and written < min_bytes:
+        raise DownloadError(
+            f"下载到的文件只有 {written} 字节，明显不是程序本体"
+            f"（至少应有 {min_bytes} 字节）。可能是网盘返回了错误页 —— "
+            "请到发行版页面手动下载。"
+        )
+
+    if expected_sha256 and not verify_checksum(part, expected_sha256):
+        raise DownloadError(
+            "下载完成但 SHA256 校验不一致 —— 文件可能在传输中损坏，"
+            "或与发行版声明的不符。已丢弃，请重试或到页面手动下载。"
+        )
+
+    os.replace(part, dest)
+    if progress_callback is not None:
+        progress_callback(written, total or written)
+    return dest
+

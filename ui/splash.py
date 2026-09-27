@@ -59,10 +59,10 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import QApplication, QWidget
 
+from core.version import CURRENT_VERSION
 from ui.anim import window_fade
 
 __all__ = ["FADE_MS", "HOLD_MS", "SplashScreen"]
-
 #: 淡入 / 淡出各用多久。原来 300ms —— 开屏本身只是个"程序起来了"的信号，
 #: 不需要 600ms 的过场，200ms 足够看出是淡入而不是闪现。
 FADE_MS = 200
@@ -180,7 +180,7 @@ class SplashScreen(QWidget):
     def __init__(
         self,
         title: str = "成绩单透镜",
-        version: str = "v1.0",
+        version: str = f"v{CURRENT_VERSION}",
         slogan: str = "把成绩单，变成能坐下来谈的东西",
         *,
         hold_ms: int = HOLD_MS,

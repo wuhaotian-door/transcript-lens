@@ -76,6 +76,7 @@ from core.recovery import (
     normalize_email,
 )
 from core.session_token import AUTO_LOGIN_DAYS, clear_token, save_token, token_info
+from core.version import CURRENT_VERSION
 from ui.anim import window_fade_in, window_fade_out
 from ui.frameless import (
     SHADOW_MARGIN,
@@ -89,8 +90,14 @@ from ui.workers import run_async
 
 __all__ = ["APP_VERSION", "MIN_PASSWORD_LENGTH", "SLOGAN", "LoginWindow"]
 
-#: 版本号（显示在左栏）
-APP_VERSION = "v1.0"
+#: 版本号（显示在左栏）。
+#:
+#: ★ v1.8 修正：这里原来硬编码 ``"v1.0"`` —— 程序都 1.7 了，登录窗左栏
+#:   还在说自己是 1.0，而且**不报错**，只是一直说假话
+#:   （charter v1.8 第五节列为必须修正的旧 bug）。
+#:   现在唯一真源是 :data:`core.version.CURRENT_VERSION`，
+#:   ``main._version_source_report()`` 用 AST 扫 ``ui/`` 拦"再写死一个字面量"。
+APP_VERSION = f"v{CURRENT_VERSION}"
 
 #: slogan
 SLOGAN = "把成绩单，变成能坐下来谈的东西"
@@ -119,7 +126,7 @@ class LoginWindow(QWidget):
         self._data_root = root
         self._store = store if store is not None else CryptoStore(root)
 
-        self.setWindowTitle("成绩单透镜 · 登录")
+        self.setWindowTitle(f"成绩单透镜 v{CURRENT_VERSION}")
         # ★ 无边框 + 透明底必须在 show() 之前设好（setWindowFlag 会藏窗口）
         apply_frameless(self)
         # 尺寸是**卡片可见部分**的尺寸，四周还要多留一圈给阴影

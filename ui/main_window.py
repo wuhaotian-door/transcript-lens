@@ -53,6 +53,7 @@ from PySide6.QtWidgets import (
 
 from core.activation import load_state
 from core.crypto_store import CryptoStore
+from core.version import CURRENT_VERSION
 from ui.anim import StackSwitcher, window_fade_in
 from ui.frameless import (
     SHADOW_MARGIN,
@@ -122,7 +123,7 @@ class MainWindow(QMainWindow):
         self._data_root = root
         self._username = ""
 
-        self.setWindowTitle(f"{APP_NAME} · transcript-lens")
+        self.setWindowTitle(f"{APP_NAME} · transcript-lens v{CURRENT_VERSION}")
         # ★ 无边框 + 透明底必须在 show() 之前设好
         apply_frameless(self)
         # 最小/初始尺寸指**可见部分**，四周另有一圈透明边留给阴影

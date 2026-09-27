@@ -114,6 +114,14 @@ $Common = @(
     '--hidden-import', 'openpyxl.worksheet._writer',
     '--hidden-import', 'pandas._libs.tslibs.base',
 
+    # ★ v1.8：老格式 .xls 的读取引擎。和 openpyxl 一样是**延迟 import** ——
+    #   pandas 在 ExcelFile(engine="xlrd") 那一刻才 import 它，
+    #   PyInstaller 的静态分析看不见。漏了的话表现是最难查的那种：
+    #   源码里跑得好好的、exe 里一导老格式成绩表就报"缺少读取组件"。
+    '--hidden-import', 'xlrd',
+    # openpyxl 带一堆数据文件（样式表、主题），--collect-all 一起收进来
+    '--collect-all', 'openpyxl',
+
     # 让 PyInstaller 找得到 ui / core / ai 这三个顶层包
     '--paths', '.',
 

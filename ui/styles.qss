@@ -94,6 +94,13 @@ QLabel#WelcomeHint {
     color: #64748B;
     font-size: 12px;
 }
+/* 欢迎页右下角的版本号小字（charter v1.8 第五节）。
+   比 hint 稍亮一点，让它读得出来但仍不抢问候语。 */
+QLabel#WelcomeVersion {
+    color: #94A3B8;
+    font-size: 12px;
+    font-weight: 600;
+}
 
 /* ---------------------------------------------------------------- 文字层级 */
 QLabel#H1 {

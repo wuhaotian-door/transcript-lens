@@ -41,11 +41,13 @@ from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
+    QHBoxLayout,
     QLabel,
     QVBoxLayout,
     QWidget,
 )
 
+from core.version import CURRENT_VERSION
 from ui.anim import window_fade
 from ui.frameless import SHADOW_MARGIN, SHADOW_BLUR, apply_frameless
 from ui.anim import apply_shadow
@@ -169,15 +171,39 @@ class WelcomeWindow(QWidget):
 
         box.addStretch(1)
 
+        # ★ 底部一行：左边"正在进入…"，右边版本号小字（charter v1.8 第五节：
+        #   欢迎页 = 问候语 + 版本号小字）。
+        #
+        #   为什么并排放而不是再叠一行：欢迎页卡片高度是**写死**的
+        #   （``_CARD_H = 280``），且外面套着固定尺寸的无边框+阴影窗口。
+        #   多叠一行会把 hint 挤出卡片下沿 —— 而这类"控件都在、几何也对、
+        #   就是看不见"的毛病，静态断言全绿也发现不了（AGENTS.md 4c）。
+        #   并排的话高度需求一个字都没变。
+        bottom = QHBoxLayout()
+        bottom.setContentsMargins(0, 0, 0, 0)
+        bottom.setSpacing(8)
+
         hint = QLabel("正在进入成绩单透镜…")
         hint.setObjectName("WelcomeHint")
-        box.addWidget(hint)
+        bottom.addWidget(hint)
+        bottom.addStretch(1)
+
+        self._version = QLabel(f"v{CURRENT_VERSION}")
+        self._version.setObjectName("WelcomeVersion")
+        bottom.addWidget(self._version)
+
+        box.addLayout(bottom)
 
     # ------------------------------------------------------------- 对外
     @property
     def greeting(self) -> str:
         """自检用：屏幕上那行问候语。"""
         return self._greeting.text()
+
+    @property
+    def version_text(self) -> str:
+        """自检用：屏幕上那个版本号小字（必须是 ``v{CURRENT_VERSION}``）。"""
+        return self._version.text()
 
     def greeting_hour(self) -> int:
         return datetime.now().hour

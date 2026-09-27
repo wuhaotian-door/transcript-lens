@@ -15,18 +15,22 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -35,8 +39,11 @@ from PySide6.QtWidgets import (
 
 from core.activation import load_state, try_activate
 from core.ai.local_assistant import PLACEHOLDER as LOCAL_PLACEHOLDER
+from core.ai.local_assistant import MODEL_LOADED_PLACEHOLDER
+from core.ai.model_downloader import ModelDownloader, model_dir
 from core.crypto_store import CryptoError, CryptoStore, PAYLOAD_FILES
 from core.exporter import export_anonymized_xlsx, export_plain_xlsx
+from core import update_apply
 from core.updater import (
     CURRENT_VERSION,
     GITEE_RELEASES_PAGE,
@@ -45,6 +52,12 @@ from core.updater import (
     check_for_update,
 )
 from ui.anim import make_card
+from ui.update_dialog import (
+    ModuleChoiceDialog,
+    ask_restart,
+    download_release,
+    plan_from_release,
+)
 from ui.workers import run_async
 
 __all__ = ["AI_SETTINGS_FILE", "SettingsPage"]
@@ -75,6 +88,9 @@ class SettingsPage(QWidget):
         self._export_provider: Callable[[], list[dict[str, Any]]] | None = None
         #: 更新检查正在进行中（防止连点，也防止回调里重复开弹窗）
         self._checking = False
+        #: 最近一次检查拿到的 Release 描述原文。AI 模型清单和更新向导
+        #: 都要从它里面解析直链 —— 存在这儿，省得再发一次请求。
+        self._release_body = ""
         self._build()
 
     # ---------------------------------------------------------------- 外部
@@ -305,7 +321,206 @@ class SettingsPage(QWidget):
         self._ai_status.setObjectName("Muted")
         self._ai_status.setWordWrap(True)
         box.addWidget(self._ai_status)
+
+        # --- 本地模型管理（charter v1.8 第八节 / 任务书 4.2）----------------
+        box.addSpacing(6)
+
+        models_title = QLabel("本地模型")
+        models_title.setObjectName("H3")
+        box.addWidget(models_title)
+
+        models_note = QLabel(
+            "模型文件只下载到本机的数据目录，不上传任何东西。"
+            "本版本只做到「下载 + 认出来」，还没有接推理引擎。"
+        )
+        models_note.setObjectName("Muted")
+        models_note.setWordWrap(True)
+        box.addWidget(models_note)
+
+        self._models_list = QLabel("（正在读取…）")
+        self._models_list.setObjectName("Muted")
+        self._models_list.setWordWrap(True)
+        box.addWidget(self._models_list)
+
+        model_row = QHBoxLayout()
+        self._model_download_btn = QPushButton("下载新模型")
+        self._model_download_btn.setObjectName("Ghost")
+        self._model_download_btn.setMinimumHeight(36)
+        self._model_download_btn.setMinimumWidth(130)
+        self._model_download_btn.clicked.connect(self._do_download_model)
+        model_row.addWidget(self._model_download_btn)
+
+        self._model_delete_btn = QPushButton("删除模型")
+        self._model_delete_btn.setObjectName("Ghost")
+        self._model_delete_btn.setMinimumHeight(36)
+        self._model_delete_btn.setMinimumWidth(110)
+        self._model_delete_btn.clicked.connect(self._do_delete_model)
+        model_row.addWidget(self._model_delete_btn)
+        model_row.addStretch(1)
+        box.addLayout(model_row)
+
+        self._model_progress = QProgressBar()
+        self._model_progress.setRange(0, 100)
+        self._model_progress.setValue(0)
+        self._model_progress.setTextVisible(True)
+        self._model_progress.setMinimumHeight(22)
+        self._model_progress.setVisible(False)
+        box.addWidget(self._model_progress)
+
+        self._model_status = QLabel("")
+        self._model_status.setObjectName("Muted")
+        self._model_status.setWordWrap(True)
+        box.addWidget(self._model_status)
+
+        self._model_downloader = ModelDownloader()
+        self._model_downloader.progress.connect(self._on_model_progress)
+        self._model_downloader.finished.connect(self._on_model_finished)
+        self._model_downloader.error.connect(self._on_model_error)
+        self._refresh_models()
         return card
+
+    # ---------------------------------------------------------------- 本地模型
+    def _refresh_models(self) -> None:
+        """把"已下载哪些模型"刷到界面上（**纯文本，不写 Markdown**）。"""
+        try:
+            installed = self._model_downloader.list_installed()
+        except Exception as exc:  # noqa: BLE001 - 读不出来不该让设置页崩
+            self._models_list.setText(f"读取本地模型失败：{type(exc).__name__}")
+            return
+        if not installed:
+            self._models_list.setText(
+                "还没有下载任何本地模型。点「下载新模型」从发行版页面提供的地址下载。"
+            )
+            self._model_delete_btn.setEnabled(False)
+            return
+        parts = []
+        for info in installed:
+            size = ModelDownloader.human_size(info.path)
+            parts.append(f"· {info.name}（{size}）")
+        self._models_list.setText("已下载 " + str(len(installed)) + " 个：\n" + "\n".join(parts))
+        self._model_delete_btn.setEnabled(True)
+
+    def _model_catalog(self) -> list[Any]:
+        """可用模型清单（带 Release 描述里的直链，拿不到就只有本地已装的）。"""
+        body = getattr(self, "_release_body", "")
+        try:
+            return self._model_downloader.list_available_models(body)
+        except Exception:  # noqa: BLE001
+            return self._model_downloader.list_available_models("")
+
+    def _do_download_model(self) -> None:
+        """选一个模型并下载（**只在用户点这里之后才联网**）。"""
+        if self._model_downloader.busy:
+            QMessageBox.information(self, "正在下载", "已经有一个下载在进行中了。")
+            return
+
+        catalog = self._model_catalog()
+        if not catalog:
+            QMessageBox.information(
+                self, "没有可下载的模型", "发行版里还没有列出任何 AI 模型。"
+            )
+            return
+
+        labels = [info.display for info in catalog]
+        choice, ok = QInputDialog.getItem(
+            self, "选择要下载的模型", "可用模型：", labels, 0, False
+        )
+        if not ok or not choice:
+            return
+        index = labels.index(choice)
+        info = catalog[index]
+        if not info.url:
+            QMessageBox.information(
+                self,
+                "这个模型还没有下载地址",
+                f"「{info.name}」在发行版说明里没有提供直链。\n\n"
+                "请点「检查更新」查看发行版页面，或联系维护者补充下载地址。",
+            )
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "开始下载",
+            f"即将下载：{info.label or info.name}"
+            + (f"（{info.size}）" if info.size else "")
+            + f"\n\n保存位置：\n{model_dir(info.name)}\n\n现在开始下载吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self._model_progress.setVisible(True)
+        self._model_progress.setValue(0)
+        self._model_status.setText(f"正在下载「{info.name}」…")
+        if not self._model_downloader.download(info.url, info.name):
+            self._model_status.setText("没能开始下载。")
+            self._model_progress.setVisible(False)
+
+    def _on_model_progress(self, percent: int) -> None:
+        if percent < 0:
+            # 总大小未知 → 不确定态
+            self._model_progress.setRange(0, 0)
+            return
+        self._model_progress.setRange(0, 100)
+        self._model_progress.setValue(percent)
+        got = self._model_downloader.downloaded_bytes
+        total = self._model_downloader.total_bytes
+        text = f"正在下载「{self._model_downloader.model_name}」… {percent}%"
+        if total:
+            text += (
+                f"　{ModelDownloader.human_size(got)}"
+                f" / {ModelDownloader.human_size(total)}"
+            )
+        self._model_status.setText(text)
+
+    def _on_model_finished(self, path: str) -> None:
+        self._model_progress.setRange(0, 100)
+        self._model_progress.setValue(100)
+        self._model_progress.setVisible(False)
+        self._model_status.setText(f"模型已下载：{path}")
+        self._refresh_models()
+        QMessageBox.information(
+            self,
+            "模型已下载",
+            f"已保存到：\n{path}\n\n"
+            "提醒：本版本还没有接推理引擎，点「评估」仍会显示"
+            f"「{MODEL_LOADED_PLACEHOLDER}」。",
+        )
+
+    def _on_model_error(self, message: str) -> None:
+        self._model_progress.setVisible(False)
+        self._model_status.setText(message)
+        # 取消不是错误 —— 不弹红色报错框
+        if "取消" not in message:
+            QMessageBox.critical(self, "下载失败", message)
+
+    def _do_delete_model(self) -> None:
+        installed = self._model_downloader.list_installed()
+        if not installed:
+            QMessageBox.information(self, "没有可删除的模型", "本机还没有下载过模型。")
+            return
+        names = [info.name for info in installed]
+        choice, ok = QInputDialog.getItem(
+            self, "删除模型", "要删除哪个模型：", names, 0, False
+        )
+        if not ok or not choice:
+            return
+        answer = QMessageBox.question(
+            self,
+            "确认删除",
+            f"确定要删除本地模型「{choice}」吗？\n\n"
+            "删除之后要重新下载才能再用（不影响成绩和任何其它数据）。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if self._model_downloader.delete(choice):
+            self._model_status.setText(f"已删除模型「{choice}」。")
+        else:
+            self._model_status.setText(f"删除「{choice}」失败，文件可能正被占用。")
+        self._refresh_models()
 
     def _on_local_ai_toggled(self, checked: bool) -> None:
         self._ai_save_btn.setEnabled(True)
@@ -414,14 +629,17 @@ class SettingsPage(QWidget):
 
     # ---------------------------------------------------------------- 更新
     def _build_update_card(self) -> QFrame:
-        """更新检查（charter v1.7 第七节）。
+        """更新检查 + 自动更新（charter v1.7 第七节 → v1.8 第六节）。
 
         ★ **只在用户点按钮时才联网**，没有任何自动检查。
         ★ 请求走 :func:`ui.workers.run_async`（后台线程）——
           在按钮回调里直接 ``urlopen`` 的话，断网时要卡满 5 秒超时，
           期间窗口不重绘（``ui/workers.py`` 开头讲的就是这个）。
-        ★ **不自动下载、不自动替换 exe**（charter 十节明令禁止）：
-          只弹窗问一句，用户点「去下载」才打开浏览器。
+        ★ 下载走 :func:`ui.update_dialog.download_release`（后台线程 +
+          模态进度条），**每一步都要用户点一下**才动：
+          点「检查更新」才查、点「开始下载」才下、点「立即重启」才换。
+          charter v1.8 第四节 ❌ 一栏里"自动更新/静默下载"依然禁止 ——
+          这里没有任何"启动时顺手更新一下"的路径。
         """
         card = make_card()
         box = QVBoxLayout(card)
@@ -433,8 +651,9 @@ class SettingsPage(QWidget):
         box.addWidget(title)
 
         note = QLabel(
-            "只在您点「检查更新」时才联网，只读一次版本号；"
-            "不会自动下载，也不会自动替换程序。"
+            "只在您点「检查更新」时才联网，只读一次版本号。"
+            "发现新版本后会先问您要下什么，点「开始下载」才会下载 —— "
+            "程序不会在后台自动下载或自动安装。"
         )
         note.setObjectName("Muted")
         note.setWordWrap(True)
@@ -497,7 +716,18 @@ class SettingsPage(QWidget):
         run_async(self, check_for_update, on_done=_done, on_error=_failed)
 
     def _apply_update_result(self, result: UpdateCheck) -> None:
-        """把检查结果落到界面上。**四种状态给四句不同的话**。"""
+        """把检查结果落到界面上。**四种状态给四句不同的话**。
+
+        ★ v1.8：发现新版本之后不再是"打开浏览器让你自己下"，
+          而是走完整向导（选模块 → 下载 → 问重启）。charter v1.8 第四节
+          把"更新下载"加进了白名单，第六节给了完整流程。
+          **但"不自动下载"这条没变** —— 每一步都要用户点一下。
+        """
+        # 把描述留下来：AI 模型清单和下载直链都从它里面解析
+        self._release_body = result.body or ""
+        if self._release_body:
+            self._refresh_models()
+
         if result.status == STATUS_ERROR:
             self._set_update_status(
                 "检查失败，请手动访问仓库查看是否有新版本。", error=True
@@ -506,20 +736,97 @@ class SettingsPage(QWidget):
         self._set_update_status(result.detail)
         if not result.has_newer:
             return
-        answer = QMessageBox.question(
-            self,
-            "发现新版本",
-            f"发现新版本 v{result.version}（当前 v{CURRENT_VERSION}），是否前往下载？\n\n"
-            "程序不会自动下载，也不会自动替换 —— 到页面上自己下载即可。",
-            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Ok,
-            QMessageBox.StandardButton.Ok,
+
+        plan = plan_from_release(result, {"body": result.body})
+        if not plan.has_main:
+            # 发行版没给直链 → 老老实实退回"打开页面自己下"，
+            # 不要假装能自动更新。
+            answer = QMessageBox.question(
+                self,
+                "发现新版本",
+                f"发现新版本 v{result.version}（当前 v{CURRENT_VERSION}）。\n\n"
+                "这个发行版没有提供程序直链，需要到页面上手动下载。\n"
+                "现在打开下载页吗？",
+                QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Ok,
+                QMessageBox.StandardButton.Ok,
+            )
+            if answer == QMessageBox.StandardButton.Ok:
+                QDesktopServices.openUrl(QUrl(GITEE_RELEASES_PAGE))
+                self._set_update_status(
+                    f"{result.detail} 已打开浏览器：{GITEE_RELEASES_PAGE}"
+                )
+            return
+
+        self._run_update_wizard(result, plan)
+
+    def _run_update_wizard(self, result: UpdateCheck, plan: Any) -> None:
+        """第一步选模块 → 第二步下载 → 第三步问重启。"""
+        chooser = ModuleChoiceDialog(plan, self)
+        if chooser.exec() != chooser.DialogCode.Accepted:
+            self._set_update_status("已取消：没有下载任何内容。")
+            return
+
+        self._set_update_status(f"正在下载 v{plan.version}…")
+        destination = (
+            update_apply.update_dir() / f"transcript-lens_v{plan.version}.exe"
         )
-        if answer == QMessageBox.StandardButton.Ok:
-            QDesktopServices.openUrl(QUrl(GITEE_RELEASES_PAGE))
-            # ★ 别把"发现新版本"那句话冲掉 —— 用户回来还得知道刚才发现了什么。
-            #   换成"已打开浏览器"会把结论吞掉（测试里就是这么抓到的）。
+        downloaded = download_release(
+            self,
+            plan.main_url,
+            destination,
+            label=(
+                f"正在下载主程序 v{plan.version}（{plan.main_size}）\n"
+                "下载中断可以重新点「开始下载」续传。"
+            ),
+            expected_sha256=plan.main_sha256,
+        )
+        if downloaded is None:
+            self._set_update_status("下载已取消，当前程序没有任何改动。", error=True)
+            return
+
+        # ★ 下载完就写 update.json —— 这样点「稍后」之后，
+        #   下次启动 apply_pending_update 才接得上（见 ui/update_dialog 开头的说明）。
+        if update_apply.is_frozen():
+            try:
+                update_apply.write_pending_update(
+                    downloaded,
+                    update_apply.current_exe() or "",
+                    plan.version,
+                    from_version=CURRENT_VERSION,
+                    sha256=plan.main_sha256,
+                )
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.warning(
+                    self, "记录更新状态失败",
+                    f"{exc}\n\n新版本已经下载好了，但重启后可能不会自动替换。",
+                )
+
+        # --- 选中的 AI 模型（可选，失败不影响主程序更新）-------------------
+        for info in plan.selected(chooser.chosen_models()):
+            path = download_release(
+                self,
+                info.url,
+                model_dir(info.name) / (info.name + ".gguf"),
+                label=f"正在下载 {info.label or info.name}"
+                      + (f"（{info.size}）" if info.size else ""),
+            )
+            if path is None:
+                self._set_update_status(
+                    f"「{info.name}」没有下载完，主程序更新不受影响。", error=True
+                )
+                break
+            self._refresh_models()
+
+        if ask_restart(self, plan, Path(downloaded)):
+            # ★ 交接已经完成，**必须**退出 —— 不退出的话旧进程还占着
+            #   exe 文件锁，bat 会重试 60 秒然后放弃。
+            self._set_update_status("正在重启以完成更新…")
+            app = QApplication.instance()
+            if app is not None:
+                app.quit()
+        else:
             self._set_update_status(
-                f"{result.detail} 已打开浏览器：{GITEE_RELEASES_PAGE}"
+                f"v{plan.version} 已下载完成。下次启动程序时会自动完成替换。"
             )
 
     # ---------------------------------------------------------------- 导出

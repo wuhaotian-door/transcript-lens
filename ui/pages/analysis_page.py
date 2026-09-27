@@ -83,6 +83,7 @@ from core.archival import (
 )
 from core.calculator import MAX_SCORE, MIN_SCORE, CalculationScope, calculate_many
 from core.crypto_store import CryptoError, CryptoStore
+from core.excel_io import ExcelEngineError, friendly_error, read_frame
 from core.parser import Category
 from core.scholarship import ClassRecord, save_class, validate_class_name
 from core.user_store import load_user_json, save_user_json
@@ -251,13 +252,15 @@ _WARNING_COLOR = "#B45309"
 def _read_raw_frame(path: str) -> pd.DataFrame:
     """把原始表读成 DataFrame（保留原样，不做任何清洗）。
 
-    ``with pd.ExcelFile(...)`` 是必须的：Windows 上不显式关闭句柄的话，
-    Excel 还开着这个文件时会读失败（踩过）。
+    ★ v1.8：读取整件事交给 :func:`core.excel_io.read_frame` —— 它**按内容的
+      魔数**挑引擎，而不是按扩展名。修的就是"导 .xlsx 却弹出 xlrd 错误"
+      那个 bug：教务系统导出的老格式文件扩展名常常是 ``.xlsx``，
+      而 pandas 一看内容就判定成 ``xls`` 去调 xlrd（实测见 excel_io 开头）。
+
+    ★ 出错的异常已经是**人话**（``ExcelEngineError``），里面**不含任何
+      包管理指令** —— 调用方直接 ``str(exc)`` 就能弹窗。
     """
-    if path.lower().endswith(".csv"):
-        return pd.read_csv(path, header=None, dtype=object)
-    with pd.ExcelFile(path) as book:
-        return pd.read_excel(book, header=None, dtype=object)
+    return read_frame(path, header=None, dtype=object)
 
 
 def _fmt(value: float | None) -> str:
@@ -669,13 +672,13 @@ class AnalysisPage(QWidget):
 
         try:
             raw = _read_raw_frame(path)
+        except ExcelEngineError as exc:
+            # ★ 已经是人话，而且不含 pip 指令（验收标准 5）
+            QMessageBox.critical(self, "导入失败", str(exc))
+            self._set_status("读取失败。", error=True)
+            return
         except Exception as exc:  # noqa: BLE001 - 读文件的意外都要给人看
-            QMessageBox.critical(
-                self,
-                "读不出这个文件",
-                f"{exc.__class__.__name__}: {exc}\n\n"
-                "请确认它是完整的 .xlsx/.xls/.csv，且没有被别的程序占用。",
-            )
+            QMessageBox.critical(self, "导入失败", friendly_error(exc, path))
             self._set_status("读取失败。", error=True)
             return
 

@@ -48,6 +48,7 @@ from core.crypto_store import CryptoError, CryptoStore, WrongPasswordError
 from core.email_recovery import send_recovery_mail
 from core.recovery import RecoveryError, enable_recovery, recovery_info
 from core.session_token import clear_token
+from core.version import CURRENT_VERSION
 from ui.anim import make_card
 from ui.workers import run_async
 
@@ -62,7 +63,8 @@ MIN_PASSWORD_LENGTH = 8
 
 _ABOUT = (
     ("程序", "成绩单透镜 · transcript-lens"),
-    ("版本", "v1.0"),
+    # ★ v1.8 修正：这里原来硬编码 "v1.0"（charter v1.8 第五节点名的旧 bug）。
+    ("版本", f"v{CURRENT_VERSION}"),
     ("定位", "辅导员本地单机工具，成绩不出这台电脑"),
     ("算术", "全部在本地确定性完成，绝不调用大模型做数字"),
     ("网络", "只有找回密码会联网（发一封邮件），成绩永不出网"),

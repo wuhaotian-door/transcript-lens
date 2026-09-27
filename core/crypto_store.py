@@ -105,6 +105,8 @@ from core.version import (
     CURRENT_VERSION,
     LEGACY_VAULT_VERSION_KEY,
     VAULT_VERSION_KEY,
+    VAULT_VERSION_KEYS,
+    stamp_vault_version,
 )
 
 __all__ = [
@@ -455,7 +457,9 @@ class UserIndex:
             "users": [u.to_dict() for u in self.users],
         }
         if self.vault_version:
-            data[VAULT_VERSION_KEY] = self.vault_version
+            # ★ 两个键名都写（值相同）—— 见 core.version.VAULT_VERSION_KEYS。
+            #   写盘走同一个助手函数，保证"两个键打架"不可能发生。
+            stamp_vault_version(data, self.vault_version)
         return data
 
     @classmethod
@@ -467,7 +471,7 @@ class UserIndex:
             raise StoreCorruptError("users.json 的 users 字段不是数组")
         # 兼容读：charter 8.1 的键优先，任务书 2.1 那个旧键名也认
         vault_version = ""
-        for key in (VAULT_VERSION_KEY, LEGACY_VAULT_VERSION_KEY):
+        for key in VAULT_VERSION_KEYS:
             value = data.get(key)
             if isinstance(value, str) and value.strip():
                 vault_version = value.strip()
