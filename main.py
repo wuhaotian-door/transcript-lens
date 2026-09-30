@@ -200,9 +200,11 @@ def _selfcheck_report() -> tuple[bool, str]:
 
     # --- ★ v1.8：铁律 1 的封印 + 版本号真源 + Excel 引擎 + 替换机制 --------
     #     ★ v1.8.1：激活码系统已整套删除，多一条"不许复活"的闸门
+    #     ★ v1.8.2：5 份开发文档合并成一份总纲，多一条"别再堆文档"的闸门
     for label, report in (
         ("封板文件封印（铁律 1）", _frozen_files_report),
         ("激活码系统已删除", _removed_gate_report),
+        ("开发文档唯一真源", _docs_gate_report),
         ("版本号唯一真源", _version_source_report),
         ("Excel 读取引擎", _excel_engine_report),
         ("启动替换机制", _apply_mechanism_report),
@@ -1127,6 +1129,165 @@ def _removed_gate_report() -> list[str]:
     return lines
 
 
+# ---------------------------------------------------------------------------
+# ★ 开发文档只有一份总纲（docs/DEV_SUMMARY.md）—— 这条闸门守着"别再堆文档"
+# ---------------------------------------------------------------------------
+
+#: ``docs/`` 的**完整白名单**。开发文档只有一份总纲；另外两本是给人看的手册
+#: （辅导员用的更新指南 / 维护者用的发版 SOP），读者不同、不能压进总纲。
+DOCS_WHITELIST: tuple[str, ...] = (
+    "DEV_SUMMARY.md",
+    "UPDATE_GUIDE.md",
+    "DISTRIBUTION.md",
+)
+
+#: 已被合并进总纲并删除的 5 份旧文档。**再被谁提到就是死链接。**
+REMOVED_DOC_NAMES: tuple[str, ...] = (
+    "SGMS_v1.3_Final_Spec.md",
+    "SGMS_v1.6_Dev_Charter.md",
+    "SGMS_v1.7_Dev_Charter.md",
+    "SGMS_v1.8_Dev_Charter.md",
+    "ACTIVATION_REMOVAL.md",
+)
+
+#: 总纲的体量下限。它是唯一真源，被谁清空或截断，这条闸门要喊出来。
+DOCS_SUMMARY_MIN_BYTES = 20000
+
+
+def _docs_gate_report() -> list[str]:
+    """开发文档只有一份总纲（``docs/DEV_SUMMARY.md``）—— 这条闸门守着它。
+
+    2026-09-27：``docs/`` 里 5 份互相取代的开发文档（v1.3 Spec、v1.6 / v1.7 /
+    v1.8 三份 charter、激活码删除记录）合并成了 ``docs/DEV_SUMMARY.md``，
+    旧文件已删。三件事，缺一件都不算数：
+
+    1. **白名单** —— ``docs/`` 下只许有 :data:`DOCS_WHITELIST` 那三个文件。
+       多一个就是又在堆开发文档 —— 越堆越多、几份说法互相打架，正是这次要治的病。
+    2. **真源没被掏空** —— 总纲必须够大，且首尾章节标题都在。
+    3. **没有死链接** —— 仓库里任何 ``.py`` / ``.ps1`` / ``.md`` / ``.json``
+       都不许再提到 :data:`REMOVED_DOC_NAMES` 里的文件名。
+
+    ★ 判据是**文件名**，不是"charter 这个词"：代码注释里还留着 120 多处
+      "charter 8.3" 这类**旧编号出处**，那是有意的历史记录，一刀切判红全是
+      误报 —— 照总纲第二十节的对照表换算即可。更要紧的是**别去机械替换**：
+      v1.6 的 ``6.x`` 一节里既有 AI 骨架接口（现在 §八）又有欢迎页停留
+      （现在 §10.2），同一个旧编号在不同文件里指向**不同的**新章节，
+      批量换名必然改错意思。**误报的闸门最后一定会被人关掉。**
+
+    ★ 跳过 ``main.py`` 自己 —— :data:`REMOVED_DOC_NAMES` 就住在这里，扫自己
+      必然自报家门（和 :func:`_removed_gate_report` 同一个道理）。也跳过
+      ``docs/DEV_SUMMARY.md`` —— 那份"旧引用对照表"是**唯一**被允许写出
+      旧文档名的地方。
+    """
+    docs_dir = PROJECT_ROOT / "docs"
+    summary = docs_dir / "DEV_SUMMARY.md"
+
+    if not docs_dir.is_dir():
+        if IS_FROZEN:
+            return [
+                f"ok    {'文档唯一真源（打包版）':<32} 没有 docs/ 目录"
+                "（`--add-data` 里没打 docs/），本项以打包前的源码自检为准"
+            ]
+        return [f"FAIL  找不到 {docs_dir} —— 检查已经失效，不是通过"]
+
+    lines: list[str] = []
+
+    # --- 1. 白名单 --------------------------------------------------------
+    present = sorted(path.name for path in docs_dir.glob("*") if path.is_file())
+    extra = [name for name in present if name not in DOCS_WHITELIST]
+    missing = [name for name in DOCS_WHITELIST if name not in present]
+    if extra:
+        lines.append(
+            "FAIL  docs/ 下多了白名单之外的文件：" + "、".join(extra)
+            + " —— 开发文档只有 docs/DEV_SUMMARY.md 一份，"
+            "新知识写进它或 AGENTS.md"
+        )
+    if missing:
+        lines.append("FAIL  docs/ 少了该有的文件：" + "、".join(missing))
+    if not extra and not missing:
+        lines.append(
+            f"ok    {'docs/ 白名单':<32} {len(present)} 个文件"
+            "（总纲 + 辅导员手册 + 发版 SOP）"
+        )
+
+    # --- 2. 真源没被掏空 --------------------------------------------------
+    if summary.is_file():
+        text = summary.read_text(encoding="utf-8", errors="ignore")
+        absent = [mark for mark in ("## 零、", "## 一、", "## 二十、") if mark not in text]
+        size = summary.stat().st_size
+        if absent:
+            lines.append(
+                "FAIL  总纲缺章节标题：" + "、".join(absent) + " —— 唯一真源被删改了"
+            )
+        elif size < DOCS_SUMMARY_MIN_BYTES:
+            lines.append(
+                f"FAIL  {summary.name} 只有 {size} 字节"
+                f"（下限 {DOCS_SUMMARY_MIN_BYTES}）—— 唯一真源被掏空了"
+            )
+        else:
+            lines.append(
+                f"ok    {'总纲体量':<32} {size} 字节 / {len(text.splitlines())} 行"
+            )
+
+    # --- 3. 没有死链接 ----------------------------------------------------
+    targets: list[Path] = []
+    for root in (
+        PROJECT_ROOT,
+        PROJECT_ROOT / "core",
+        PROJECT_ROOT / "ui",
+        PROJECT_ROOT / "tests",
+        PROJECT_ROOT / "config",
+        docs_dir,
+    ):
+        if not root.is_dir():
+            continue
+        found = root.glob("*") if root == PROJECT_ROOT else root.rglob("*")
+        targets.extend(
+            path
+            for path in found
+            if path.is_file() and path.suffix in {".py", ".ps1", ".md", ".json"}
+        )
+    skip = {PROJECT_ROOT / "main.py", summary}
+
+    dead: list[str] = []
+    scanned = 0
+    for target in dict.fromkeys(sorted(targets)):
+        if target in skip:
+            continue
+        text = target.read_text(encoding="utf-8", errors="ignore")
+        scanned += 1
+        for number, line in enumerate(text.splitlines(), 1):
+            for name in REMOVED_DOC_NAMES:
+                if name in line:
+                    dead.append(f"{target.relative_to(PROJECT_ROOT)}:{number} 提到 {name}")
+    if dead:
+        more = f"（共 {len(dead)} 处）" if len(dead) > 5 else ""
+        lines.append(
+            "FAIL  还在引用已删除的旧文档：" + "；".join(dead[:5]) + more
+            + " —— 改成 docs/DEV_SUMMARY.md 的对应章节"
+        )
+    elif scanned:
+        lines.append(
+            f"ok    {'无死链接':<32} 扫了 {scanned} 个文件（.py / .ps1 / .md / .json）"
+        )
+
+    # --- 4. AGENTS.md 必须指向总纲（"开工前先读"这条规矩的锚点）------------
+    agents = PROJECT_ROOT / "AGENTS.md"
+    if agents.is_file():
+        if "docs/DEV_SUMMARY.md" in agents.read_text(encoding="utf-8", errors="ignore"):
+            lines.append(
+                f"ok    {'AGENTS.md 指向总纲':<32} 第 0 节写着「开工前先读」"
+            )
+        else:
+            lines.append(
+                "FAIL  AGENTS.md 里找不到 docs/DEV_SUMMARY.md 的指引 —— "
+                "总纲会变成没人读的死文件"
+            )
+    elif not IS_FROZEN:
+        lines.append("FAIL  找不到 AGENTS.md —— 检查已经失效，不是通过")
+    return lines
+
+
 def _version_source_report() -> list[str]:
     """版本号唯一真源（charter v1.8 第三节铁律 10 / 第五节）。
 
@@ -1138,8 +1299,8 @@ def _version_source_report() -> list[str]:
        ``f"v{CURRENT_VERSION}"``。
 
     ★ 为什么不是"在源码里 grep 有没有 1.0"：
-      那样会误伤**引用**（``ui/anim.py`` 的注释里写着"charter v1.6 第 5.2 节"、
-      ``ui/splash.py`` 提到 ``docs/SGMS_v1.3_Final_Spec.md``）。
+      那样会误伤**引用**（``ui/anim.py`` 的注释里写着"旧 charter v1.6 第 5.2 节"、
+      ``ui/pages/settings_page.py`` 的文档字符串提到 ``docs/DEV_SUMMARY.md``）。
       用 ``ast`` 只扫**字符串字面量**、再用"整串就是个版本号"这条判据，
       引用（注释和文档字符串）自然被排除 —— 注释根本不在 AST 里，
       文档字符串则被显式跳过。

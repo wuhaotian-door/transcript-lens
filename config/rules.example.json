@@ -1,6 +1,6 @@
 {
   "_comment": "奖学金测算规则模板 —— 只含字段结构与示例值。真实配置请另存为 config/rules.json（已被 .gitignore 忽略）。",
-  "_source": "docs/SGMS_v1.6_Dev_Charter.md 第 4 章（规则已定死，不许改）",
+  "_source": "docs/DEV_SUMMARY.md 第九节 奖学金测算（规则已定死，不许改）",
   "version": 1,
 
   "final_score": {
