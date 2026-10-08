@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -52,6 +53,14 @@ from PySide6.QtWidgets import (
 )
 
 from core.crypto_store import CryptoError, CryptoStore
+from core.import_workers import (
+    ImportFormatError,
+    ImportPlan,
+    ImportSummary,
+    apply_plan,
+    new_batch_id,
+    plan_import,
+)
 from core.scholarship import (
     ACADEMIC_WEIGHT,
     AWARD_FIRST,
@@ -72,8 +81,13 @@ from core.scholarship import (
     save_quota,
 )
 from ui.anim import make_card
+from ui.moral_import_dialog import MoralImportPreviewDialog
+from ui.workers import run_async
 
 __all__ = ["MORAL_MAX", "MORAL_MIN", "ScholarshipPage"]
+
+#: 批量导入的进度条走 3 步（读表 / 写库 / 收尾），跟界面上那几次提示对齐
+IMPORT_STEPS = 3
 
 MORAL_MIN = 0
 MORAL_MAX = 100
@@ -165,6 +179,8 @@ class ScholarshipPage(QWidget):
         self._record: ClassRecord | None = None
         #: 上一次测算的结果（导出用）
         self._rows: list[ScholarshipRow] = []
+        #: 有没有一批导入正在后台跑（防止连点两次）
+        self._import_busy = False
         self._build()
 
     # ---------------------------------------------------------------- 外部
@@ -304,6 +320,15 @@ class ScholarshipPage(QWidget):
         self._save_moral_btn.setMinimumHeight(34)
         self._save_moral_btn.clicked.connect(self._do_save_moral)
         head.addWidget(self._save_moral_btn)
+
+        self._import_moral_btn = QPushButton("批量导入")
+        self._import_moral_btn.setObjectName("Ghost")
+        self._import_moral_btn.setMinimumHeight(34)
+        self._import_moral_btn.setToolTip(
+            "从 Excel / CSV 读一列德育分（学号 + 姓名 + 分值），先预览再导入"
+        )
+        self._import_moral_btn.clicked.connect(self._do_import_moral)
+        head.addWidget(self._import_moral_btn)
         box.addLayout(head)
 
         self._moral_table = QTableWidget(0, len(MORAL_COLUMNS))
@@ -330,6 +355,15 @@ class ScholarshipPage(QWidget):
         self._moral_status.setObjectName("Muted")
         self._moral_status.setWordWrap(True)
         box.addWidget(self._moral_status)
+
+        #: 批量导入的进度条（0~IMPORT_STEPS 步；平时藏着）
+        self._import_progress = QProgressBar()
+        self._import_progress.setRange(0, IMPORT_STEPS)
+        self._import_progress.setValue(0)
+        self._import_progress.setTextVisible(True)
+        self._import_progress.setMinimumHeight(22)
+        self._import_progress.setVisible(False)
+        box.addWidget(self._import_progress)
         return card
 
     # --- ③ 名额 ---
@@ -562,6 +596,123 @@ class ScholarshipPage(QWidget):
         self._moral_status.setText(f"已保存 {count} 人的德育分。")
         QMessageBox.information(self, "已保存",
                                 f"{self._record.class_name}：{count} 人的德育分已加密存盘。")
+
+    # ------------------------------------------------------------ 批量导入
+    def _do_import_moral(self) -> None:
+        """批量导入德育分：选文件 → 后台读表 → 预览 5 行 → 后台写库。
+
+        三步都走 :func:`ui.workers.run_async`（读 Excel 是磁盘大活，
+        在界面线程里读几十人的表会让窗口"无响应"）。
+        """
+        if self._import_busy:
+            QMessageBox.information(self, "正在导入", "上一批还没跑完，稍等一下。")
+            return
+        if not self._username:
+            QMessageBox.information(self, "还没登录", "先登录再导入德育分。")
+            return
+        if not self.class_names():
+            QMessageBox.information(
+                self, "还没有班级",
+                "一个班都还没建过。先在「📊 智育分析」把这个班的成绩导进来，"
+                "这里才有学号名单可以对应。",
+            )
+            return
+
+        path, _filter = QFileDialog.getOpenFileName(
+            self,
+            "选择德育分表（.xlsx / .xls / .csv）",
+            "",
+            "Excel 工作簿 (*.xlsx *.xls);;CSV 文件 (*.csv);;全部文件 (*)",
+        )
+        if not path:
+            return
+
+        self._begin_import_busy("正在读表…")
+        known = tuple(self.class_names())
+        default_class = self.current_class
+        run_async(
+            self,
+            lambda: plan_import(path, known_classes=known,
+                                default_class=default_class),
+            on_done=self._on_import_planned,
+            on_error=self._on_import_failed,
+        )
+
+    def _on_import_planned(self, plan: ImportPlan) -> None:
+        """读表回来了（**还没写库**）：摆预览，等用户点头。"""
+        self._end_import_busy()
+        try:
+            ok = MoralImportPreviewDialog.confirm(plan, self)
+        except Exception as exc:  # noqa: BLE001 - 弹窗崩了也不能把数据写进去
+            self._moral_status.setText("预览打不开，本次没有导入任何数据。")
+            QMessageBox.critical(self, "预览打不开",
+                                 f"{type(exc).__name__}: {exc}")
+            return
+        if not ok:
+            self._moral_status.setText("已取消：没有确认预览，本次没有导入任何数据。")
+            return
+
+        self._begin_import_busy("正在写库…")
+        batch_id = new_batch_id()
+        run_async(
+            self,
+            lambda: apply_plan(self._store, self._username, plan,
+                               batch_id=batch_id),
+            on_done=self._on_import_applied,
+            on_error=self._on_import_failed,
+        )
+
+    def _on_import_applied(self, summary: ImportSummary) -> None:
+        """写库回来了：刷新界面 + 把"成功 N / 跳过 M / 失败 K"摆出来。"""
+        self._end_import_busy()
+        self._load_current_class()
+        self._moral_status.setText(
+            f"批量导入（{summary.source}）：成功 {summary.succeeded} 行 / "
+            f"跳过 {summary.skipped} 行 / 失败 {summary.failed} 行。"
+        )
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("批量导入完成")
+        box.setText(
+            f"成功 {summary.succeeded} 行 / 跳过 {summary.skipped} 行 / "
+            f"失败 {summary.failed} 行"
+        )
+        box.setInformativeText(summary.as_text())
+        box.exec()
+
+    def _on_import_failed(self, exc: BaseException) -> None:
+        """读表或写库出错 —— 说人话，并且**绝不假装成功**。"""
+        self._end_import_busy()
+        if isinstance(exc, ImportFormatError):
+            self._moral_status.setText("这份表读不进来：" + str(exc))
+            QMessageBox.critical(self, "这份表读不进来", str(exc))
+            return
+        detail = getattr(exc, "_tl_traceback", "")
+        self._moral_status.setText(f"导入失败：{type(exc).__name__}: {exc}")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle("导入失败")
+        box.setText(f"{type(exc).__name__}: {exc}")
+        if detail:
+            box.setDetailedText(str(detail))
+        box.exec()
+
+    def _begin_import_busy(self, text: str, step: int) -> None:
+        """进入"导入中"状态：进度条露头、按钮先禁用。"""
+        self._import_busy = True
+        self._import_progress.setRange(0, IMPORT_STEPS)
+        self._import_progress.setValue(max(0, min(IMPORT_STEPS, int(step))))
+        self._import_progress.setFormat("%v / %m")
+        self._import_progress.setVisible(True)
+        self._import_moral_btn.setEnabled(False)
+        self._save_moral_btn.setEnabled(False)
+        self._moral_status.setText(text)
+
+    def _end_import_busy(self) -> None:
+        self._import_busy = False
+        self._import_progress.setVisible(False)
+        self._import_moral_btn.setEnabled(True)
+        self._save_moral_btn.setEnabled(True)
 
     def _do_save_quota(self) -> None:
         if self._record is None:

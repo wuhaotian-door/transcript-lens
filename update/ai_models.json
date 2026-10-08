@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "updated": "2026-10-08",
+  "_doc": [
+    "AI 学习助手的模型清单。程序用 Gitee raw 读这份文件（core/ai/model_registry.py 的 GITEE_RAW_MODELS），界面入口是设置页的「模型中心」。",
+    "改这份文件 = 改线上清单，所以改完必须提交到 master 才会生效。",
+    "字段：id 唯一键（也是磁盘上的账本键）/ label 界面中文名 / group 分组（「推荐」永远排最前）/ file 落盘文件名 / url 直链 / size 字节数 / sha256 小写 64 位 / minRamGb 建议内存 / defaultCheck 是否默认勾选 / note 界面提示。",
+    "★ size 和 sha256 必须是**真值**：size 差超过 1% 会被判成「下回来的不是这个文件」，sha256 对不上会直接拒绝落盘。",
+    "下面两条取自 ModelScope 上 Qwen 官方 GGUF 仓库的 q4_k_m 量化版，体积/哈希/直链都用 2026-10-08 的接口返回值核对过，直链实测支持 Range（HTTP 206，续传要用）。"
+  ],
+  "models": [
+    {
+      "id": "qwen2.5-1.5b-instruct-q4_k_m",
+      "label": "Qwen2.5 1.5B 指令版（Q4_K_M 量化）",
+      "group": "推荐",
+      "file": "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+      "url": "https://modelscope.cn/models/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/master/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+      "size": 1117320736,
+      "sha256": "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e",
+      "minRamGb": 4,
+      "defaultCheck": true,
+      "note": "体积小、启动快，普通办公机（8GB 内存）就能跑"
+    },
+    {
+      "id": "qwen2.5-3b-instruct-q4_k_m",
+      "label": "Qwen2.5 3B 指令版（Q4_K_M 量化）",
+      "group": "高级",
+      "file": "qwen2.5-3b-instruct-q4_k_m.gguf",
+      "url": "https://modelscope.cn/models/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/master/qwen2.5-3b-instruct-q4_k_m.gguf",
+      "size": 2104932768,
+      "sha256": "626b4a6678b86442240e33df819e00132d3ba7dddfe1cdc4fbb18e0a9615c62d",
+      "minRamGb": 8,
+      "defaultCheck": false,
+      "note": "效果更好，建议 16GB 内存；下载要 2GB 左右，别在流量上点"
+    }
+  ]
+}

@@ -11,6 +11,21 @@
 * 红线 10：有内容却缺了课程成绩列（行短了/错位）→ 整行 ``is_valid=False``、
   ``has_column_mismatch=True``，**绝不静默吞掉该行**。
 
+**v1.9 表格干扰过滤**（Owner 实测的三类干扰）：
+
+教务系统导出的表里混着三类"不是学生成绩"的东西，以前它们会被当成
+课程列和"学生"算进加权分母 —— 分母凭空变大，均分被稀释，而且**没有任何提示**：
+
+1. **统计列**：不及格门数 / 平均分 / 总分 / 平均学分绩 / 平均学分绩点 / 排名 …
+   （见 :data:`STAT_HEADER_KEYWORDS`）→ 排除，记进 ``ParseResult.stat_columns``。
+2. **末尾汇总行**：``37人  470  2485 …`` / ``不及格  18  6  0``
+   （见 :data:`SUMMARY_ROW_KEYWORDS`）→ 跳过，记进 ``ParseResult.skipped_rows``。
+3. **顶部大标题**：跨列合并的"…学生成绩汇总表"（读出来只有一个非空单元格）
+   → 不当表头行，见 :func:`_row_is_title_like`。
+
+三条都**留痕**：跳过的行、排除的列都写进 ``warnings`` / ``stat_columns`` /
+``skipped_rows``，绝不静默吞（红线 10 的精神）。
+
 本模块不做加权、不做合并、不碰 UI、不碰网络。
 """
 
@@ -35,6 +50,7 @@ __all__ = [
     "find_header_rows",
     "is_anchor_header",
     "is_meta_header",
+    "is_stat_header",
     "normalize_header",
     "parse_dataframe",
     "parse_dataframe_to_courses",
@@ -155,6 +171,56 @@ ANCHOR_HEADER_KEYWORDS: tuple[str, ...] = (
     "合计学分",
     "学分小计",
 )
+
+#: ★ v1.9 新增：**统计列**的表头关键词。命中这些词的列是"算出来的汇总"，
+#: 不是学生考的分数 —— 绝不能当课程列。
+#:
+#: 为什么必须单独列一张表：``parse_dataframe`` 原来的判据是"不是身份列、
+#: 不是锚点列 → 就是课程列"。教务系统导出的成绩表恰恰会在课程列右边挂一长串
+#: 统计列（不及格门数 / 平均分 / 总分 / 平均学分绩点 / 排名），于是每一列都被
+#: 当成一门课算进加权分母 —— 分母凭空变大，加权均分被稀释，而且没有任何提示。
+#:
+#: ★ 判据只看**字符串**表头（``normalize_header`` 对非字符串返回空串），
+#:   所以数据区里的数字不会误命中。
+STAT_HEADER_KEYWORDS: tuple[str, ...] = (
+    "不及格门数",
+    "不及格科目",
+    "不及格课程",
+    "不及格数",
+    "不及格",
+    "平均学分绩点",
+    "平均学分绩",
+    "平均绩点",
+    "平均分",
+    "平均成绩",
+    "绩点",
+    "gpa",
+    "总分",
+    "总成绩",
+    "总评",
+    "合计",
+    "小计",
+    "排名",
+    "名次",
+    "rank",
+)
+
+#: ★ v1.9 新增：**末尾统计/汇总行**里出现的词。这类行整行都不是学生：
+#: ``37人  470  2485 …`` / ``不及格  18  6  0``。
+SUMMARY_ROW_KEYWORDS: tuple[str, ...] = (
+    "不及格",
+    "合计",
+    "小计",
+    "总计",
+    "汇总",
+    "平均",
+    "人数",
+    "门数",
+    "统计",
+)
+
+#: ``37人`` / ``37 人`` 这种"人数"单元格。
+_SUMMARY_COUNT_RE = re.compile(r"^\s*\d+(?:\.\d+)?\s*人\s*$")
 
 #: 教师列那种"按行堆叠"的污染写法：``90 张三`` / ``91：李四``。
 #: 只拦"纯数字 + 分隔符 + 姓名"这一种形态，不能因为表头带空格就误杀正常课程名。
@@ -300,6 +366,13 @@ class ParseResult:
     id_columns: list[int] = field(default_factory=list)
     #: 被识别为「姓名」的列序号。取姓名时优先用它，避免把学号当姓名。
     name_columns: list[int] = field(default_factory=list)
+    #: ★ v1.9：被识别为「统计列」的列序号（不及格门数 / 平均分 / 总分 /
+    #: 平均学分绩点 / 排名 …）。这些列的数值是**算出来的汇总**，不是学生成绩，
+    #: 一律不进加权分母。回显弹窗要把这件事说给辅导员听。
+    stat_columns: list[int] = field(default_factory=list)
+    #: ★ v1.9：被跳过的行 ``(行序号 0-based, 原因)``。统计/汇总行、
+    #: 缺学生标识的行。**跳过的行必须留痕**（红线 10 的精神：绝不静默吞行）。
+    skipped_rows: list[tuple[int, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -483,6 +556,26 @@ def is_anchor_header(value: Any) -> bool:
     return bool(text) and any(kw in text for kw in ANCHOR_HEADER_KEYWORDS)
 
 
+def is_stat_header(value: Any) -> bool:
+    """该表头是否是「统计列」（v1.9）。
+
+    统计列 = 教务系统在课程列右边挂的那串**算出来的汇总**：
+    不及格门数 / 平均分 / 总分 / 平均学分绩 / 平均学分绩点 / 排名 …
+
+    它们既不是学生身份列，也不是学生考的分数。以前判据是"不是身份列、
+    不是锚点列 → 就是课程列"，于是这些列的数值被当成课程分数算进了加权。
+
+    ★ 匹配前把**所有空白都挤掉**（含全角空格和换行）：教务导出的表头里
+    「平 均 分」「平均\n分」这两种写法都真见过，而 `normalize_header` 只去
+    首尾空白。挤空白对课程名是安全的 —— 课程名里不会出现上面那串关键词。
+    """
+    text = normalize_header(value).lower()
+    if not text:
+        return False
+    squeezed = "".join(text.split())
+    return any(kw in squeezed for kw in STAT_HEADER_KEYWORDS)
+
+
 def is_student_id_header(value: Any) -> bool:
     """该表头是否是「学号」列（纵向累计的钥匙）。"""
     text = normalize_header(value).lower()
@@ -537,6 +630,48 @@ def _looks_like_real_data_row(
     return False
 
 
+def _row_non_empty_count(df: pd.DataFrame, row_index: int) -> int:
+    """整行有几个非空单元格。"""
+    return sum(
+        1
+        for c in range(df.shape[1])
+        if strip_blank_marker(df.iloc[row_index].iloc[c]) is not None
+    )
+
+
+def _row_is_title_like(df: pd.DataFrame, row_index: int) -> bool:
+    """这一行是不是**顶部大标题**（v1.9 干扰之三）。
+
+    判据：整行**只有一个**非空单元格。
+
+    为什么这么判：教务导出的表最上面常有一行跨列合并的大标题
+    （"2024-2025 学年第一学期学生成绩汇总表"）。合并单元格被 openpyxl /
+    xlrd 读出来时只有最左边那格有值、其余是空 —— "只有一个非空格"
+    就是它的指纹。而**真正的表头行不可能只有一个非空格**：它至少要写出
+    「姓名」+ 学号或至少一门课。
+
+    ★ 不这么做的话，标题里的"学生"二字会命中
+      :data:`SUBJECT_HEADER_KEYWORDS`，标题行就被当成表头行，白白吃掉
+      :data:`MAX_HEADER_ROWS` 里的一格，真正的表头行反而被挤掉。
+    """
+    return _row_non_empty_count(df, row_index) == 1
+
+
+def _summary_text_reason(text: str) -> str:
+    """单元格文本像不像"统计/汇总"？像则返回人话原因，否则返回空串。
+
+    ``37人`` → "人数统计"；``不及格`` / ``合计`` / ``平均分`` → 含汇总词。
+    """
+    if not text:
+        return ""
+    if _SUMMARY_COUNT_RE.match(text):
+        return f"「{text}」是人数统计"
+    for keyword in SUMMARY_ROW_KEYWORDS:
+        if keyword in text:
+            return f"「{text}」含汇总词「{keyword}」"
+    return ""
+
+
 def find_header_rows(
     df: pd.DataFrame,
 ) -> tuple[list[int], list[int], list[int], list[int], list[int]]:
@@ -555,6 +690,12 @@ def find_header_rows(
 
     n_rows, n_cols = df.shape
     for r in range(n_rows):
+        # ★ v1.9：顶部跨列合并的大标题不是表头行（干扰之三）。
+        #   不跳过的话，标题里只要有"学生"二字就会被当成身份列表头，
+        #   真正的表头行反而被 MAX_HEADER_ROWS 挤掉。
+        if _row_is_title_like(df, r):
+            continue
+
         raw = [normalize_header(df.iloc[r].iloc[c]) for c in range(n_cols)]
 
         # 锚点列（所得学分）自己占一列，但绝不当课程列
@@ -808,8 +949,32 @@ def parse_dataframe(df: pd.DataFrame) -> ParseResult:
     data_start = header_rows[-1] + 1
     result.data_start_row = data_start
 
+    # ---- v1.9 干扰之一：统计列绝不是课程列 --------------------------------
+    # 判据落在**表头行**上：只要任一表头行的这一格命中 is_stat_header，
+    # 整列就是统计列。身份列/锚点列优先（它们不参与统计判定）。
+    stat_columns = sorted(
+        {
+            c
+            for c in range(df.shape[1])
+            if c not in meta_columns
+            and c not in anchor_columns
+            and any(is_stat_header(df.iloc[r].iloc[c]) for r in header_rows)
+        }
+    )
+    result.stat_columns = stat_columns
+    for c in stat_columns:
+        label = ""
+        for r in header_rows:
+            label = label or normalize_header(df.iloc[r].iloc[c])
+        result.warnings.append(
+            f"第 {c + 1} 列「{label or '未命名'}」是统计列（不及格门数/平均分/排名这类"
+            "算出来的汇总），已排除，不计入加权分母"
+        )
+
     columns = [
-        c for c in range(df.shape[1]) if c not in meta_columns and c not in anchor_columns
+        c
+        for c in range(df.shape[1])
+        if c not in meta_columns and c not in anchor_columns and c not in stat_columns
     ]
     courses, course_warnings = _extract_course_values(
         df, columns, header_rows, meta_columns
@@ -837,6 +1002,16 @@ def parse_dataframe(df: pd.DataFrame) -> ParseResult:
         ):
             continue
 
+        # ---- v1.9 干扰之二：末尾统计/汇总行不是学生 ----------------------
+        # 身份列（姓名/学号/序号/班级…）里写着「37人」「不及格」「平均分」
+        # 这类汇总词 → 整行跳过。先判这一条，免得它又被下面的
+        # "第一个非空单元格"兜底成一个人名，然后带着一堆分数进加权。
+        summary_reason = ""
+        for c in sorted(set(name_columns) | set(id_columns) | set(meta_columns)):
+            summary_reason = _summary_text_reason(normalize_header(row.iloc[c]))
+            if summary_reason:
+                break
+
         # 姓名：优先取「姓名」列；没有姓名列时才退回"第一个非空身份列"
         student = ""
         for c in name_columns:
@@ -852,6 +1027,32 @@ def parse_dataframe(df: pd.DataFrame) -> ParseResult:
                 if text:
                     student = text
                     break
+
+        # 学号：纵向累计的钥匙。学号列里的数字/长串原样保留为字符串。
+        student_id = ""
+        for c in id_columns:
+            text = _id_text(row.iloc[c])
+            if text:
+                student_id = text
+                break
+
+        # 有效学生行必须有学生标识（学号或姓名）—— 干扰之二的后半条：
+        # 尾巴上的纯汇总数值行（``470  2485 …``）既没有姓名也没有学号，
+        # 以前会被"第一个非空单元格"兜底成一个人名。
+        # ★ 只在表里**确实有**学号/姓名列时才这么判：没有身份列的窄表
+        #   （``课程 | 学分 | 成绩``）本来就取不到标识，不能把它的行全判死。
+        if (
+            not summary_reason
+            and not student
+            and not student_id
+            and (id_columns or name_columns)
+        ):
+            summary_reason = "没有学号也没有姓名（纯汇总数值行）"
+
+        if summary_reason:
+            result.skipped_rows.append((r, summary_reason))
+            continue
+
         if not student:
             student = next(
                 (
@@ -863,14 +1064,6 @@ def parse_dataframe(df: pd.DataFrame) -> ParseResult:
             )
         if not student:
             student = f"<第{r + 1}行>"
-
-        # 学号：纵向累计的钥匙。学号列里的数字/长串原样保留为字符串。
-        student_id = ""
-        for c in id_columns:
-            text = _id_text(row.iloc[c])
-            if text:
-                student_id = text
-                break
 
         exam = ExamRow(row_index=r, student=student, student_id=student_id, scores={})
         bad_cells: list[tuple[int, str]] = []
@@ -903,6 +1096,10 @@ def parse_dataframe(df: pd.DataFrame) -> ParseResult:
                 if c not in meta_columns
                 and c not in score_columns
                 and c not in anchor_columns
+                # ★ v1.9：统计列已被排除出课程列，这里也必须一起排除 ——
+                #   否则统计列的汇总数值会掉进 leftovers，把**每一行**都
+                #   误报成"错位"（红线 10 的告警被稀释成噪音）。
+                and c not in stat_columns
             ]
             leftovers = [v for v in leftovers if v is not None]
             if leftovers or bad_cells:
@@ -922,6 +1119,16 @@ def parse_dataframe(df: pd.DataFrame) -> ParseResult:
             exam.warnings.append(f"课程 {names} 在本行重复记分，取高由计算器处理")
 
         result.rows.append(exam)
+
+    # ★ v1.9：跳过的行必须留痕。辅导员要能看见"程序替我扔掉了哪几行、
+    #   为什么扔" —— 静默吞行是红线 10 明令禁止的事。
+    if result.skipped_rows:
+        rows_text = "、".join(str(r + 1) for r, _ in result.skipped_rows)
+        reasons_text = "；".join(sorted({reason for _, reason in result.skipped_rows}))
+        result.warnings.append(
+            f"已跳过 {len(result.skipped_rows)} 行统计/汇总行（不是学生成绩）："
+            f"第 {rows_text} 行 —— {reasons_text}"
+        )
 
     if not result.rows:
         result.warnings.append("表头下没有找到任何学生行")

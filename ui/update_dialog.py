@@ -115,6 +115,11 @@ class UpdatePlan:
 def plan_from_release(check: UpdateCheck, release: Any = None) -> UpdatePlan:
     """把"检查结果 + release 记录"变成一份 :class:`UpdatePlan`。
 
+    v1.9 起**清单路线优先**：``check`` 里带了清单给的三件套
+    （:attr:`~core.updater.UpdateCheck.has_direct_link`）时，直链 / 体积 / 哈希
+    直接用它们，**不再解析正文**；否则退回解析 Release 正文
+    （``core.updater.parse_release_body``，已标 deprecated）。
+
     Args:
         check: :func:`core.updater.check_for_update` 的结果。
         release: Gitee release 记录（``latest_release()`` 的返回值）。
@@ -131,12 +136,22 @@ def plan_from_release(check: UpdateCheck, release: Any = None) -> UpdatePlan:
     sizes = dict(parsed.get("sizes") or {})
     checksums = dict(parsed.get("checksums") or {})
 
+    main_url = str(parsed.get("main") or "")
+    main_size = sizes.get("main") or DEFAULT_MAIN_SIZE
+    main_sha256 = checksums.get("main", "")
+
+    if check.has_direct_link:
+        # 清单路线：三个字段都是**结构化**给的，比正则抠正文靠谱
+        main_url = check.url
+        main_size = check.size_text or DEFAULT_MAIN_SIZE
+        main_sha256 = check.sha256
+
     return UpdatePlan(
         version=check.version or CURRENT_VERSION,
-        body=body,
-        main_url=str(parsed.get("main") or ""),
-        main_size=sizes.get("main") or DEFAULT_MAIN_SIZE,
-        main_sha256=checksums.get("main", ""),
+        body=body or check.notes,
+        main_url=main_url,
+        main_size=main_size,
+        main_sha256=main_sha256,
         models=catalog_from_release(body),
     )
 

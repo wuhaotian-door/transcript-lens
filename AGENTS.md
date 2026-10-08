@@ -218,25 +218,17 @@ Qt 会缓存效果的源 pixmap，页面淡入淡出**不会**每帧重新模糊
 
 ### 4k. ★★★ 窗口动画的 `finished` 回调里**不许销毁那个窗口** —— 会静默炸进程
 
-**这是本项目至今最严重、最会骗人的一个 bug。** 症状：
+**本项目最会骗人的一个 bug。** 症状：双击 exe → 开屏 → 打招呼 → **然后就没了**，
+界面不出来、点任务栏也没反应、**没有任何报错**（`--windowed` 连 stdout 都没有），
+退出码 `0xC0000409`（STATUS_STACK_BUFFER_OVERRUN）。
 
-> 双击 exe → 开屏 → 打招呼 → **然后就没了**。界面不出来，
-> 点任务栏也没反应。**没有任何报错**（`--windowed` 的 exe 连
-> stdout/stderr 都没有），退出码是 `0xC0000409`（STATUS_STACK_BUFFER_OVERRUN）。
+根因是两步 use-after-free：① 动画的 parent 就是它作用的那个窗口
+（`QPropertyAnimation(window, b"windowOpacity", window)`）；② 回调里把窗口最后一个
+Python 引用丢掉（`AppFlow.welcome = None`）→ 窗口当场析构 → 动画跟着没；
+③ Qt 发完 `finished` 之后 `QAbstractAnimationPrivate::setState` 还要继续用那个动画对象
+（注销统一计时器、处理 deleteWhenStopped）→ 踩空 → 进程直接消失。
 
-根因是一条两步的 use-after-free：
-
-1. 动画的 parent 就是它作用的那个窗口
-   （`QPropertyAnimation(window, b"windowOpacity", window)`）；
-2. 回调里把窗口的最后一个 Python 引用丢掉
-   （`AppFlow.welcome = None` / `AppFlow.login = None`）→ 窗口当场析构
-   → parent 在它上面的动画**跟着一起没**；
-3. 可 Qt 发完 `finished` 之后
-   **`QAbstractAnimationPrivate::setState` 还要继续用那个动画对象**
-   （注销统一计时器、处理 deleteWhenStopped）→ 踩空 → 进程直接消失。
-
-**光把清理槽排到前面是不够的**（试过，照样崩）。正确的写法是
-**让回调延后一拍**，等这一轮事件循环走完、动画彻底收工：
+**光把清理槽排到前面是不够的**（试过，照样崩）。正确写法是**让回调延后一拍**：
 
 ```python
 # ⛔ 同步回调：on_done 里一销毁窗口就踩空
@@ -247,42 +239,37 @@ anim.finished.connect(lambda: on_done())
 anim.finished.connect(lambda: QTimer.singleShot(0, window, on_done))
 ```
 
-同样地，`ui/anim.py` 的 `_drop` 必须是 `finished` 上的**第一个**槽，
-并且用 `shiboken6.isValid()` 判活之后再碰动画对象（见 `is_alive`）。
+`ui/anim.py` 的 `_drop` 必须是 `finished` 上的**第一个**槽，并且用 `shiboken6.isValid()`
+判活之后再碰动画对象（见 `is_alive`）。
 
-**为什么 400 多项测试一条都没抓到？** 因为那条路径**从来没被跑过** ——
-所有测试为省 1.5 秒一律 `skip_to_end()`，而这 bug 只在"欢迎页**真的**淡出"
-时才成立。所以现有两道闸门**都别再拆掉**：`%TEMP%\tl_boot_test.py`
-（`auto` / `login` / `switch` 三个真实时序，每个**单独进程**，退出码即断言）
-和 `transcript-lens.exe --bootcheck`（打包产物里的真启动流程写进
-`%TEMP%\transcript-lens-bootcheck.txt`）。`build_exe.ps1` 打完包**两个都跑**，
-非 0 直接判失败。
+**为什么 400 多项测试一条都没抓到？** 那条路径**从来没被跑过** —— 测试为省 1.5 秒
+一律 `skip_to_end()`，这 bug 只在"欢迎页**真的**淡出"时才成立。所以现有两道闸门
+**都别再拆掉**：`%TEMP%\tl_boot_test.py`（`auto` / `login` / `switch` 三个真实时序，
+每个**单独进程**，退出码即断言）和 `transcript-lens.exe --bootcheck`；
+`build_exe.ps1` 打完包**两个都跑**，非 0 直接判失败。
 
 **规矩**：任何"动画结束后销毁触发它的那个对象"的代码，回调必须延后一拍；
 并且**必须有测试真的把动画跑完**，不许 skip。
 
 ### 4l. ★★ 启动慢的两个真凶：`QSplashScreen` 和标题里的 emoji
 
-量完发现**跟动画时长、跟机器性能都无关**，是两笔一次性开销
-（`%TEMP%\tl_splash_probe.py` / `tl_perf_bench.py` 实测，
-对照组 `sleep(0.15)` 量到 150.3ms，校准正常）：
+实测（`%TEMP%\tl_splash_probe.py` / `tl_perf_bench.py`，带 `sleep(0.15)` 对照组校准）：
+**跟动画时长、跟机器性能都无关**，是两笔一次性开销 ——
 
-* **`QSplashScreen` 本身比 `QWidget` 慢 865ms**（`QWidget` 164~167ms vs
-  `QSplashScreen` 1028~1035ms；每个变体**单独起进程**测，排除"第一次创建原生窗口"
-  这笔一次性成本）。跟半透明 / 无边框 / 透明度**全都无关** ——
-  那 865ms 用户盯着全黑屏幕。`ui/splash.py` 已改成自绘 `QWidget`。
+* **`QSplashScreen` 比 `QWidget` 慢 865ms**（164~167ms vs 1028~1035ms；每个变体
+  单独起进程测，排除"第一次创建原生窗口"那笔）。跟半透明 / 无边框 / 透明度全无关。
+  `ui/splash.py` 已改成自绘 `QWidget`。
 * **开屏标题里的 📊 一个字 241.7ms**（去掉 emoji 只要 0.2ms）：emoji 要现场加载
-  Segoe UI Emoji 做彩色字形合成，是**启动链上最贵的单个字符**。已删。
-  > 只删开屏 pixmap 里的；侧栏 / 页面标题的 emoji 在**已映射好的窗口**里，不占启动时间。
-* 改完还剩 **765ms 全黑**，`tl_splash_trace.py` 打点定位到：开屏**先发 finished
-  再淡出**。现在**先叫下一个窗口、再淡出自己**（`ui/splash.py._start_fade_out`），
-  这段就落在开屏背后。
+  Segoe UI Emoji 做彩色字形合成。只删开屏 pixmap 里的；**已映射窗口**里的 emoji
+  （侧栏 / 页标题）不占启动时间。
+* 剩下 **765ms 全黑**缘于开屏**先发 finished 再淡出** —— 现在**先叫下一个窗口、
+  再淡出自己**（`ui/splash.py._start_fade_out`），量法见 `tl_splash_trace.py` 打点。
 
-**预热的三条规矩**（`AppFlow._prewarm_main` 把主窗提前建好并 `show()`，
-`MainWindow.__init__` 里已经 `setWindowOpacity(0.0)`，映射出来全透明、看不见）：
+**预热的三条规矩**（`AppFlow._prewarm_main` 提前建好主窗并 `show()`，
+`MainWindow.__init__` 已 `setWindowOpacity(0.0)`，映射出来全透明、看不见）：
 
 ★ **不能在 `run()` 之后紧接着预热** —— `run()` 只是把淡入动画 start 出去，那一刻
-窗口还一帧都没画；跑 600ms 同步工作会把**淡入动画冻在第一帧**，用户看到"点了没反应"。
+窗口还一帧没画；跑 600ms 同步工作会把**淡入动画冻在第一帧**，用户看到"点了没反应"。
 所以挂在 `on_shown` 上。
 ★ 停留时间要**扣掉**预热耗时（`HOLD_MS - spent`）。第一版"干完活再计时"，
 欢迎页实际停留 `HOLD_MS + 600ms` —— 白等 600ms。
@@ -441,28 +428,16 @@ Start-Sleep -Seconds 3      # 句柄释放有延迟，马上重试可能还是�
 
 ### 10b. ★ 为什么是**互斥三档**，而不是三个可自由勾选的类别
 
-旧 charter 6.4 当年写的是（现在记在总纲 §1.3）"三个独立 Toggle：必修 / 限选 / 选修，可多选组合"。
-**按字面做成任意组合是做不到的**，理由是硬的：
-
-* 能算出什么数由 `CalculationScope` 决定，而它在 `core/calculator.py` 里、
-  **铁律一冻结**，只有三个成员（①全部 ②必修+限选 ③仅必修）。
-  `{限选}`、`{选修}`、`{限选,选修}` 这些组合**没有对应的口径**。
-* 要支持它们，只有两条路：改 `core/calculator.py`（违反铁律一），
-  或者在界面里自己乘一遍加权（违反铁律五"不发明未定义规则"＋
-  "本页只做格式化，不做任何二次算术"）。
-
-所以界面保留**互斥三档**，但把"这一档到底算了哪几类"写在明面上，
-让总纲 §一 那条纠正**在界面上看得见**：
-
-| 位置 | 内容 | 真源 |
-|---|---|---|
-| 按钮气泡 | `计入：必修＋限选（选修不计入）` | `scope_breakdown()` 读 `CalculationScope.categories` |
-| 状态行 | `当前口径「必修+限选」（必修＋限选（选修不计入））` | 同上 |
-| 表下常驻说明 | `CALC_SCOPE_NOTE` | 常量 |
-
+旧 charter 6.4 当年写的是（现在记在总纲 §1.3）"三个独立 Toggle：必修 / 限选 /
+选修，可多选组合"。**按字面做成任意组合是做不到的**：能算出什么数由
+`CalculationScope` 决定（`core/calculator.py`，**铁律一冻结**，只有①全部
+②必修+限选 ③仅必修三个成员），`{限选}`、`{选修}`、`{限选,选修}` **没有对应口径**；
+要支持它们只能改封板文件（违反铁律一）或在界面里自己乘一遍加权（违反铁律五）。
+所以界面保留**互斥三档**，但把"这一档算了哪几类"写在明面上，让总纲 §一 那条纠正
+**在界面上看得见**：按钮气泡与状态行走 `scope_breakdown()`（读
+`CalculationScope.categories`），表下常驻说明用 `CALC_SCOPE_NOTE`。
 ★ 上一版文档把"选修"写成"归限选"却没人发现，根因就是**按钮上只写"全部"**，
-没人知道"全部"含不含选修。现在任何一个位置都能一眼看出来。
-行为门见 `main._category_policy_report()`（第 19 节）。
+没人知道"全部"含不含选修；现在任何一个位置都能一眼看出来。行为门见第 19 节。
 
 ## 11. 切页锁的看门狗必须**把页面落到位**，不是只放锁
 
@@ -536,12 +511,6 @@ self._stack.setCurrentIndex(self._pending); clear_effect(...); self._land(...)
 `_updater_policy_lines()` 里那条"import 期零网络"
 （把 `urlopen` 换成炸弹再重新 import 一遍模块，见第 21 节）。
 
-### ❌ 禁止
-
-自动更新检查 · 静默下载 · telemetry / 埋点 / 崩溃上报 ·
-任何形式的「输码解锁 / 联网校验用户资格」 ·
-拿 `requests` / `httpx` 干**非** SMTP、**非**用户主动下载/AI 的事。
-
 ### selfcheck 怎么守（`main._network_policy_report`）
 
 ★ **守卫要落在行为上，不能落在"这个包在不在"上。** 原来那条
@@ -565,13 +534,12 @@ self._stack.setCurrentIndex(self._pending); clear_effect(...); self._land(...)
 
     final = 智育加权(口径① 全口径) × 0.7 + 德育分 × 0.3
 
-* 班级内按 final 降序；前 X 名一等、接下来 Y 名二等、再接下来 Z 名三等
+* 班级内按 final 降序；前 X / 接下来 Y / 再 Z 名分一、二、三等
   （X/Y/Z **每班独立配置**，存 `class_{班级号}_quota.json.enc`）；
 * **特等奖**：final 进入前 X 名 **且** 每门科目原始成绩 ≥ 90。
   **不占名额**（拿特等的人从名额池里移出去、后面的人往前补）；
   **默认不叠加**，勾了"允许叠加"就显示成 `特等+一等`（统计时**两边都数**）。
-* 输出列：`排名 | 姓名 | 学号 | 智育分 | 德育分 | 最终成绩 | 奖项 | 备注`；
-  着色 一等金 `#FEF3C7` / 二等银 `#E5E7EB` / 三等铜 `#FFEDD5` / 特等紫 `#F3E8FF`。
+* 输出列、四种奖的配色、名额与特等的完整口径 → **总纲 §9.1-§9.4**，这里不重复。
 
 ★ **德育分没录 ≠ 0 分**（红线 2 的同一条道理）。没录的人按 0 参与测算，
 但**必须在备注里写明**"德育分未录入，按 0 计" —— 不写的话辅导员会以为
@@ -579,8 +547,8 @@ self._stack.setCurrentIndex(self._pending); clear_effect(...); self._land(...)
 
 ★ **`core/scholarship.py` 里一行加权算术都没有。** 智育分是导入时
 `core.calculator` 用口径①算好、存进 `class_{班级号}.json.enc` 的；
-这里只做"乘 0.7 / 加 德育×0.3 / 排序 / 截名额"。那几步是**奖项规则**的算术，
-总纲 §9.1 明确给了公式，不算"自己发明算术"。
+这里只做"乘 0.7 / 加 德育×0.3 / 排序 / 截名额" —— 那几步是**奖项规则**的算术，
+总纲 §9.1 给了公式，不算"自己发明算术"。**除此之外不许再加算术。**
 
 ★ 特等奖的"每门 ≥90"只检查**这个学生真考了的课**（`score is not None`）：
 没选的课不参与判定，**不会**被当成 0 分拖累他；缺考（数字 0）**算考了**，
@@ -621,13 +589,8 @@ self._stack.setCurrentIndex(self._pending); clear_effect(...); self._land(...)
 **文字的光栅化方式不一样**（没有 ClearType，字形次像素取整也不同）。
 动画跑完、效果一摘，整页**重新光栅化一遍**，所有字都换了个画法。
 
-量法（`%TEMP%\tl_clean_probe.py`，带对照组校准 —— 把名单换成 1 个人时
-差异必须明显出现，证明方法有灵敏度）：
-
-| 对比 | 结果 |
-|---|---|
-| 挂着效果 @1.0 vs 摘掉效果 | **17.4% 的像素不同**，最大通道差 **240** |
-| 同一坐标 | 一个版本是深色字 `#0f173b`，另一个是纯白 `#ffffff` |
+量法 `%TEMP%\tl_clean_probe.py`（带对照组校准）：挂着效果 @1.0 vs 摘掉效果
+**17.4% 的像素不同**、最大通道差 **240**；同一坐标一边 `#0f173b`、一边 `#ffffff` |
 
 **修法**：页面**永远不挂效果**。要淡入的改成盖在上面的一层**纯色幕布**淡出
 （`ui/anim.py` 的 `_PageCover` + `StackSwitcher._after_out`）：
@@ -772,12 +735,9 @@ self._archive = build_archive(
 所以只打 `latest` 的话，在发布第一个发行版之前这功能永远只能报"检查失败"，
 而那不是实话。`check_for_update()` 因此有四种状态，界面对每种说不同的话：
 
-| status | 界面上的话 | 含义 |
-|---|---|---|
-| `newer` | 弹窗"发现新版本 vX，是否前往下载？" | 真有新的 |
-| `current` | "当前已是最新版本 (v1.7)" | 比过了，一样或更旧 |
-| `no-release` | "…仓库里还没有发布任何发行版" | **接口通了**，只是没东西可下 |
-| `error` | "检查失败，请手动访问仓库" | 真连不上 |
+四种状态：`newer`（弹窗"发现新版本 vX，是否前往下载？"）、`current`（"当前已是
+最新版本"）、`no-release`（"…还没有发布任何发行版"，即**接口通了**、只是没东西可下）、
+`error`（"检查失败，请手动访问仓库"）。
 
 ★ **`check_latest_version()` 的契约一个字没改**（总纲 §六 指定的那个）：
 成功给版本号字符串，失败给 `None`。要分状态用 `check_for_update()`。
@@ -835,12 +795,9 @@ v1.7 时这里写的是"绝不自动下载、绝不自动替换，只打开浏�
 * 键：**两个键同时写**（`core.version.VAULT_VERSION_KEYS`）：
   `__vault_version__`（总纲 §12.3 的值）和 `vault_version`
   （任务书 2.1 / 旧 v1.8 charter §1.1 两次给的值）。**读取时哪个有值认哪个。**
-  * 为什么写两份：这件事在文档之间**对不上**，而让实现去猜哪边赢的风险是
-    **某次真迁移把标记写到一个启动检测读不到的键上** —— 那正是版本保护
-    唯一要防的事。写两份的成本是两个 JSON 字段，收益是"谁读都对"。
-  * 唯一写入点是 `core.version.stamp_vault_version()`，
-    所以"两个键打架"这种状态从写入这一侧就不可能产生。
-    `--selfcheck` 里断言两个键都在且相等。
+  * 为什么写两份：键名在两份文档之间**对不上**，让实现去猜哪边赢的风险是"某次
+    真迁移把标记写到一个启动检测读不到的键上"。成本是两个 JSON 字段，收益是"谁读都对"。
+    唯一写入点是 `core.version.stamp_vault_version()`，`--selfcheck` 断言两键都在且相等。
 * 位置：`users.json` 顶层，跟着 `UserIndex` 走 —— 因为 `save_users()`
   每次都从 `UserIndex.to_dict()` 重写整个文件，标记**不挂在 UserIndex 上
   就会被下一次写盘悄悄抹掉**。
@@ -974,12 +931,8 @@ v1.7 → v1.8 时实测踩到（`--selfcheck` 的迁移检查当场 FAIL，拦�
 
 ### 25a. `core/parser.py` 把「专业选修」归到限选
 
-冻结的 `CATEGORY_KEYWORDS` 里，`"专业选修"` 同时命中限选和选修的关键字，
-打平时按 `必修 > 限选 > 选修` 取先出现的 → 归**限选**。
-
-* 这是**校名别名**（多数培养方案里"专业选修课"就是限选课）；
-* `parser.py` 铁律一封板，**一个字符都不许动**；
-* 真要改是 Owner 的事。详见第 19 节。
+校名别名（多数培养方案里"专业选修课"就是限选课），parser 铁律一封板、**一个字符
+都不许动**；真要改是 Owner 的事。判据与理由见**第 19 节末**。
 
 ### 25b. ★ 分数 > 100 会**静默掉出加权分母**，但仍留在 `course_scores` 里
 
@@ -1186,3 +1139,36 @@ AST 源码层 / `CHECK_MODULES` 接线层）+ `%TEMP%\tl_qt_drive.py`（运行�
 
 ★ 用 `ast` 而不是 grep `activ`：`ui/pages/scholarship_page.py` 里有 openpyxl 的
 `book.active`，一刀切地搜必然误报 —— **误报的闸门最后一定会被关掉**。
+
+## 31. ★ 模型中心（v1.9 新增）
+
+`core/ai/model_registry.py`（**零 Qt、零 HTTP import** —— 字节流借
+`core.updater.download_exe`，照第 28 节的模式）+ `ui/model_center_dialog.py`。
+
+* 清单是 Gitee raw `update/ai_models.json`：**读不到只是警告，界面照开**
+  （给"复制链接手动下载"兜底）；默认勾选 = `defaultCheck` 为真**且**内存够。
+* ★ **内存闸门不许放行**：`minRamGb` 写成 `"8GB"` 要认得出；认不出必须给中文警告，
+  **不能退化成 0**（见 `need <= 0` 就放行等于没闸门）。内存不够的行 `flags` 里
+  **没有 `ItemIsEnabled`** —— 整行不可选，不只是不勾。
+* ★ **装没装好以磁盘为准**：`installed.json` 只是账本，`merged_with_local()` 让磁盘上
+  真有的 `.gguf` 优先。写账本的门：`size` 差在 `SIZE_TOLERANCE`（0.01，下限 4096
+  字节）以内**且** sha256 对得上。绝不自动下载；失败重试 1 次 → 标红 + 复制链接。
+* 判据：`tests/test_model_registry.py`（109 用例）+ `%TEMP%\tl_v19_ui_test.py`
+  （假 `fetch_model_list` / `merged_with_local` / `download_exe`，量像素）。
+
+## 32. ★ 批量导入德育分（v1.9 新增）
+
+`core/import_workers.py`（**零 Qt import**，pytest 可直接测）+
+`ui/moral_import_dialog.py`（预览）+ `ui/pages/scholarship_page.py`（按钮与流程）。
+
+* 三步：后台 `plan_import()`（**只读不写库**）→ 主线程预览 → 后台 `apply_plan()`；
+  **取消 = 一个字节都不写**。
+* 坏行**不中断整批**：`errors` 收全 → `export/import_errors_<batch_id>.csv`
+  （utf-8-sig，无错不建文件）；成功行按 `sid:<学号>` 追加，批次账本写
+  `moral_batches.json.enc` —— ★ **应用级载荷只收 `.enc`**，写成 `.json` 会被
+  `save_encrypted` 当场拒绝。
+* ★ 班级必须**已经建过**（`raw_class not in known` 就报错，一个班都没建过也要报）——
+  否则德育分写进没有名单的班：数据进去了，界面上一个人也看不到。
+* ★ `ImportPlan.failures` / `skipped` / `classes` 是 **property 不是方法**。
+* 判据：`tests/test_import.py`（40 用例）+ `%TEMP%\tl_v19_ui_test.py`；探针
+  **必须桩掉 `QMessageBox.information`**（模态弹窗会把 120 秒看门狗跑满）。

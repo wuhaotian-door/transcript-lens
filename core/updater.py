@@ -55,6 +55,26 @@
 :func:`download_exe` 全程只往 ``<dest>.part`` 里写，**成功之后才** ``replace``
 成目标文件。所以"下载到一半断网/取消"永远不会留下一个半截的 exe
 去覆盖用户手里那个好的 —— 这是任务书 2.4 的硬约束"下载失败不损坏已有 exe"。
+
+★ v1.9：版本号和直链改从 ``update/manifest.json`` 读
+------------------------------------------------
+
+v1.8 及之前，"最新版本号"只能从 Gitee 发行版的 ``tag_name`` 猜，"主程序直链 /
+体积 / sha256"只能在发行版**正文**里用正则抠（:func:`parse_release_body`）。
+正文是给人看的散文，正则抠它等于把发版人的写作习惯当接口 —— 少写一个冒号、
+把直链换成网盘页面，更新功能就哑了。
+
+v1.9 起换成一份**结构化的清单**：``update/manifest.json``（仓库里那份就是模板），
+:func:`check_for_update` 先读它，拿到 ``app`` 段的 ``version / url / size / sha256``。
+
+* 清单里 **version 比当前新** → :data:`STATUS_NEWER`，并把直链一并带出来，
+  更新向导不必再解析正文；
+* 清单缺失 / 404 / 读不懂 / **三样关键字段缺任何一样** → 退回老路子
+  （读发行版正文），一条都不改老代码的行为。宁可退回老路子，
+  **也绝不拿一条没校验的直链去替换用户的程序**（见 :meth:`ManifestApp.usable`）。
+
+老路子的 :func:`parse_release_body` 与 :func:`latest_release` **保留不删**，
+但已经标成 deprecated：只在清单不可用时兜底，新发版方式请写清单。
 """
 
 from __future__ import annotations
@@ -79,10 +99,15 @@ __all__ = [
     "DownloadCancelled",
     "DownloadError",
     "GITEE_API",
+    "GITEE_RAW_MANIFEST",
     "GITEE_RELEASES_API",
     "GITEE_RELEASES_PAGE",
+    "MANIFEST_SCHEMA",
     "MIN_EXE_BYTES",
+    "ManifestApp",
     "NO_RELEASE",
+    "SOURCE_MANIFEST",
+    "SOURCE_RELEASE",
     "STATUS_CURRENT",
     "STATUS_ERROR",
     "STATUS_NEWER",
@@ -91,11 +116,31 @@ __all__ = [
     "check_for_update",
     "check_latest_version",
     "download_exe",
+    "fetch_manifest",
+    "human_size",
     "latest_release",
     "normalize_sha256",
+    "parse_manifest",
     "parse_release_body",
     "verify_checksum",
 ]
+
+#: 更新清单（v1.9 新增）。发版的人把版本号 / 主程序直链 / 体积 / sha256 写在这里。
+#:
+#: ★ 用的是 Gitee 的 **raw** 地址而不是 API：清单是仓库里的一个普通文件，
+#:   不需要 token，也没有"还没发过版就 404"那套麻烦（那是发行版接口的脾气）。
+#:   raw 的代价是有缓存，刚推上去可能要等一会儿才刷出来 —— 所以本模块
+#:   永远保留"清单读不到就退回发行版正文"的兜底。
+GITEE_RAW_MANIFEST = (
+    "https://gitee.com/wuhaotiansystem/transcript-lens/raw/master/update/manifest.json"
+)
+
+#: 清单格式版本。不认识的版本一律当"读不懂"处理（退回老路子），**不猜**。
+MANIFEST_SCHEMA = 1
+
+#: :class:`UpdateCheck.source` 的取值：这次信息是从哪儿来的。
+SOURCE_MANIFEST = "manifest"   #: v1.9 的清单
+SOURCE_RELEASE = "release"     #: 老的发行版正文（deprecated，仅兜底）
 
 #: Gitee 的"最新发行版"接口（charter 7.2）。只读 GET，不需要 token。
 GITEE_API = (
@@ -157,6 +202,157 @@ class DownloadError(RuntimeError):
     """
 
 
+# ---------------------------------------------------------------------------
+# 更新清单 update/manifest.json（v1.9 新增，替代解析发行版正文）
+# ---------------------------------------------------------------------------
+
+
+def _positive_int(value: Any) -> int:
+    """把 JSON 里的数字读成 ``>= 0`` 的 int。**认不出来就是 0，不抛异常。**
+
+    ``bool`` 要单独挡掉 —— Python 里 ``True`` 也是 ``int``，不挡的话
+    ``"size": true`` 会变成 1 字节，然后下载校验拿 1 去比 228MB。
+    """
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float) and value == value and value > 0:
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip().replace(",", "").replace("_", "")
+        if text.isdigit():
+            return int(text)
+    return 0
+
+
+def human_size(size: Any) -> str:
+    """把字节数写成人话（``"223.5 MB"`` / ``"1.07 GB"``）；取不到就给空串。
+
+    更新向导里"主程序（223.5 MB）"这句话用的就是它。
+    1024 进制，B 不带小数。
+    """
+    try:
+        value = float(size)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0:
+        return ""
+    if value >= 1024**3:
+        return f"{value / 1024**3:.2f} GB"
+    if value >= 1024**2:
+        return f"{value / 1024**2:.1f} MB"
+    if value >= 1024:
+        return f"{value / 1024:.1f} KB"
+    return f"{int(value)} B"
+
+
+@dataclass(frozen=True)
+class ManifestApp:
+    """``update/manifest.json`` 里 ``app`` 段的内容。
+
+    ==============  =======================================================
+    字段             说明
+    ==============  =======================================================
+    ``version``     这次发布的版本号（``"1.9"``）
+    ``url``         主程序 exe 的直链
+    ``size``        字节数（``0`` = 清单里没写）
+    ``sha256``      小写 64 位十六进制（空串 = 清单里没写）
+    ``notes``       发版说明（纯文本，**不许写 Markdown** —— 总纲 §三 铁律 9）
+    ``published``   发布日期文字，只用于显示
+    ==============  =======================================================
+    """
+
+    version: str = ""
+    url: str = ""
+    size: int = 0
+    sha256: str = ""
+    notes: str = ""
+    published: str = ""
+
+    @property
+    def usable(self) -> bool:
+        """够不够格拿来**自动更新**：直链、体积、哈希三样缺一不可。
+
+        ★ 少任何一样都宁可退回老路子。拿一个"不知道多大、也没法校验"的文件
+          去覆盖用户手里的程序，不是勇敢，是不负责任。
+        """
+        return bool(self.url) and self.size > 0 and bool(self.sha256)
+
+    @property
+    def size_text(self) -> str:
+        """给人看的体积（``"223.5 MB"``）；没写体积时给空串。"""
+        return human_size(self.size)
+
+
+def parse_manifest(payload: Any) -> tuple[ManifestApp | None, str]:
+    """解析一份清单。**永不抛异常**，返回 ``(app, 说明)``。
+
+    三种可能的返回：
+
+    * ``(None, 原因)`` —— 压根没解析出 app（不是 JSON 对象 / 没有 app 段 /
+      读不出版本号 / ``schema`` 是本程序不认识的版本）；
+    * ``(app, 原因)`` —— app 解析出来了但**不完整**（缺 url / size / sha256），
+      调用方必须看 :meth:`ManifestApp.usable` 再决定用不用；
+    * ``(app, "")`` —— 完整可用。
+
+    ``schema`` 的处理是**不猜**：写了别的版本号就当读不懂，
+    免得以后改了格式，老程序拿新清单瞎解析出一堆错值。
+    """
+    if not isinstance(payload, dict):
+        return None, "清单不是一个 JSON 对象"
+    schema = payload.get("schema")
+    if schema is not None and schema != MANIFEST_SCHEMA:
+        return None, f"清单格式版本是 {schema!r}，本程序只认 {MANIFEST_SCHEMA}"
+    app = payload.get("app")
+    if not isinstance(app, dict):
+        return None, "清单里没有 app 段"
+    # 版本号两种写法都认：写在 ``app`` 里（"这次发布的程序是哪个版本"），
+    # 或写在顶层（"这份清单描述哪个版本"）。发版的人两种都会写，没必要挑。
+    version = normalize_version(app.get("version")) or normalize_version(
+        payload.get("version")
+    )
+    if not version:
+        return None, "清单里没有可识别的版本号"
+    # 发版说明同理：优先 app.notes，其次顶层 notes。
+    notes = str(app.get("notes") or payload.get("notes") or "").strip()
+
+    manifest = ManifestApp(
+        version=version,
+        url=str(app.get("url") or "").strip(),
+        size=_positive_int(app.get("size")),
+        sha256=normalize_sha256(app.get("sha256")),
+        notes=notes,
+        published=str(payload.get("published") or "").strip(),
+    )
+    if not manifest.usable:
+        return manifest, "清单里 app.url / app.size / app.sha256 没写全"
+    return manifest, ""
+
+
+def fetch_manifest(
+    url: str = GITEE_RAW_MANIFEST, timeout: float = DEFAULT_TIMEOUT
+) -> tuple[ManifestApp | None, str]:
+    """GET 一次清单。**永不抛异常**，返回 ``(app, 说明)``。
+
+    说明的三种常见情况（都**不是故障**，只是"退回老路子"）：
+
+    * ``404`` —— 仓库里还没有 ``update/manifest.json``；
+    * 连不上 / 超时 —— 断网，或者 Gitee 抽风；
+    * 拿到了但不是合法 JSON —— 多半被网关换成了 HTML 错误页。
+    """
+    status, payload = _get_json(url, timeout)
+    if status is None:
+        return None, "连不上服务器（断网或 Gitee 抽风）"
+    if status == 404:
+        return None, "远端还没有 update/manifest.json（404 不是故障）"
+    if status != 200:
+        return None, f"服务器返回 HTTP {status}"
+    if payload is None:
+        return None, "清单不是合法 JSON（可能被网关换成了 HTML 错误页）"
+    return parse_manifest(payload)
+
+
 @dataclass(frozen=True)
 class UpdateCheck:
     """一次更新检查的结果。
@@ -175,12 +371,22 @@ class UpdateCheck:
     "主程序直链 / 各 AI 模块直链 / sha256 / 体积"（:func:`parse_release_body`）。
     ★ 只有 :data:`STATUS_NEWER` 时才会填 —— 没有新版本就没必要
       把整段描述带着满世界传。
+
+    ``url`` / ``size`` / ``sha256`` / ``notes`` 是**清单路线**带出来的直链信息
+    （v1.9 新增）。走了清单时 ``body`` 是空串，更新向导直接用这三个字段，
+    不用再解析正文。``source`` 说明这次信息是从哪儿来的
+    （:data:`SOURCE_MANIFEST` / :data:`SOURCE_RELEASE`），给日志和测试看。
     """
 
     status: str
     version: str = ""
     detail: str = ""
     body: str = ""
+    url: str = ""
+    size: int = 0
+    sha256: str = ""
+    notes: str = ""
+    source: str = ""
 
     @property
     def reachable(self) -> bool:
@@ -190,6 +396,19 @@ class UpdateCheck:
     @property
     def has_newer(self) -> bool:
         return self.status == STATUS_NEWER
+
+    @property
+    def has_direct_link(self) -> bool:
+        """带出了**能校验**的直链（三样齐全），可以走自动下载。
+
+        ★ 少一样就 ``False`` —— 界面这时只能给"打开浏览器自己下"。
+        """
+        return bool(self.url) and self.size > 0 and bool(self.sha256)
+
+    @property
+    def size_text(self) -> str:
+        """清单给的主程序体积（``"223.5 MB"``）；没带直链体积时给空串。"""
+        return human_size(self.size)
 
 
 def _get_json(url: str, timeout: float) -> tuple[int | None, Any]:
@@ -236,6 +455,9 @@ def _version_from_release(release: Any) -> str:
 def latest_release(timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any] | None:
     """拿一条 release 记录（``latest`` 拿不到就退一步读列表）。
 
+    ★ **deprecated（v1.9 起）**：版本号与直链请走 ``update/manifest.json``
+      （:func:`fetch_manifest`）。本函数只在清单不可用时兜底。
+
     **任何异常都返回 ``None``**，绝不往外抛 —— 调用方是设置页的一个按钮，
     用户点一下不该看到 traceback（charter 7.2："超时/失败返回 None，不弹错"）。
 
@@ -270,7 +492,10 @@ def check_latest_version(timeout: float = DEFAULT_TIMEOUT) -> str | None:
 
 
 def check_for_update(
-    timeout: float = DEFAULT_TIMEOUT, *, current: str = CURRENT_VERSION
+    timeout: float = DEFAULT_TIMEOUT,
+    *,
+    current: str = CURRENT_VERSION,
+    manifest_url: str = GITEE_RAW_MANIFEST,
 ) -> UpdateCheck:
     """一次完整的更新检查，带**能说清楚**的状态。
 
@@ -278,12 +503,71 @@ def check_for_update(
     "接口通了但仓库里一个发行版都没有"和"根本没连上"必须给用户
     不同的话 —— 前者不是故障，说成"检查失败"是撒谎。
 
+    v1.9 的顺序是**先清单、后正文**：
+
+    1. 读 ``update/manifest.json``（:func:`fetch_manifest`）。拿到一份
+       :meth:`ManifestApp.usable` 的清单就照它给结果 ——
+       版本号来自 ``app.version``，直链/体积/哈希一并带回去；
+    2. 清单拿不到、读不懂、**或者三样关键字段没写全** → 退回老的发行版路线
+       （:func:`_check_from_release`，deprecated）。**行为与 v1.8 完全一致**，
+       所以清单还没发布的那段时间，这个功能不会退化。
+
     Args:
         timeout: 秒。
         current: 拿来比的当前版本（测试用；默认 :data:`core.version.CURRENT_VERSION`）。
+        manifest_url: 清单地址（测试用）。
 
     Returns:
         :class:`UpdateCheck`。
+    """
+    app, _problem = fetch_manifest(manifest_url, timeout)
+    if app is not None and app.usable:
+        return _from_manifest(app, current)
+    return _check_from_release(timeout, current)
+
+
+def _from_manifest(app: ManifestApp, current: str) -> UpdateCheck:
+    """清单路线：版本号 / 直链 / 体积 / 哈希全部来自 ``update/manifest.json``。
+
+    三种版本关系的话术与老路线**逐字一致**（"发现新版本"、
+    "已是最新"、"清单上写的比本机旧"），免得用户在不同路线上看到两套说法。
+    """
+    if is_newer(app.version, current):
+        return UpdateCheck(
+            status=STATUS_NEWER,
+            version=app.version,
+            detail=f"发现新版本 v{app.version}（当前 v{current}）。",
+            url=app.url,
+            size=app.size,
+            sha256=app.sha256,
+            notes=app.notes,
+            source=SOURCE_MANIFEST,
+        )
+    if compare_versions(app.version, current) < 0:
+        # 清单上的版本比本机还旧（比如发版人忘了更新清单）——
+        # 不劝人降级，但也别装作"已是最新"，把这句实话说出来。
+        return UpdateCheck(
+            status=STATUS_CURRENT,
+            version=app.version,
+            detail=(
+                f"当前已是最新版本 (v{current})。"
+                f"清单上写的是 v{app.version}，比本机旧。"
+            ),
+            source=SOURCE_MANIFEST,
+        )
+    return UpdateCheck(
+        status=STATUS_CURRENT,
+        version=app.version,
+        detail=f"当前已是最新版本 (v{current})。",
+        source=SOURCE_MANIFEST,
+    )
+
+
+def _check_from_release(timeout: float, current: str) -> UpdateCheck:
+    """**deprecated**：v1.8 及之前的老路子 —— 从 Gitee 发行版抠版本号和正文。
+
+    ★ 保留不删（任务书要求），但只在清单不可用时兜底。
+      新发版方式请写 ``update/manifest.json``，别再依赖正文正则。
     """
     latest_status, latest_data = _get_json(GITEE_API, timeout)
     version = ""
@@ -300,6 +584,7 @@ def check_for_update(
                 # ★ **列表空**才叫"没有发行版"
                 return UpdateCheck(
                     status=NO_RELEASE,
+                    source=SOURCE_RELEASE,
                     detail=(
                         f"当前已是最新版本 (v{current}) —— "
                         "仓库里还没有发布任何发行版，暂时没有可下载的新版本。"
@@ -317,6 +602,7 @@ def check_for_update(
                 #   而仓库里明明挂着东西 —— 那是句假话。
                 return UpdateCheck(
                     status=STATUS_ERROR,
+                    source=SOURCE_RELEASE,
                     detail=(
                         "检查失败：仓库里有发行版，但读不出可识别的版本号。"
                         "请手动访问仓库查看。"
@@ -325,12 +611,14 @@ def check_for_update(
         else:
             return UpdateCheck(
                 status=STATUS_ERROR,
+                source=SOURCE_RELEASE,
                 detail="检查失败：连不上 Gitee。请手动访问仓库查看是否有新版本。",
             )
 
     if not version:  # pragma: no cover - 上面两条分支已经覆盖
         return UpdateCheck(
             status=STATUS_ERROR,
+            source=SOURCE_RELEASE,
             detail="检查失败：接口返回里读不出可识别的版本号。请手动访问仓库。",
         )
 
@@ -343,6 +631,7 @@ def check_for_update(
             version=version,
             detail=f"发现新版本 v{version}（当前 v{current}）。",
             body=body,
+            source=SOURCE_RELEASE,
         )
 
     relation = compare_versions(version, current)
@@ -352,6 +641,7 @@ def check_for_update(
         return UpdateCheck(
             status=STATUS_CURRENT,
             version=version,
+            source=SOURCE_RELEASE,
             detail=(
                 f"当前已是最新版本 (v{current})。"
                 f"仓库上最新的一条发行版是 v{version}，比本机旧。"
@@ -360,6 +650,7 @@ def check_for_update(
     return UpdateCheck(
         status=STATUS_CURRENT,
         version=version,
+        source=SOURCE_RELEASE,
         detail=f"当前已是最新版本 (v{current})。",
     )
 
@@ -406,6 +697,10 @@ def _strip_markup(line: str) -> str:
 
 def parse_release_body(body: Any) -> dict[str, Any]:
     """从 Release 描述里解析出下载链接（任务书 2.1）。
+
+    ★ **deprecated（v1.9 起）**：新发版方式是在 ``update/manifest.json`` 里
+      写结构化字段（:func:`parse_manifest`），不用再让程序拿正则去抠散文。
+      本函数**保留不删**，只在清单不可用时兜底（见 :func:`check_for_update`）。
 
     约定格式（``docs/DISTRIBUTION.md`` 的发版 SOP 里写的就是这个）::
 

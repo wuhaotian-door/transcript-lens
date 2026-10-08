@@ -87,6 +87,8 @@ CHECK_MODULES: tuple[str, ...] = (
     "ui.recover_dialog",
     "ui.login_window",
     "ui.main_window",
+    "ui.moral_import_dialog",
+    "ui.model_center_dialog",
     "ui.pages",
     "ui.pages.analysis_page",
     "ui.pages.profile_page",
@@ -101,10 +103,12 @@ CHECK_MODULES: tuple[str, ...] = (
     "core.archival",
     "core.crypto_store",
     "core.user_store",
+    "core.import_workers",
     "core.scholarship",
     "core.ai",
     "core.ai.local_assistant",
     "core.ai.cloud_adapter",
+    "core.ai.model_registry",
     "core.email_recovery",
     "core.recovery",
     "core.library",
@@ -870,12 +874,20 @@ def _updater_policy_lines() -> list[str]:
 #: ★ 要改这些文件（比如 Owner 决定解冻 calculator）→ **同时更新这里的哈希**。
 #:   那个动作必须是**有意的**：它不是"顺手改一下让它绿"，
 #:   而是"我们决定解冻铁律 1"。改哈希这件事本身就是审批记录。
+#:
+#: ★ v1.9 解冻记录（**唯一一次，只动了 parser.py**）：
+#:   Owner 明确要求修「成绩导入解析器把统计列（不及格门数/平均分/总分/
+#:   平均学分绩点/排名）、末尾汇总行（37人/不及格）、顶部合并单元格大标题
+#:   当成学生成绩」的 Bug —— 这个 Bug 的修复点就在 ``core/parser.py``
+#:   里（课程列判据 + 数据行判据），绕不开。
+#:   所以按上面这条规矩**有意解冻 parser.py 一个文件**，并在此更新哈希；
+#:   calculator / validator / tests/test_calc.py 三个仍然逐字节原封不动。
 FROZEN_FILE_SHA256: dict[str, str] = {
     "core/calculator.py": (
         "44dc25e1b796476c748a6327201c03c50e7722cf9d7167389bf21e112899be60"
     ),
     "core/parser.py": (
-        "d246bf5c373f0960ace2c140c8b2cce8aaacfac144cc25542ef2e07e6a6056cc"
+        "14ab62ab2b6fdcdd6cff6c59427263f940c0cbee6c02691b80788a4cde31e450"
     ),
     "core/validator.py": (
         "a6241d5b9db84df10b5bafb04d0d8e6d1dc9fada8f4a8d967ac0277a57782a40"

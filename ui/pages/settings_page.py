@@ -50,6 +50,7 @@ from core.updater import (
     check_for_update,
 )
 from ui.anim import make_card
+from ui.model_center_dialog import open_model_center
 from ui.update_dialog import (
     ModuleChoiceDialog,
     ask_restart,
@@ -300,6 +301,16 @@ class SettingsPage(QWidget):
         box.addWidget(self._models_list)
 
         model_row = QHBoxLayout()
+        self._model_center_btn = QPushButton("模型中心")
+        self._model_center_btn.setObjectName("Ghost")
+        self._model_center_btn.setMinimumHeight(36)
+        self._model_center_btn.setMinimumWidth(110)
+        self._model_center_btn.setToolTip(
+            "看远端清单，勾选要装的模型，一个个下（绝不自作主张下载）"
+        )
+        self._model_center_btn.clicked.connect(self._do_open_model_center)
+        model_row.addWidget(self._model_center_btn)
+
         self._model_download_btn = QPushButton("下载新模型")
         self._model_download_btn.setObjectName("Ghost")
         self._model_download_btn.setMinimumHeight(36)
@@ -356,6 +367,29 @@ class SettingsPage(QWidget):
             parts.append(f"· {info.name}（{size}）")
         self._models_list.setText("已下载 " + str(len(installed)) + " 个：\n" + "\n".join(parts))
         self._model_delete_btn.setEnabled(True)
+
+    def _do_open_model_center(self) -> None:
+        """打开模型中心：读远端清单 → 勾选 → 串行下载。
+
+        ★ **只有用户点这个按钮才会联网**，程序自己永远不会去下载模型。
+        """
+        try:
+            open_model_center(self, on_installed=self._on_models_installed)
+        except Exception as exc:  # noqa: BLE001 - 打不开也不该让设置页崩
+            QMessageBox.warning(
+                self,
+                "模型中心打不开",
+                "模型中心没能打开：" + type(exc).__name__ + "。",
+            )
+
+    def _on_models_installed(self, model_ids: list[Any]) -> None:
+        """模型中心这一轮装好了东西 —— 刷新本地模型那块并报一句。"""
+        self._refresh_models()
+        names = [str(item) for item in model_ids if str(item)]
+        if names:
+            self._model_status.setText(
+                "模型中心装好了 " + str(len(names)) + " 个模型：" + "、".join(names)
+            )
 
     def _model_catalog(self) -> list[Any]:
         """可用模型清单（带 Release 描述里的直链，拿不到就只有本地已装的）。"""

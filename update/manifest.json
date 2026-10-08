@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "version": "1.8",
+  "published": "2026-10-08",
+  "_doc": [
+    "程序更新清单。v1.9 起 core/updater.check_for_update() 先读这份文件（GITEE_RAW_MANIFEST），读不到才退回解析 Gitee 发行版正文（老路子，已标 deprecated）。",
+    "发版步骤：① 打包出 dist\\transcript-lens.exe；② 传成 Gitee 发行版的附件，把附件直链填进 app.url（形如 https://gitee.com/wuhaotiansystem/transcript-lens/releases/download/v1.9/transcript-lens.exe）；③ 用 Get-FileHash -Algorithm SHA256 和 (Get-Item ...).Length 算出 sha256 与字节数填进 app.sha256 / app.size；④ version 改成这次发的版本号；⑤ 提交并推 master。",
+    "★ app.url / app.size / app.sha256 三样缺任何一样，这份清单就算「不完整」：程序不会拿它去自动更新，而是退回读发行版正文。**宁可退回老路子，也不拿没校验的直链替换用户的程序。**",
+    "★ 重新打包会让 exe 的 sha256 变化（PyInstaller 产物里带时间戳），所以每次发版都要重新算，别抄旧值。"
+  ],
+  "app": {
+    "url": "",
+    "size": 0,
+    "sha256": "",
+    "notes": ""
+  }
+}

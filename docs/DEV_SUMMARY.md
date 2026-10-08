@@ -39,8 +39,19 @@
 
 ### 0.3 现在项目到哪一步了
 
-v1.8 全部功能已实装并打包发布。当前**没有待办功能**，只有第 17 节的已知限制
-（都是"记录在案、暂不修"的类型）。下一个版本要做什么，先问 Owner。
+**v1.8 / v1.8.1 / v1.8.2 已发布**（v1.8.2 把 5 份开发文档合并成本文，提交 `e2d7edd`）。
+
+**v1.9 已在工作区完成（未发版）**，三件事 + 一个 Bug 修复：
+
+| 项 | 落地位置 |
+|---|---|
+| 解析器表格干扰 Bug（统计列 / 末尾汇总行 / 大标题） | `core/parser.py`（唯一一次解冻，见 §7.4、§13.6） |
+| 批量导入德育分 | `core/import_workers.py` + `ui/moral_import_dialog.py` + 奖学金页按钮（§二十一） |
+| AI 模型中心 | `core/ai/model_registry.py` + `ui/model_center_dialog.py` + 设置页入口（§八） |
+| 更新器改走 `update/manifest.json` | `core/updater.py`（§6.3） |
+
+**v1.9 之后没有待办功能**，只有第 17 节的已知限制（都是"记录在案、暂不修"
+的类型）。下一个版本要做什么，先问 Owner。
 
 ---
 
@@ -189,8 +200,8 @@ v1.7 及之前有三处**写死了 `"v1.0"`**：`ui/login_window.py` 的 `APP_VE
 ### 6.1 全流程
 
 ```
-点「检查更新」→ GET /releases/latest 解析 tag_name
-   ├─ 没有新版本 → 状态行"当前已是最新版本 (v1.8)"
+点「检查更新」→ GET update/manifest.json 读 app 字段（url / size / sha256）
+   ├─ 没有新版本 → 状态行"当前已是最新版本 (v1.9)"
    └─ 有新版本   → 弹窗（版本说明 + 模块勾选）
         → 点「开始下载」→ 进度条 / 速度 / 随时可取消
         → 下载完成 → 弹窗：
@@ -220,15 +231,35 @@ v1.7 及之前有三处**写死了 `"v1.0"`**：`ui/login_window.py` 的 `APP_VE
 
 四个"绝不"和 `.bat` 的 ASCII 约束见 AGENTS.md §26。
 
-### 6.3 发行版描述就是下载配置
+### 6.3 清单优先：`update/manifest.json` 才是下载配置
 
-程序**只读最新那个发行版的描述正文**（`core/updater.parse_release_body()`），
-从里面解析主程序和 AI 模型的直链。文件本体**不放 Gitee 附件**（免费版有大小和
-流量限制），放网盘、描述里贴直链。格式与解析规则见 `docs/DISTRIBUTION.md`。
+**v1.9 起 `check_for_update()` 先读清单**（`core/updater.fetch_manifest()`）：
+
+```
+GET https://gitee.com/wuhaotiansystem/transcript-lens/raw/master/update/manifest.json
+{ "schema": 1, "app": { "version": "1.9", "url": "…", "size": 234567890,
+                        "sha256": "…", "notes": "…", "published": "2026-10-08" } }
+```
+
+| 规则 | 判据 |
+|---|---|
+| 版本比较 | 一律用 `core/version.CURRENT_VERSION`（`check_for_update(current=…)` 可注入，给测试用） |
+| `app` 缺 `url`/`size`/`sha256` 任一项 | `ManifestApp.usable == False` → 视为"清单没准备好"，**退回旧路线** |
+| 清单 404 / 连不上 / JSON 坏 | 不报故障，**退回旧路线**（`source="release"`） |
+| 两条路都走不通 | 才报"仓库里还没有发布任何发行版" |
+| 结果来自哪条路 | `UpdateCheck.source` = `"manifest"` 或 `"release"`，界面据此显示直链与大小 |
+
+**旧路线（Release 描述正文）保留但已 deprecated**：`parse_release_body()` 与
+`latest_release()` 上面都标了 deprecated，`model_downloader.catalog_from_release()`
+仍可用它取 AI 模型直链。文件本体**不放 Gitee 附件**（免费版有大小和流量限制），
+放网盘、清单/描述里贴直链。
 
 > ⚠️ **打了 tag 不等于建了 Release。** 仓库里没有任何发行版时，
-> `/releases/latest` 返回 **404**、`/releases` 返回 **`[]`**，程序会说
-> "仓库里还没有发布任何发行版" —— 那是实话，**不是故障**。
+> `/releases/latest` 返回 **404**、`/releases` 返回 **`[]`** —— 那是实话，
+> **不是故障**（清单路线通的时候根本不会走到这里）。
+
+> ★ 清单里 `url`/`size`/`sha256` 三个空着是**合法状态**：说明 Owner 还没把
+> 网盘直链填进来。程序会给"清单还没填直链"的提示，不会拿一个空 url 去下载。
 
 ---
 
@@ -277,6 +308,7 @@ AGENTS.md §27d。
 | 文件 | 状态 |
 |---|---|
 | `core/ai/model_downloader.py` | ✅ 实装：GGUF 从网盘下到 `models/`，续传 + sha256 + 体积底线 |
+| `core/ai/model_registry.py` | ✅ v1.9 实装：读远端清单 → 分组 → 内存闸门 → 勾选计划 → 装/未装/待更新 |
 | `core/ai/local_assistant.py` | 占位，**不实现推理** |
 | `core/ai/cloud_adapter.py` | 占位，不实现 |
 
@@ -291,6 +323,49 @@ AGENTS.md §27d。
 > ★ **v1.8 只做到"把模型下载下来 + 认出来"，还没有接推理引擎。**
 > 下完之后点「评估」仍然显示「模型已加载但未配置推理引擎」——
 > 这是**诚实的状态说明**，不是故障。
+
+### 8.1 模型中心（v1.9）
+
+设置页「本地模型」那一行的**第一个**按钮是「模型中心」
+（`ui/model_center_dialog.open_model_center(parent, *, on_installed=None)`）。
+
+**数据源**：`core/ai/model_registry.GITEE_RAW_MODELS` =
+`https://gitee.com/wuhaotiansystem/transcript-lens/raw/master/update/ai_models.json`
+（仓库里 `update/ai_models.json` 就是它的模板；改清单要同时改仓库这份）。
+清单形状：`{"schema": 1, "models": [ {id, name, group, size, sha256, url,
+minRamGb, defaultCheck, …} ]}`。
+
+| 环节 | 函数 | 判据 |
+|---|---|---|
+| 取清单 | `fetch_model_list(timeout=…)` | 走 `core.updater._get_json`（**本模块零 HTTP import**） |
+| 解析 | `parse_model_list(payload)` | 逐条容错，坏字段收集成**中文警告**返回（`(models, warnings)`） |
+| 合并本地 | `merged_with_local(models, dest_dir=None)` | **磁盘上有非空文件优先于账本**，状态为 `已装` / `未装` / `待更新` |
+| 内存闸门 | `local_ram_gb()` / `check_memory(need_gb)` | 用 `GlobalMemoryStatusEx`；`need_gb <= 0` = 清单没声明 → 放行 |
+| 默认勾选 | `default_checked(model)` | `defaultCheck=true` **且** 本机内存 ≥ `minRamGb` 才默认勾 |
+| 下载计划 | `build_choices` / `group_choices` / `describe_download_plan` | 分组默认 `推荐`，本机已有的归 `本机已有` |
+
+**落盘**：`installed_file(dest_dir=None)` = `default_models_dir()/installed.json`
+（即 `%LOCALAPPDATA%\SGMS\models\installed.json`，schema 1），
+`load_installed` / `save_installed` / `record_installed` / `forget_installed` 四个出口。
+
+★ **`minRamGb` 写错不许静默放行**（v1.9 修）：`_memory_gb()` 认得出
+`8` / `"8"` / `"8GB"` / `"8 g"` / `"8吉字节"`；写了但读不懂 → 内存按 0 处理
+**并带一句中文警告**（"这条不会被内存拦住，请自己确认机器能不能跑"）。
+理由：`check_memory` 对 `need <= 0` 是放行，两件事叠在一起会让 4GB 机器
+把 3B 模型判成"够跑"。
+
+**界面行为（`ui/model_center_dialog.py`）**：
+
+| 规则 | 判据 |
+|---|---|
+| 分组显示 | `QTreeWidget`，`COLUMNS = ("名称","大小","状态")`，推荐组在前 |
+| 内存不够的模型 | 复选框留着但**整行不可选**（`flags` 里**没有** `ItemIsEnabled`），不是悄悄隐藏 |
+| **绝不自动下载** | 打开清单只读不写；下载必须用户点「下载选中」（延续 §21c） |
+| 逐个下载 | 复用 `core.updater` 的下载器（续传 + sha256），**不重写** |
+| 校验 | 先比 `size`（容差 `SIZE_TOLERANCE = 0.01`，下限 4096 字节）再比 `sha256`，**都对才写 `installed.json`** |
+| 失败处理 | 自动重试 1 次 → 仍失败则**该行标红** + 给「复制链接到浏览器下载」按钮 |
+| 线程 | 取清单与下载都走 `ui.workers.run_async`（§5b） |
+| 装完回调 | `downloadFinished = Signal(list)` → 设置页 `_on_models_installed(ids)` 刷新模型列表 |
 
 ---
 
@@ -478,6 +553,26 @@ C:\Users\<系统用户>\AppData\Local\SGMS\
 5. **校验锚点**：若表里有"所得学分"列，程序算出的总学分与锚点差 > 0.5
    → 弹窗警告
 
+### 13.6 ★ 表格干扰的三类过滤（v1.9 新增，`core/parser.py`）
+
+教务导出的成绩表里有一堆**不是学生成绩**的东西，以前会被当课程列或当学生吃进去。
+现在 `parse_dataframe()` 有四个判据（都在 `core/parser.py`）：
+
+| 干扰 | 判据 | 后果 |
+|---|---|---|
+| **统计列**（"不及格门数"/"平均分"/"总分"/"所得学分"/"平均学分绩"/"平均学分绩点"/"排名"） | `is_stat_header(header)` 查 `STAT_HEADER_KEYWORDS` | 该列**不算课程列**，也不参与"列数错位"判据；列号记进 `ParseResult.stat_columns` |
+| **末尾汇总行**（"37人"/"470"/"不及格"/"18"…） | 先过 `SUMMARY_ROW_KEYWORDS` + `_SUMMARY_COUNT_RE`（`\d+\s*人`），再看姓名列 | 整行跳过，理由记进 `ParseResult.skipped_rows`，**不弹错位窗** |
+| **合并单元格大标题** | `_row_is_title_like(row)`：只有首格有字、其余全空 | **不吃表头扫描预算**，直接跳过 |
+| **半截行** | 学号/姓名全空、或成绩列数 < 课程列数 | 按原 §13.3 处理（整行标红、不参与计算） |
+
+**每一处跳过都留一条中文 warning**（写进 `ParseResult.warnings`），
+所以"这行为什么没了"永远能查到。测试见 `tests/test_parser_filters.py`（49 用例）。
+
+> ★ **这是 `core/parser.py` 唯一一次解冻**（铁律 1 封的是 sha256）。
+> 新哈希 `14ab62ab2b6fdcdd6cff6c59427263f940c0cbee6c02691b80788a4cde31e450`，
+> 已同步进 `main.FROZEN_FILE_SHA256`（`main.py` 里那条注释写明"v1.9 解冻记录，
+> 唯一一次，只动 parser.py"）。**下次再动就必须再走一遍这条路。**
+
 **成绩处理规则（不变）**：
 
 - 补考**不覆盖**原成绩
@@ -547,6 +642,8 @@ C:\Users\<系统用户>\AppData\Local\SGMS\
 | v1.7 | 更新检查（`urllib.request` 只读 Gitee）+ 数据迁移与版本保护；QLabel 文案铁律；UI 层拦 >100 分 | 加 `core/version.py` / `core/updater.py` / `core/migrator.py` |
 | v1.8 | 自动更新器实装（可下载可替换，**但绝不自动**）+ 版本号全局同步 + Excel 老格式修复 + AI 模型下载器骨架 | 修掉三处硬编码 `"v1.0"` |
 | v1.8.1 | **删除整套激活码系统**（提交 `9fea15f`） | 见下 |
+| v1.8.2 | 5 份开发文档合并成**这一份总纲** + 「文档唯一真源」自检闸门（提交 `e2d7edd`） | 30 套件 runner 全绿；`docs/` 白名单机制生效 |
+| v1.9 | 解析器表格干扰修复（`core/parser.py` 唯一一次解冻）+ 德育分批量导入 + AI 模型中心 + 更新器改走 `update/manifest.json` | 未发版；两段开发指令见 §二十二 |
 
 ### 16.1 激活码系统为什么删、删了什么
 
@@ -627,7 +724,7 @@ C:\Users\<系统用户>\AppData\Local\SGMS\
 
 ## 十八、测试与闸门清单
 
-### 18.1 `--selfcheck` 的 11 条闸门（`main.py`）
+### 18.1 `--selfcheck` 的 10 条闸门（`main.py`）
 
 | 闸门函数 | 管什么 |
 |---|---|
@@ -645,9 +742,25 @@ C:\Users\<系统用户>\AppData\Local\SGMS\
 跑法：`python main.py --selfcheck`；另有 `--bootcheck`（真实启动流程，
 退出码本身就是断言）。
 
+另外 `CHECK_MODULES`（`main.py:78`）在自检里逐个 `import` 一遍
+（**v1.9 起 38 个模块**，新增 `ui.moral_import_dialog` / `ui.model_center_dialog` /
+`core.import_workers` / `core.ai.model_registry`）—— 加新模块要顺手加进去。
+
 ### 18.2 回归套件
 
-runner 是 `%TEMP%\tl_run_all.ps1`（**不在仓库里**，是本机开发工具）。
+**pytest**（`python -m pytest tests/ -q`，runner 的第 1 个套件就是它）：
+
+| 文件 | 管什么 | 用例 |
+|---|---|---|
+| `tests/test_calc.py` | 加权口径（**被封板的那个**） | 8 |
+| `tests/test_parser_filters.py` | v1.9 三类表格干扰过滤 | 49 |
+| `tests/test_import.py` | 批量导入德育分（校验四规则 / CSV / 落库） | 40 |
+| `tests/test_model_registry.py` | 模型清单解析 / 内存闸门 / 装没装 / 勾选 | 109 |
+| `tests/test_manifest.py` | `update/manifest.json` 优先 + 退回旧路线 | 58 |
+
+（v1.9 全量实测 **264 passed**。）
+
+runner 是 `%TEMP%\tl_run_all.ps1`（**不在仓库里**，是本机开发工具；**v1.9 起 31 个套件**）。
 覆盖四类：源码闸门（selfcheck / bootcheck）、策略闸门
 （`tl_category_gate_test.py` / `tl_updater_gate_test.py` / `tl_v18_gate_test.py` /
 `tl_noact_gate_test.py` / `tl_docs_gate_test.py`）、链路测试（`tl_migrate_test.py` / `tl_updater_test.py` /
@@ -662,6 +775,14 @@ HTTP 服务器验续传 / `tl_boot_test.py` 三种启动模式 / `tl_visual_new.
 `tl_updater_test.py` 的 4e 漏还原一个模块级桩，4b 于是真的弹了个**没人点的
 模态框**，整个套件**静默挂死 40 分钟、一个字都不输出**，把后面 23 个套件全堵住，
 而 runner 自己完全没法发现这件事。**一条挂死的用例不该能拖住整套回归。**
+
+★ 这条超时**本身被证明会触发**（v1.9 实测）：`%TEMP%\tl_timeout_probe.ps1` 用 runner
+里同一套 .NET 启进程代码，把上限压到 3 秒、去跑一个 `time.sleep(20)` 的进程 →
+`timeout=True exit=124 elapsed=3.7s`（真被杀掉，不是只写在注释里）。
+另注一个**已定性的计时异常**：2026/10/8 那次 31 套件全绿时，`cover` 一行 elapsed
+报成 **4635.8s** 而 `exit=0`、20 条断言全过，当天系统事件日志里没有任何睡眠/唤醒
+（Kernel-Power 42/107，最近一次是 10/7 01:24）—— 判断为调度/计时异常，不是产品
+卡住、也不是超时没生效；真超时一定同时满足 `exit=124` + 进程被 `taskkill`。
 
 ### 18.3 测试纪律
 
@@ -680,6 +801,16 @@ HTTP 服务器验续传 / `tl_boot_test.py` 三种启动模式 / `tl_visual_new.
 - 跑全套 runner 期间**不得并行跑 GUI 工作**
 - 重建 exe 前必须
   `Get-Process -Name 'transcript-lens*' | Stop-Process -Force; Start-Sleep -Seconds 3`
+- ★ **断言剪贴板的用例会栽在机器状态上，不是栽在代码上**（v1.9 实测）：
+  `tl_qt_drive.py` 的「一键复制进了剪贴板」某次报 `0 字符`，控制组实验证明是
+  **explorer 的剪贴板链卡死** —— 那一刻连纯 ctypes 的 `OpenClipboard`（不含本项目
+  一行代码）都返回 err=5、PowerShell 的 `Set-Clipboard` 也抛「所请求的剪贴板操作失败」。
+  **判定顺序：先跑控制组，再怀疑代码**（`taskkill /f /im explorer.exe` + 重启 explorer
+  立刻重跑，同一套件「全部通过」）。跑全套 runner 前重启一次 explorer 当预飞，
+  能避开这个假红。`tl_qt_drive.py` 里那条断言现在自带**环境探针**：先测
+  `OpenClipboard`，开不了就打印 `[SKIP]` 并换成一条**与剪贴板无关**的替身判据
+  （正文够长、值得复制），**不把实质一起跳掉**；探针能双向证明（重启 explorer 后
+  同一条断言立刻真跑起来并「全部通过」，2026/10/8 实测）。
 
 ---
 
@@ -694,7 +825,7 @@ HTTP 服务器验续传 / `tl_boot_test.py` 三种启动模式 / `tl_visual_new.
 
 ### 收工前
 
-- [ ] `python main.py --selfcheck` 全绿（**尤其那 11 条策略闸门**）
+- [ ] `python main.py --selfcheck` 全绿（**尤其那 10 条策略闸门**）
 - [ ] 改了闸门 → **证明它会 FAIL**（注入 → 报红 → 逐字节还原 + 核对 sha256）
 - [ ] `%TEMP%\tl_run_all.ps1` 全绿
 - [ ] `git status` 干净，`dist/` `build/` 没被 `git add`
@@ -736,3 +867,112 @@ HTTP 服务器验续传 / `tl_boot_test.py` 三种启动模式 / `tl_visual_new.
 | "charter v1.8 §九 禁止事项" | §三 + §四 + §十四 |
 | `ACTIVATION_REMOVAL.md` | §十六 的 16.1-16.5 |
 | "任务书 2.1 / 2.3 / 3.2 / 4" | 任务书是外部输入，不是本文档；其中的 `xlrd<2.0`（任务书 3.2）**是错的**，见 §7.3 |
+
+---
+
+## 二十一、批量导入德育分（v1.9 新模块）
+
+**读者**：要改导入、要加一列新字段的人。**先读这一节，别重新发明一遍。**
+
+| 文件 | 干什么 |
+|---|---|
+| `core/import_workers.py`（757 行） | 全部逻辑：读表 → 校验 → 预览计划 → 落库 → 错误 CSV → 批次台账。**一行 Qt 都不 import** |
+| `ui/moral_import_dialog.py` | 预览弹窗（`MoralImportPreviewDialog.confirm(plan, parent)`） |
+| `ui/pages/scholarship_page.py` | 德育分卡片的「批量导入」按钮 + 进度条 + 完成弹窗 |
+
+### 21.1 流程（三步，每一步都能中止）
+
+```
+「批量导入」→ QFileDialog（.xlsx / .xls / .csv）
+  → [后台] plan_import(path, known_classes=…, default_class=self.current_class)
+  → 预览弹窗：能导 N 行 · 失败 K 行 · 跳过 M 行 + 前 5 行 + 全部警告
+  → 用户点「确认导入」才 [后台] apply_plan(store, username, plan, batch_id=…)
+  → 状态行 + 弹窗：成功 N 行 / 跳过 M 行 / 失败 K 行
+```
+
+**为什么分两步**：`plan_import` 只读不写库，用户能在**任何数据进库之前**看到
+"哪几行会被丢掉、为什么"。取消 = 一个字节都没写。
+
+### 21.2 判据（改之前先看这张表）
+
+| 项 | 值 / 判据 |
+|---|---|
+| 表头识别 | `detect_columns(df)` 扫前 `HEADER_SCAN_ROWS = 10` 行，**命中 ≥ `HEADER_MIN_HITS = 2` 个关键字**才算表头；找不到 → `ImportFormatError`（界面文案"这份表读不进来"） |
+| 四类坏行 | ① 学号重复（**同批内**，理由写"第 N 行已经出现过"）② 姓名为空 ③ 分值不是数字（理由带原值，如 `德育分「优秀」不是数字`）④ **班级不在已建班级里** |
+| 坏行后果 | 收进 `plan.failures`，**不中断整批**，其余行照常导入 |
+| 分值范围 | `MORAL_MIN = 0` / `MORAL_MAX = 100`（必须与微调框、`save_moral` 的 clamp 是同一个区间） |
+| 错误清单 | `export/import_errors_<batch_id>.csv`（`utf-8-sig` 带 BOM，Excel 打开不乱码）；**一行错都没有就不建文件** |
+| 成功行落库 | `scholarship.save_moral()`，键是 `sid:<学号>`，一个班一个加密文件 |
+| 批次台账 | `BATCH_FILE = "moral_batches.json.enc"` |
+| 批次号 | `new_batch_id()`；`record_batch()` 追加进台账，`load_batches()` 读回 |
+| 一次上限 | `MAX_BATCH_RECORDS = 50` 条提示 |
+| 进度 | `IMPORT_STEPS = 3`（选文件 / 读表 / 落库） |
+| 引擎 | 复用 `core/excel_io.engine_for()` **按魔数**选引擎，不另写一遍 |
+
+★ **`ImportPlan.failures` / `.skipped` / `.classes` 是 property，不是方法**
+（写 `plan.failures()` 会 `TypeError`）。`plan_import(frame=…)` 传 DataFrame 时
+必须是 `header=None` 形状（表头当**第一行数据**传），否则 `detect_columns` 认不出表头。
+
+### 21.3 两个被测试逼出来的真 Bug（别改回去）
+
+| Bug | 症状 | 正解 |
+|---|---|---|
+| 台账文件名叫 `moral_batches.json` | `save_user_json` → `save_encrypted` **当场拒绝**：`ValueError: 拒绝写入 'moral_batches.json'：应用级载荷只允许 .enc 后缀。明文 .json 一律不许落盘（Spec 红线 11）` | 必须叫 `.json.enc` |
+| 班级校验写成 `elif known and raw_class not in known` | **一个班都没建过时静默放行**，德育分写进没有名单的班 —— 数据进库了，界面上谁也看不见 | 改成 `elif raw_class not in known`，空集合走专门文案"先在智育分析里把这个班的成绩导进来" |
+
+---
+
+## 二十二、v1.9 两段开发指令（原文归档 + 落地对照）
+
+> **为什么留这一节**：这两段是 Owner 在 v1.9 下达的原始指令，按要求"合并进开发
+> 总纲"。以后翻旧账（"当时到底要求了什么"）看这里，不用去翻对话记录。
+> **本节是历史记录，不是待办清单** —— 落地情况看第 21 节和 §6.3 / §8.1 / §13.6。
+
+### 22.1 指令一：SGMS v1.9 开发任务（三件事）
+
+| 原文要求 | 落地 |
+|---|---|
+| 新文件 `core/import_workers.py`：读 Excel/CSV → 校验 → 落库 | ✅ §21.2 |
+| 校验四规则：学号重复 / 姓名为空 / 分值非 float / 班级不在已建班级 | ✅ 四类坏行，理由各不相同 |
+| 失败行写 `export/import_errors_<batch>.csv`，**不中断整批** | ✅ 无错不建文件 |
+| 成功行带 `batch_id` 追加进德育分表 | ✅ 分数进 `save_moral`，批次元数据进 `moral_batches.json.enc`（**分数记录本身不加字段**，所以数据格式没变、不需要迁移） |
+| UI：**设置页或主菜单**加"批量导入德育分"按钮 → 选文件 → 预览前 5 行 → QThread → 进度条 → "成功 N / 跳过 M / 失败 K" | ⚠️ **改落在奖学金测算页德育分卡片**（德育分本来就在那页，设置页放它反而不合直觉），其余照做；线程用 `ui.workers.run_async`（§5b 的统一出口），不自己 new `QThread` |
+| 复用 `core/excel_io.py` 的魔数选引擎 | ✅ §21.2 最后一行 |
+| 新文件 `core/ai/model_registry.py`：`fetch_model_list()` 读 Gitee raw 的 `update/ai_models.json`，返回 `list[dict]` | ✅ §8.1 |
+| 本地已装模型读 `models/installed.json`（不存在则 `{}`） | ⚠️ 实际是 `%LOCALAPPDATA%\SGMS\models\installed.json`（`installed_file()`），且**磁盘上有文件优先于账本** |
+| 新文件 `ui/model_center_dialog.py`：`QTreeWidget` 分组（推荐/高级）+ 复选框 + 名称/大小/状态 | ✅ 另加 `本机已有` 组 |
+| 默认勾选 `defaultCheck=true` **且** 本机内存 ≥ `minRamGb` | ✅ 内存不够的**整行不可选**（不是隐藏） |
+| 底部「下载选中」→ 逐个调 `core.updater` 的下载函数（复用） | ✅ |
+| 每个文件校验 size + sha256，**一致才写 `installed.json`** | ✅ 容差 `SIZE_TOLERANCE = 0.01`（下限 4096 字节） |
+| 失败顺序：自动重试 1 次 → 仍失败则**标红 + 复制链接到浏览器** | ✅ |
+| **不允许自动下载**，必须用户点（延续 §21c） | ✅ 打开清单只读，探针实测 `downloaded == []` |
+| `core/ai/model_downloader.py` 保持零 HTTP import | ✅ 5 个 `core/ai/*.py` 都被自检闸门扫 |
+| `core/updater.check_for_update()` 先 GET `manifest.json` 拿 `app` 的 url/size/sha256 | ✅ §6.3 |
+| 版本比较用 `core/version.CURRENT_VERSION` | ✅ 且 `current=` 可注入 |
+| 原 Release 正文解析**保留但标 deprecated** | ✅ `parse_release_body()` / `latest_release()` |
+| 下载主流程不变（临时文件 → 校验 → `update.json` → bat 替换） | ✅ §6.1 / §6.2 未动 |
+| 硬约束：不引 requests/httpx/aiohttp、不接云端 SDK、必须 Range 续传 + SHA256、下载失败要有浏览器兜底、封板 sha256 硬校验保留 | ✅ 全部满足（parser.py 解冻后哈希已同步进 `main.FROZEN_FILE_SHA256`） |
+| 自测：假 `ai_models.json` 放本地 http server 测勾选/下载/校验/写 `installed.json` | ✅ `tests/test_model_registry.py` 109 用例（只打 `127.0.0.1`） |
+| 自测：坏 sha256 的假文件确认拒绝写入 | ✅ 同上 |
+| 自测：德育分 30 行假数据含 3 行故意错，确认 errors.csv 正确 | ✅ `%TEMP%\tl_v19_ui_test.py`（27 行入、3 行出，三条理由各不相同） |
+| 交付：跑 `tests/test_calc.py` 和新增 `tests/test_import.py` | ✅ 见 §18.2 全表 |
+| 交付：**更新 AGENTS.md 新增 §30 模型中心、§31 批量导入** | ⚠️ §30 已被"激活码系统已删除"占用 → 实际落 **§31 / §32** |
+| 交付：commit 带 **v1.9** 前缀，**不推 Gitee** | ✅ 见 §16.5（提交号 ≠ 程序版本号，`CURRENT_VERSION` 仍是 `1.8`，没有数据格式变化就不升） |
+
+### 22.2 指令二：修复成绩导入解析器的表格干扰 Bug
+
+| 原文要求 | 落地 |
+|---|---|
+| 识别并剔除"不及格门数 / 平均分 / 总分 / 所得学分 / 平均学分绩 / 平均学分绩点 / 排名"这类**统计列**，绝不能当成绩 | ✅ §13.6 第 1 行（`is_stat_header` + `STAT_HEADER_KEYWORDS`） |
+| 过滤末尾统计行：含"人"（如"37人"）、"不及格"、纯汇总数值的行 | ✅ §13.6 第 2 行（`SUMMARY_ROW_KEYWORDS` + `_SUMMARY_COUNT_RE`） |
+| 跳过表格顶部合并单元格大标题 | ✅ §13.6 第 3 行（`_row_is_title_like`，且**不吃表头扫描预算**） |
+| 校验行完整性：必须有非空学号/姓名 + 合理成绩 | ✅ §13.6 第 4 行 + 原 §13.3 |
+| 缺失关键字段的行**直接丢弃并记录日志** | ✅ 每处跳过都写 `ParseResult.warnings`（中文理由），列号进 `stat_columns`、行号进 `skipped_rows` |
+| 硬约束：复用 `core/excel_io.py` 魔数选引擎，不重写读取 | ✅ `**read_excel_kwargs` 扩展点没动（§7.4） |
+| 硬约束：不引新的第三方联网/解析库 | ✅ |
+| 硬约束：**保持封板 sha256 硬校验，若改动需同步 `main.py` 里的哈希** | ✅ 改了 `core/parser.py` → 同步 `main.FROZEN_FILE_SHA256`（这是 parser 唯一一次解冻） |
+| 自测：用含三类干扰的真实表/fixture 验证；跑通 942+ 测试全绿；打包后复测 | ✅ `tests/test_parser_filters.py` 49 例 + §18.2 全量；**frozen 复测见下** |
+| 交付：改解析代码 + 测试用例 + commit（含修复说明） | ✅ |
+
+> ★ **两段指令的收尾要求**："最后合并上述开发提示词到开发总纲里面" ——
+> 就是本节。以后同类要求一律**并进本文**，`docs/` 只允许那三个文件（§0.2）。
