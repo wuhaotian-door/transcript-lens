@@ -329,6 +329,26 @@ Gitee 超限片 `usable=False`）+ `tests/test_manifest.py` 里的 `app.parts` �
 验牙：`%TEMP%\tl_parts_gate_test.py` 把上限改小 / 把 `download_parts` 改名 /
 让它一开始就清空目标文件 —— 三种注入都当场报红，还原后 sha256 一致、闸门重新全绿。
 
+★ **2026-10-10 v1.8.1 真机实测**（首次走完整条链路，结论比设计更重要）：
+
+* 三片都传上去了：附件 id `3358116` / `3358129` / `3358151`，各 80033189 字节；
+  直链 `https://gitee.com/wuhaotiansystem/transcript-lens/releases/download/1.8.1/transcript-lens-v1.8.1.exe.partN`
+  可下（**标签名是 `1.8.1`，不带 `v` 前缀**）。
+* ★ **Gitee 附件直链不认 Range**：带 `Range: bytes=0-0` 去请求，回的是
+  **HTTP 200 + 完整的 76MB**（不是 206）—— 所以 `download_exe` 的"**片内**断点续传"
+  在这个托管上**不会生效**，它会按既定逻辑"服务器忽略 Range 就从 0 重下"（那条判据
+  当初就是为这种服务器写的）。**整片级续传仍然有效**：`<目标>.parts\partNN`
+  里已校验过的片**连请求都不发**。要真续传，得换支持 Range 的托管（网盘/对象存储）。
+* 端到端复验（`%TEMP%\tl_verify_release.py`）：从三条**真实直链**下载 →
+  `download_parts` 逐片校验 → 按清单顺序拼接 → 整体 sha256
+  `bc58221ee32644d1b43bc4c0abbba5bc062d3ea9d61f8e32cc7eeb17a215e211` 与清单一致 →
+  **拼出来的 exe 自己跑 `--selfcheck`，退出码 0、`RESULT: ALL OK`**。
+  229MB 用时 **117s（≈2.0 MB/s）**。
+* ★ 老客户端（v1.8，不认 `app.parts`）读到这份清单会判「缺 `app.url`」→
+  **退回老的发行版正文路线**（安全降级，不会下错东西）；分片下载只对
+  ≥ v1.8.1 的客户端生效。**第一次装 v1.8.1 得手动拿包**（三片下载后按顺序拼、
+  或直接用拼好的那个 exe）。
+
 ---
 
 ## 七、Excel 导入引擎
