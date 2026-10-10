@@ -284,6 +284,103 @@ def test_human_size(size: Any, expected: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# app.parts（v1.8.1：Gitee 单附件上限 100MB，240MB 的包只能切片传）
+# ---------------------------------------------------------------------------
+
+
+def _parts_payload(
+    *,
+    size: int = 300,
+    urls: tuple[str, ...] = (
+        "https://example.com/p1",
+        "https://example.com/p2",
+        "https://example.com/p3",
+    ),
+):
+    """一份"切成几片"的清单，片体积默认 100+100+100。"""
+    return {
+        "schema": 1,
+        "version": "1.8.1",
+        "app": {
+            "size": size,
+            "sha256": "C3" * 32,
+            "parts": [
+                {"url": url, "size": 100, "sha256": "D4" * 32} for url in urls
+            ],
+        },
+    }
+
+
+def test_parse_manifest_分片清单可用() -> None:
+    app, problem = U.parse_manifest(_parts_payload())
+    assert app is not None, problem
+    assert problem == ""
+    assert app.usable is True
+    assert app.multi_part is True
+    assert app.parts_text == "3 片"
+    assert app.url == ""          # 多段模式下顶层 url 就是空的
+    assert [p.size for p in app.parts] == [100, 100, 100]
+
+
+def test_parse_manifest_没有分片时还是单文件那套() -> None:
+    app, _ = U.parse_manifest(_payload())
+    assert app is not None
+    assert app.multi_part is False
+    assert app.parts_text == ""
+
+
+@pytest.mark.parametrize("missing", ["url", "size", "sha256"])
+def test_parse_manifest_分片缺字段要说清楚(missing: str) -> None:
+    data = _parts_payload()
+    data["app"]["parts"][1].pop(missing)
+    app, problem = U.parse_manifest(data)
+    assert app is not None
+    assert app.usable is False
+    assert "分片" in problem, problem
+
+
+def test_parse_manifest_分片体积之和对不上要说清楚() -> None:
+    app, problem = U.parse_manifest(_parts_payload(size=301))
+    assert app is not None and app.usable is False
+    assert "对不上" in problem, problem
+
+
+def test_parse_manifest_gitee上超100MB的片要说清楚() -> None:
+    limit = U.ATTACHMENT_LIMIT_BYTES
+    data = _parts_payload(size=limit + 200)
+    data["app"]["parts"][0]["size"] = limit          # 正好压线，合法
+    data["app"]["parts"][1]["size"] = 100
+    data["app"]["parts"][2]["size"] = 100
+    data["app"]["parts"][2]["url"] = (
+        "https://gitee.com/wuhaotiansystem/transcript-lens/releases/download/1.8.1/x.p3"
+    )
+    app, problem = U.parse_manifest(data)
+    assert app is not None and app.usable is True, problem   # 压线不算超
+
+    data["app"]["parts"][2]["size"] = limit + 1
+    data["app"]["size"] = limit + 100 + limit + 1
+    app, problem = U.parse_manifest(data)
+    assert app is not None and app.usable is False
+    assert "上限" in problem, problem
+
+
+def test_parse_manifest_parts不是列表就当读不懂() -> None:
+    data = _parts_payload()
+    data["app"]["parts"] = "part1"
+    app, problem = U.parse_manifest(data)
+    assert app is None
+    assert "parts" in problem, problem
+
+
+def test_parse_manifest_parts里的非对象项让清单变不可用() -> None:
+    data = _parts_payload()
+    data["app"]["parts"].append("part4")
+    app, problem = U.parse_manifest(data)
+    assert app is not None and app.usable is False
+    assert app.parts[-1].usable is False
+
+
+# ---------------------------------------------------------------------------
 # fetch_manifest
 # ---------------------------------------------------------------------------
 
@@ -343,10 +440,20 @@ def test_仓库清单只允许空模板或完全填好() -> None:
     app, problem = U.parse_manifest(json.loads(raw.decode("utf-8")))
     assert app is not None, f"仓库清单结构不对，根本解析不出来：{problem}"
     if app.usable:
-        assert app.url.startswith("https://"), app.url
-        assert "/releases/download/" in app.url, app.url
-        assert app.size > 0
-        assert len(app.sha256) == 64
+        if app.multi_part:
+            # 切片发布（Gitee 单附件 ≤100MB）：顶层 url 是空的，
+            # 每一片的 url 必须是本仓库发行版附件的直链，且都要小于上限。
+            for part in app.parts:
+                assert part.url.startswith("https://"), part.url
+                assert "/releases/download/" in part.url, part.url
+                assert 0 < part.size <= U.ATTACHMENT_LIMIT_BYTES, part.size
+                assert len(part.sha256) == 64
+            assert sum(p.size for p in app.parts) == app.size
+        else:
+            assert app.url.startswith("https://"), app.url
+            assert "/releases/download/" in app.url, app.url
+            assert app.size > 0
+            assert len(app.sha256) == 64
         assert app.version, "填好的清单必须写明版本号"
     else:
         assert app.url == "" and app.size == 0 and app.sha256 == "", (

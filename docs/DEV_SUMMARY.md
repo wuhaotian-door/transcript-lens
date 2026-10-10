@@ -283,6 +283,54 @@ GET https://gitee.com/wuhaotiansystem/transcript-lens/raw/master/update/manifest
 
 ---
 
+### 6.4 分片发布：包比 Gitee 附件上限大时怎么办（v1.8.1）
+
+**硬限制**：Gitee 社区版**单个附件 ≤ 100MB**（官方帮助「创建 Release」页原文：
+"单个附件不能超过 100M（GVP 项目 200M）"；配额页还写了单仓库附件总容量 1G）。
+我们打出来的 onefile exe 是 **240MB 量级** —— **根本传不上去**。
+发行版页面上那两个 `<标签>.zip` / `<标签>.tar.gz` 是 Gitee **自动生成的源码包**，
+**不是** exe 附件（曾经就是被这一点误导过：清单里写了一条永远 404 的 exe 直链）。
+
+所以 v1.8.1 起清单支持 `app.parts`：
+
+| 字段 | 含义 |
+|---|---|
+| `app.size` / `app.sha256` | **整个 exe** 的字节数与哈希（两种模式含义相同） |
+| `app.parts[]` | 顺序切好的每一片：`url` / `size` / `sha256`（每片自己的） |
+| `app.url` | 分片模式下**留空**（单文件模式才填） |
+
+程序端 `core.updater.download_parts()` 的保证（比单文件的 `download_exe` 只多不少）：
+
+1. **逐片校验**：每片下完先核自己的 sha256，坏片当场丢弃、绝不混进拼接；
+2. **顺序固定**：拼接顺序 = 清单里 `app.parts` 的顺序，不看文件名；
+3. **整体再校验**：拼完核 `app.sha256` 与 `app.size`，任何一条不过都**不写目标文件**；
+4. **只写 `<目标>.part`**，成功才 `os.replace` —— 失败/取消**绝不损坏已有 exe**；
+5. **可续传**：每片缓存在 `<目标>.parts\partNN`，已校验过的片再点一次**连请求都不发**；
+6. 成功之后清掉 `<目标>.parts\`。
+
+**发版三步**（`tools/split_release.py` 是仓库里的工具，不是临时脚本）：
+
+```powershell
+python tools\split_release.py dist\transcript-lens.exe --parts 3 `
+    --tag 1.8.1 --version 1.8.1 --notes "…" --out release
+```
+
+它逐片量体积（**超过 100MB 就要求你多切几片**，不让你"传上去再说"），
+并打印可直接粘贴的 `app` 段；然后把每片传成发行版附件（网页拖拽，或
+`POST /repos/{owner}/{repo}/releases/{release_id}/attach_files`），
+最后**用 HEAD/Range 复查每条直链**能下、`Content-Length` 与清单一致。
+
+★ 判据：`tests/test_updater_parts.py`（15 例，全程只打本机 `http.server`：
+拼接逐字节一致 / 坏片拒绝且不动旧文件 / 缺片 / 整体体积与哈希对不上 /
+取消保留缓存 / 续传不发请求 / 半截缓存要重下 / 下完清理缓存 /
+Gitee 超限片 `usable=False`）+ `tests/test_manifest.py` 里的 `app.parts` 七例 +
+`main._download_policy_lines()` 三条（静态必须有 `download_parts` 与
+`ATTACHMENT_LIMIT_BYTES`；行为要"真跑一次失败的分片下载、目标文件逐字节未变"）。
+验牙：`%TEMP%\tl_parts_gate_test.py` 把上限改小 / 把 `download_parts` 改名 /
+让它一开始就清空目标文件 —— 三种注入都当场报红，还原后 sha256 一致、闸门重新全绿。
+
+---
+
 ## 七、Excel 导入引擎
 
 ### 7.1 事实：教务系统的 .xlsx 里有一大半其实是老格式
@@ -790,10 +838,11 @@ C:\Users\<系统用户>\AppData\Local\SGMS\
 | `tests/test_parser_filters.py` | v1.9 三类表格干扰过滤 | 49 |
 | `tests/test_import.py` | 批量导入德育分（校验四规则 / CSV / 落库） | 40 |
 | `tests/test_model_registry.py` | 模型清单解析 / 内存闸门 / 装没装 / 勾选 | 109 |
-| `tests/test_manifest.py` | `update/manifest.json` 优先 + 退回旧路线 + **仓库那份清单不许半填** | 58 |
+| `tests/test_manifest.py` | `update/manifest.json` 优先 + 退回旧路线 + **仓库那份清单不许半填** + `app.parts` | 58 |
+| `tests/test_updater_parts.py` | **分片下载与拼接**（逐片校验 / 顺序 / 整体校验 / 取消与续传，只打本机 http.server） | 15 |
 | `tests/test_version_migration.py` | **版本链无断档**（§23b：升版本号必须补一跳）+ 迁移记账 | 19 |
 
-（v1.8.1 全量实测 **283 passed**。加这个文件的原因见下。）
+（v1.8.1 全量实测 **307 passed**。加 `test_version_migration.py` 的原因见下。）
 
 ★ **`tests/test_version_migration.py` 是 2026-10-10 补的**：以前"升版本号要补迁移跳"
 这条只有 `%TEMP%` 里的开发套件守着，而 **`%TEMP%` 会被系统清理** ——

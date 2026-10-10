@@ -737,9 +737,16 @@ class SettingsPage(QWidget):
             destination,
             label=(
                 f"正在下载主程序 v{plan.version}（{plan.main_size}）\n"
-                "下载中断可以重新点「开始下载」续传。"
+                + (
+                    f"这次发布切成 {len(plan.main_parts)} 片，会逐片校验再拼起来。\n"
+                    if plan.main_parts
+                    else ""
+                )
+                + "下载中断可以重新点「开始下载」续传。"
             ),
             expected_sha256=plan.main_sha256,
+            parts=plan.main_parts,
+            expected_size=plan.main_bytes,
         )
         if downloaded is None:
             self._set_update_status("下载已取消，当前程序没有任何改动。", error=True)

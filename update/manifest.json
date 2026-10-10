@@ -1,17 +1,38 @@
 {
   "schema": 1,
-  "version": "1.8",
-  "published": "2026-10-08",
+  "version": "1.8.1",
+  "published": "2026-10-10",
   "_doc": [
     "程序更新清单。v1.9 起 core/updater.check_for_update() 先读这份文件（GITEE_RAW_MANIFEST），读不到才退回解析 Gitee 发行版正文（老路子，已标 deprecated）。",
-    "发版步骤：① 打包出 dist\\transcript-lens.exe；② 传成 Gitee 发行版的附件，把附件直链填进 app.url（形如 https://gitee.com/wuhaotiansystem/transcript-lens/releases/download/v1.9/transcript-lens.exe）；③ 用 Get-FileHash -Algorithm SHA256 和 (Get-Item ...).Length 算出 sha256 与字节数填进 app.sha256 / app.size；④ version 改成这次发的版本号；⑤ 提交并推 master。",
-    "★ app.url / app.size / app.sha256 三样缺任何一样，这份清单就算「不完整」：程序不会拿它去自动更新，而是退回读发行版正文。**宁可退回老路子，也不拿没校验的直链替换用户的程序。**",
-    "★ 重新打包会让 exe 的 sha256 变化（PyInstaller 产物里带时间戳），所以每次发版都要重新算，别抄旧值。"
+    "★ 结构必须是**顶层 app** 段 —— 2026-10-10 踩过一次：写成 `files.app` 那种嵌套结构时 parse_manifest() 直接给 (None, '清单里没有 app 段')，清单路线**静默失效**、退回老路线，而界面上看不出任何异常。判据：tests/test_manifest.py::test_仓库清单只允许空模板或完全填好（**半填也不许**）。",
+    "★ 240MB 的包**传不进 Gitee 附件**（社区版单附件上限 100MB，官方帮助「创建 Release」页原文），所以这份清单用 app.parts 把 exe 顺序切成 3 片：app.size / app.sha256 指**整个 exe**，每一片有自己的 url / size / sha256。程序逐片校验 → 按清单顺序拼接 → 再核整体 sha256（core.updater.download_parts；失败/取消绝不损坏已有 exe，缓存留在 <目标>.parts\\ 供续传）。",
+    "切片的命令：python tools\\split_release.py dist\\transcript-lens.exe --parts 3 --tag <标签名> --version <版本号> --notes \"…\" --out release —— 它会逐片量体积，超过 100MB 上限就要求多切几片，并把可粘贴的 app 段打印出来。",
+    "上传：Gitee 发行版**附件**（网页拖拽，或 API POST /repos/{owner}/{repo}/releases/{release_id}/attach_files，release_id 用 GET /repos/{owner}/{repo}/releases 查）。★ 发行版页面上自动生成的 <标签>.zip / .tar.gz 是源码包，**不是** exe 附件。",
+    "发版步骤：① 打包出 dist\\transcript-lens.exe；② 用上面的命令切片；③ 把每片传成附件（文件名照抄切出来的名字）；④ 把 app.parts / app.size / app.sha256 / version 填成打印出来的那份；⑤ 提交并推 master；⑥ **用 HEAD/Range 复查每条直链**能不能下、Content-Length 与清单一致。",
+    "★ app.url / app.size / app.sha256（单文件模式）或 app.size / app.sha256 + app.parts（分片模式）缺任何一样，这份清单就算「不完整」：程序不会拿它去自动更新，而是退回读发行版正文。**宁可退回老路子，也不拿没校验的直链替换用户的程序。**",
+    "★ 重新打包会让 exe 的 sha256 变化（PyInstaller 产物里带时间戳），所以每次发版都要重新切、重新算，别抄旧值。"
   ],
   "app": {
     "url": "",
-    "size": 0,
-    "sha256": "",
-    "notes": ""
+    "size": 240099567,
+    "sha256": "bc58221ee32644d1b43bc4c0abbba5bc062d3ea9d61f8e32cc7eeb17a215e211",
+    "notes": "v1.8.1：修好成绩导入解析器的表格干扰（统计列 / 末尾汇总行 / 合并大标题不再被当成学生成绩）；新增德育分批量导入与 AI 模型中心；更新检查改走清单直链。",
+    "parts": [
+      {
+        "url": "https://gitee.com/wuhaotiansystem/transcript-lens/releases/download/1.8.1/transcript-lens-v1.8.1.exe.part1",
+        "size": 80033189,
+        "sha256": "d72048d670fed15a1ab1253057e04a9719eddfbd09d9728f138962adb6128d16"
+      },
+      {
+        "url": "https://gitee.com/wuhaotiansystem/transcript-lens/releases/download/1.8.1/transcript-lens-v1.8.1.exe.part2",
+        "size": 80033189,
+        "sha256": "f32dd312b498a85827a4186687a495bfc46602802cdc46d476e256113b65c326"
+      },
+      {
+        "url": "https://gitee.com/wuhaotiansystem/transcript-lens/releases/download/1.8.1/transcript-lens-v1.8.1.exe.part3",
+        "size": 80033189,
+        "sha256": "abea2b2a3fa60cffae5fdff72f2bf27ad20175b4a5c1ea7389f0c12fc1ce3059"
+      }
+    ]
   }
 }

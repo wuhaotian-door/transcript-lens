@@ -83,15 +83,17 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from core.version import CURRENT_VERSION, compare_versions, is_newer, normalize_version
 
 __all__ = [
+    "ATTACHMENT_LIMIT_BYTES",
     "CHUNK_SIZE",
     "CURRENT_VERSION",
     "DEFAULT_TIMEOUT",
@@ -105,6 +107,7 @@ __all__ = [
     "MANIFEST_SCHEMA",
     "MIN_EXE_BYTES",
     "ManifestApp",
+    "ManifestPart",
     "NO_RELEASE",
     "SOURCE_MANIFEST",
     "SOURCE_RELEASE",
@@ -116,6 +119,7 @@ __all__ = [
     "check_for_update",
     "check_latest_version",
     "download_exe",
+    "download_parts",
     "fetch_manifest",
     "human_size",
     "latest_release",
@@ -186,6 +190,17 @@ DOWNLOAD_TIMEOUT = 30
 #: 拿它去替换用户的程序是灾难。实测打包出来的 exe 是 228MB 量级。
 MIN_EXE_BYTES = 1 * 1024 * 1024
 
+#: Gitee **单个附件**的上限（社区版）：100MB。
+#:
+#: ★ 2026-10-10 查官方帮助确认（"创建 Release"页原文：单个附件不能超过 100M，
+#:   GVP 项目 200M）。我们打出来的 onefile exe 是 **240MB**，也就是说
+#:   **根本传不上去** —— 所以清单支持 `app.parts`：把 exe 切成几片分别传，
+#:   程序自己逐片校验再拼回来。
+#:
+#: 这条只用来判断"传得上去吗"（见 :attr:`ManifestPart.oversize_on_gitee`），
+#: **不是**运行期的下载限制：托管在别处（网盘 / 对象存储）的分片想多大都行。
+ATTACHMENT_LIMIT_BYTES = 100 * 1024 * 1024
+
 
 class DownloadCancelled(Exception):
     """用户点了「取消下载」。
@@ -248,19 +263,68 @@ def human_size(size: Any) -> str:
 
 
 @dataclass(frozen=True)
+class ManifestPart:
+    """清单里 ``app.parts`` 的一片（v1.8.1 新增）。
+
+    为什么要有它：Gitee 社区版**单个附件上限 100MB**，而我们的 onefile exe
+    是 240MB 量级 —— 传不上去。于是发版时把 exe 切成几片分别当附件传，
+    程序逐片校验、拼回原样、再核对**整体** sha256。
+
+    ==============  =======================================================
+    字段             说明
+    ==============  =======================================================
+    ``url``         这一片的直链
+    ``size``        这一片的字节数
+    ``sha256``      这一片的 sha256（下完就校验，坏片不会混进拼接）
+    ==============  =======================================================
+
+    ★ **片内的 sha256 与整体的 sha256 都要有**：只看整体哈希的话，一个坏片
+      要等全部下完才被发现；只看片哈希的话，片与片之间的**顺序与缺失**
+      没人管。两个都要，见 :attr:`ManifestApp.usable`。
+    """
+
+    url: str = ""
+    size: int = 0
+    sha256: str = ""
+
+    @property
+    def usable(self) -> bool:
+        """直链、体积、哈希三样齐全才敢用。"""
+        return bool(self.url) and self.size > 0 and bool(self.sha256)
+
+    @property
+    def oversize_on_gitee(self) -> bool:
+        """托管在 Gitee 上、却超过了单附件上限 —— 传不上去的那种片。
+
+        ★ 只管 gitee.com 的直链：托管在网盘 / 对象存储上的片不受这条限制。
+        """
+        return "gitee.com" in self.url and self.size > ATTACHMENT_LIMIT_BYTES
+
+    @property
+    def size_text(self) -> str:
+        """给人看的体积（``"76.3 MB"``）。"""
+        return human_size(self.size)
+
+
+@dataclass(frozen=True)
 class ManifestApp:
     """``update/manifest.json`` 里 ``app`` 段的内容。
 
     ==============  =======================================================
     字段             说明
     ==============  =======================================================
-    ``version``     这次发布的版本号（``"1.9"``）
-    ``url``         主程序 exe 的直链
+    ``version``     这次发布的版本号（``"1.8.1"``）
+    ``url``         主程序 exe 的直链（**单文件**时用；多段时留空）
     ``size``        字节数（``0`` = 清单里没写）
     ``sha256``      小写 64 位十六进制（空串 = 清单里没写）
     ``notes``       发版说明（纯文本，**不许写 Markdown** —— 总纲 §三 铁律 9）
     ``published``   发布日期文字，只用于显示
+    ``parts``       多段下载的分片（v1.8.1 新增；空 = 走单文件那套）
     ==============  =======================================================
+
+    ★ ``size`` / ``sha256`` 在两种模式下都指**整个 exe**：单文件时它就是那个
+      文件的体积与哈希；多段时它是**拼回来之后**的体积与哈希
+      （每一片自己的体积/哈希在 :class:`ManifestPart` 里）。
     """
 
     version: str = ""
@@ -269,20 +333,45 @@ class ManifestApp:
     sha256: str = ""
     notes: str = ""
     published: str = ""
+    parts: tuple[ManifestPart, ...] = ()
+
+    @property
+    def multi_part(self) -> bool:
+        """这份清单是不是"切成几片"的发布。"""
+        return bool(self.parts)
 
     @property
     def usable(self) -> bool:
-        """够不够格拿来**自动更新**：直链、体积、哈希三样缺一不可。
+        """够不够格拿来**自动更新**。
+
+        单文件：直链、体积、哈希三样缺一不可（v1.9 起就是这样）。
+
+        多段：每一片三样齐全、**片的体积之和等于整体体积**、整体哈希有写，
+        并且**托管在 Gitee 上的片不许超过 100MB 上限**（传不上去的清单
+        等于死的，宁可不认）。
 
         ★ 少任何一样都宁可退回老路子。拿一个"不知道多大、也没法校验"的文件
           去覆盖用户手里的程序，不是勇敢，是不负责任。
         """
+        if self.parts:
+            if self.size <= 0 or not self.sha256:
+                return False
+            if sum(p.size for p in self.parts) != self.size:
+                return False
+            return all(p.usable and not p.oversize_on_gitee for p in self.parts)
         return bool(self.url) and self.size > 0 and bool(self.sha256)
 
     @property
     def size_text(self) -> str:
         """给人看的体积（``"223.5 MB"``）；没写体积时给空串。"""
         return human_size(self.size)
+
+    @property
+    def parts_text(self) -> str:
+        """给界面用的一句"分几片"（单文件时给空串）。"""
+        if not self.parts:
+            return ""
+        return f"{len(self.parts)} 片"
 
 
 def parse_manifest(payload: Any) -> tuple[ManifestApp | None, str]:
@@ -317,6 +406,26 @@ def parse_manifest(payload: Any) -> tuple[ManifestApp | None, str]:
     # 发版说明同理：优先 app.notes，其次顶层 notes。
     notes = str(app.get("notes") or payload.get("notes") or "").strip()
 
+    # 分片（v1.8.1 新增）：`app.parts` 是一个列表，每项 url / size / sha256。
+    # ★ 结构不对的项**照样收进来**（宁可让它 usable=False 明确报错，
+    #   也不要静默丢掉一片 —— 丢一片就是拼出半个 exe 去替换用户的程序）。
+    raw_parts = app.get("parts")
+    parts: list[ManifestPart] = []
+    if isinstance(raw_parts, list):
+        for item in raw_parts:
+            if not isinstance(item, dict):
+                parts.append(ManifestPart())
+                continue
+            parts.append(
+                ManifestPart(
+                    url=str(item.get("url") or "").strip(),
+                    size=_positive_int(item.get("size")),
+                    sha256=normalize_sha256(item.get("sha256")),
+                )
+            )
+    elif raw_parts is not None:
+        return None, "清单里 app.parts 不是一个列表"
+
     manifest = ManifestApp(
         version=version,
         url=str(app.get("url") or "").strip(),
@@ -324,10 +433,22 @@ def parse_manifest(payload: Any) -> tuple[ManifestApp | None, str]:
         sha256=normalize_sha256(app.get("sha256")),
         notes=notes,
         published=str(payload.get("published") or "").strip(),
+        parts=tuple(parts),
     )
-    if not manifest.usable:
-        return manifest, "清单里 app.url / app.size / app.sha256 没写全"
-    return manifest, ""
+    if manifest.usable:
+        return manifest, ""
+    if manifest.multi_part:
+        if any(not p.usable for p in manifest.parts):
+            return manifest, "清单里的分片有缺 url / size / sha256 的"
+        if any(p.oversize_on_gitee for p in manifest.parts):
+            return manifest, (
+                f"有分片超过 Gitee 单附件上限（{human_size(ATTACHMENT_LIMIT_BYTES)}）"
+                "，传不上去"
+            )
+        if sum(p.size for p in manifest.parts) != manifest.size:
+            return manifest, "分片体积之和与 app.size 对不上"
+        return manifest, "清单里 app.size / app.sha256 没写全"
+    return manifest, "清单里 app.url / app.size / app.sha256 没写全"
 
 
 def fetch_manifest(
@@ -387,6 +508,7 @@ class UpdateCheck:
     sha256: str = ""
     notes: str = ""
     source: str = ""
+    parts: tuple[ManifestPart, ...] = ()
 
     @property
     def reachable(self) -> bool:
@@ -398,12 +520,35 @@ class UpdateCheck:
         return self.status == STATUS_NEWER
 
     @property
+    def multi_part(self) -> bool:
+        """这次要下的是**切成几片**的主程序（v1.8.1 新增）。"""
+        return bool(self.parts)
+
+    @property
     def has_direct_link(self) -> bool:
-        """带出了**能校验**的直链（三样齐全），可以走自动下载。
+        """带出了**能校验**的直链，可以走自动下载。
+
+        单文件：``url`` + ``size`` + ``sha256`` 三样齐全；
+        多段（v1.8.1）：有分片、整体 ``size``/``sha256`` 齐全，
+        且每一片自己也是三样齐全。
 
         ★ 少一样就 ``False`` —— 界面这时只能给"打开浏览器自己下"。
         """
+        if self.parts:
+            return (
+                self.size > 0
+                and bool(self.sha256)
+                and all(p.usable for p in self.parts)
+                and sum(p.size for p in self.parts) == self.size
+            )
         return bool(self.url) and self.size > 0 and bool(self.sha256)
+
+    @property
+    def parts_text(self) -> str:
+        """给界面用的一句"分几片"（单文件时给空串）。"""
+        if not self.parts:
+            return ""
+        return f"{len(self.parts)} 片"
 
     @property
     def size_text(self) -> str:
@@ -542,6 +687,7 @@ def _from_manifest(app: ManifestApp, current: str) -> UpdateCheck:
             sha256=app.sha256,
             notes=app.notes,
             source=SOURCE_MANIFEST,
+            parts=app.parts,
         )
     if compare_versions(app.version, current) < 0:
         # 清单上的版本比本机还旧（比如发版人忘了更新清单）——
@@ -1057,4 +1203,142 @@ def download_exe(
     if progress_callback is not None:
         progress_callback(written, total or written)
     return dest
+
+
+def download_parts(
+    parts: Sequence[ManifestPart],
+    dest_path: str | Path,
+    progress_callback: Callable[[int, int | None], None] | None = None,
+    *,
+    timeout: float = DOWNLOAD_TIMEOUT,
+    resume: bool = True,
+    cancel: Callable[[], bool] | None = None,
+    expected_sha256: str = "",
+    expected_size: int = 0,
+    min_bytes: int = MIN_EXE_BYTES,
+) -> Path:
+    """把**切成几片**的主程序下回来、拼好、校验（v1.8.1 新增）。
+
+    为什么会有这个函数：Gitee 社区版单个附件上限 100MB，而 onefile exe 是
+    240MB 量级 —— 只能切片上传。切片带来的风险必须由这一段代码兜住，
+    所以它的保证比 :func:`download_exe` 只多不少：
+
+    1. **逐片校验**：每一片下完先核 ``part.sha256``，坏片立刻丢弃重下，
+       绝不混进拼接（否则要等 240MB 全下完才发现白干）；
+    2. **顺序固定**：拼接顺序就是清单里 ``app.parts`` 的顺序，不看文件名；
+    3. **整体再校验**：拼完核 ``expected_sha256``（整个 exe 的哈希）
+       与 ``expected_size``，任何一条不过就**不写目标文件**；
+    4. **全程只写 ``<dest>.part``**，成功之后才 ``os.replace`` ——
+       与 :func:`download_exe` 同一条红线：失败/取消**绝不损坏已有 exe**；
+    5. **可续传**：每片缓存在 ``<dest>.parts/partNN``，取消/断网后再点一次，
+       已经校验过的片**直接跳过**（连请求都不发）；
+    6. 全部成功后才清掉 ``<dest>.parts/``。
+
+    Args:
+        parts: 分片清单（顺序即拼接顺序）。
+        dest_path: 最终目标文件。
+        progress_callback: ``callback(已下载字节, 总字节或 None)`` ——
+            **整条链的累计进度**，不是某一片的。
+        timeout: 每块之间的超时（秒）。
+        resume: 允不允许续传（片级 + 整体）。
+        cancel: 无参可调用对象，返回真表示用户要取消。
+        expected_sha256: **拼好后**整个文件的 sha256；空串 = 不校验。
+        expected_size: **拼好后**整个文件的字节数；``0`` = 不校验。
+        min_bytes: 拼好后小于这个数判失败（防"下回来一个错误页"）。
+
+    Returns:
+        真正的目标路径（:class:`pathlib.Path`）。
+
+    Raises:
+        DownloadCancelled: 用户取消。
+        DownloadError: 网络失败 / 片校验不过 / 体积对不上 / 整体校验不过。
+    """
+    if not parts:
+        raise DownloadError("没有任何分片可下 —— 清单里的 app.parts 是空的。")
+
+    dest = Path(dest_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    whole = dest.with_name(dest.name + ".part")
+    pool = dest.with_name(dest.name + ".parts")
+    pool.mkdir(parents=True, exist_ok=True)
+
+    total: int | None = expected_size or sum(p.size for p in parts) or None
+    done_before = 0
+
+    # --- 1. 逐片下载 ---------------------------------------------------
+    for index, piece in enumerate(parts, start=1):
+        cache = pool / f"part{index:02d}"
+        if resume and _looks_complete(cache, piece.size, piece.sha256):
+            done_before += piece.size
+            if progress_callback is not None:
+                progress_callback(done_before, total)
+            continue
+
+        def _relay(written: int, _inner: int | None, _base: int = done_before) -> None:
+            if progress_callback is not None:
+                progress_callback(_base + written, total)
+
+        download_exe(
+            piece.url,
+            cache,
+            _relay,
+            timeout=timeout,
+            resume=resume,
+            cancel=cancel,
+            expected_sha256=piece.sha256,
+            min_bytes=min(piece.size, MIN_EXE_BYTES),
+        )
+        done_before += piece.size
+
+    # --- 2. 按清单顺序拼接 ---------------------------------------------
+    written = 0
+    try:
+        with open(whole, "wb") as sink:
+            for index in range(1, len(parts) + 1):
+                with open(pool / f"part{index:02d}", "rb") as source:
+                    while True:
+                        block = source.read(CHUNK_SIZE)
+                        if not block:
+                            break
+                        sink.write(block)
+                        written += len(block)
+            sink.flush()
+            os.fsync(sink.fileno())
+    except OSError as exc:
+        raise DownloadError(
+            f"拼接分片失败：{exc}。已下好的分片留在 {pool.name}\\ 里，重试不用重下。"
+        ) from exc
+
+    # --- 3. 整体校验（先体积、后哈希）----------------------------------
+    if expected_size and written != expected_size:
+        raise DownloadError(
+            f"拼出来的文件是 {written} 字节，清单声明 {expected_size} 字节 —— "
+            "分片可能不完整。已丢弃，请重试或到发行版页面手动下载。"
+        )
+    if min_bytes and written < min_bytes:
+        raise DownloadError(
+            f"拼出来的文件只有 {written} 字节，明显不是程序本体"
+            f"（至少应有 {min_bytes} 字节）。请到发行版页面手动下载。"
+        )
+    if expected_sha256 and not verify_checksum(whole, expected_sha256):
+        raise DownloadError(
+            "分片全部下完，但拼起来的整体 SHA256 校验不一致 —— "
+            "文件可能在传输中损坏，或与发行版声明的不符。已丢弃，请重试。"
+        )
+
+    os.replace(whole, dest)
+    shutil.rmtree(pool, ignore_errors=True)
+    if progress_callback is not None:
+        progress_callback(written, total or written)
+    return dest
+
+
+def _looks_complete(path: Path, size: int, sha256: str) -> bool:
+    """``path`` 是不是一片**已经下好且校验过**的分片（续传时用它跳过请求）。"""
+    try:
+        if not path.is_file() or path.stat().st_size != size:
+            return False
+    except OSError:
+        return False
+    return verify_checksum(path, sha256)
 

@@ -64,8 +64,10 @@ from core.ai.model_downloader import ModelInfo, catalog_from_release
 from core.updater import (
     DownloadCancelled,
     DownloadError,
+    ManifestPart,
     UpdateCheck,
     download_exe,
+    download_parts,
     parse_release_body,
 )
 from core.version import CURRENT_VERSION
@@ -100,11 +102,25 @@ class UpdatePlan:
     main_url: str = ""
     main_size: str = DEFAULT_MAIN_SIZE
     main_sha256: str = ""
+    #: 主程序**总的**字节数（0 = 不知道）。多段下载要用它核对拼回来的体积。
+    main_bytes: int = 0
+    #: 主程序的下载分片（v1.8.1 起；空 = 走单文件那套）。
+    main_parts: tuple[ManifestPart, ...] = ()
     models: list[ModelInfo] = field(default_factory=list)
 
     @property
+    def multi_part(self) -> bool:
+        """主程序是不是"切成几片"发布的。"""
+        return bool(self.main_parts)
+
+    @property
     def has_main(self) -> bool:
-        return bool(self.main_url)
+        return bool(self.main_url) or bool(self.main_parts)
+
+    def main_label(self) -> str:
+        """复选框上那句"主程序更新（…）"。"""
+        suffix = f"，{len(self.main_parts)} 片" if self.main_parts else ""
+        return f"主程序更新（{self.main_size}{suffix}）"
 
     def selected(self, wanted: list[str]) -> list[ModelInfo]:
         """按名字挑出用户勾上的模型（保持清单顺序）。"""
@@ -119,6 +135,10 @@ def plan_from_release(check: UpdateCheck, release: Any = None) -> UpdatePlan:
     （:attr:`~core.updater.UpdateCheck.has_direct_link`）时，直链 / 体积 / 哈希
     直接用它们，**不再解析正文**；否则退回解析 Release 正文
     （``core.updater.parse_release_body``，已标 deprecated）。
+
+    v1.8.1 起清单还可以给 ``app.parts``（Gitee 单附件上限 100MB，
+    240MB 的包只能切片传）—— 那时 ``main_url`` 是空的、``main_parts`` 有值，
+    界面与下载流程都按"分片"走。
 
     Args:
         check: :func:`core.updater.check_for_update` 的结果。
@@ -139,12 +159,16 @@ def plan_from_release(check: UpdateCheck, release: Any = None) -> UpdatePlan:
     main_url = str(parsed.get("main") or "")
     main_size = sizes.get("main") or DEFAULT_MAIN_SIZE
     main_sha256 = checksums.get("main", "")
+    main_bytes = 0
+    main_parts: tuple[ManifestPart, ...] = ()
 
     if check.has_direct_link:
-        # 清单路线：三个字段都是**结构化**给的，比正则抠正文靠谱
+        # 清单路线：这些字段都是**结构化**给的，比正则抠正文靠谱
         main_url = check.url
         main_size = check.size_text or DEFAULT_MAIN_SIZE
         main_sha256 = check.sha256
+        main_bytes = check.size
+        main_parts = check.parts
 
     return UpdatePlan(
         version=check.version or CURRENT_VERSION,
@@ -152,6 +176,8 @@ def plan_from_release(check: UpdateCheck, release: Any = None) -> UpdatePlan:
         main_url=main_url,
         main_size=main_size,
         main_sha256=main_sha256,
+        main_bytes=main_bytes,
+        main_parts=main_parts,
         models=catalog_from_release(body),
     )
 
@@ -176,6 +202,9 @@ class _DownloadTask(QRunnable):
         signals: _DownloadSignals,
         expected_sha256: str,
         cancel: Any,
+        *,
+        parts: tuple[ManifestPart, ...] = (),
+        expected_size: int = 0,
     ) -> None:
         super().__init__()
         self._url = url
@@ -183,18 +212,36 @@ class _DownloadTask(QRunnable):
         self._signals = signals
         self._sha = expected_sha256
         self._cancel = cancel
+        self._parts = parts
+        self._size = expected_size
         self.setAutoDelete(True)
 
     def run(self) -> None:  # pragma: no cover - 后台线程
+        def _report(done: int, total: int | None) -> None:
+            self._signals.progress.emit(done, int(total or 0))
+
         try:
-            path = download_exe(
-                self._url,
-                self._dest,
-                lambda done, total: self._signals.progress.emit(done, int(total or 0)),
-                cancel=self._cancel,
-                expected_sha256=self._sha,
-                min_bytes=0 if self._sha else 1024 * 1024,
-            )
+            if self._parts:
+                # v1.8.1：清单把主程序切成几片（Gitee 单附件 ≤100MB）——
+                # 逐片校验 + 拼接 + 整体 sha256，保证与 download_exe 同等强度。
+                path = download_parts(
+                    self._parts,
+                    self._dest,
+                    _report,
+                    cancel=self._cancel,
+                    expected_sha256=self._sha,
+                    expected_size=self._size,
+                    min_bytes=0,
+                )
+            else:
+                path = download_exe(
+                    self._url,
+                    self._dest,
+                    _report,
+                    cancel=self._cancel,
+                    expected_sha256=self._sha,
+                    min_bytes=0 if self._sha else 1024 * 1024,
+                )
         except DownloadCancelled:
             self._signals.cancelled.emit()
         except (DownloadError, OSError, ValueError) as exc:
@@ -347,12 +394,17 @@ def download_release(
     *,
     label: str,
     expected_sha256: str = "",
+    parts: tuple[ManifestPart, ...] = (),
+    expected_size: int = 0,
 ) -> str | None:
     """模态下载一个文件，返回**下载好的路径**；取消或失败返回 ``None``。
 
     ★ 阻塞（跑一个局部事件循环）而不是回调 —— 调用方是一条线性流程
       （选模块 → 下载 → 问重启），用信号把三步拆开会多出一堆状态机。
       Qt 的 ``QEventLoop`` 在这里是合适的：进度条照样刷新、取消按钮照样能点。
+
+    ★ ``parts`` 非空 = 主程序是**切成几片**发布的（v1.8.1）：
+      那时 ``url`` 是空的，下载走 :func:`core.updater.download_parts`。
     """
     from PySide6.QtCore import QEventLoop
 
@@ -380,7 +432,15 @@ def download_release(
     signals.failed.connect(_failed)
     signals.cancelled.connect(_cancelled)
 
-    task = _DownloadTask(url, Path(dest), signals, expected_sha256, lambda: dialog.cancelled)
+    task = _DownloadTask(
+        url,
+        Path(dest),
+        signals,
+        expected_sha256,
+        lambda: dialog.cancelled,
+        parts=parts,
+        expected_size=expected_size,
+    )
     QThreadPool.globalInstance().start(task)
 
     dialog.show()
@@ -431,9 +491,7 @@ class ModuleChoiceDialog(QDialog):
         box.addWidget(note)
 
         # --- 主程序 -------------------------------------------------------
-        self._main_box = QCheckBox(
-            f"主程序更新（{plan.main_size}）"
-        )
+        self._main_box = QCheckBox(plan.main_label())
         self._main_box.setChecked(plan.has_main)
         self._main_box.setEnabled(False)      # 主程序是必选项，不给取消
         if not plan.has_main:

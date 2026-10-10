@@ -1646,10 +1646,19 @@ def _download_policy_lines() -> list[str]:
             lines.append(f"FAIL  更新下载引了第三方 HTTP 客户端：{offenders}")
         elif "def download_exe(" not in source:
             lines.append("FAIL  core/updater.py 里没有 download_exe（下载没实现）")
+        elif "def download_parts(" not in source:
+            # v1.8.1：Gitee 单附件上限 100MB，240MB 的包只能切片传 ——
+            # 没有 download_parts 就等于"发不出去的包，也没人能自动更新"。
+            lines.append("FAIL  core/updater.py 里没有 download_parts（分片下载没实现）")
+        elif "ATTACHMENT_LIMIT_BYTES" not in source:
+            lines.append(
+                "FAIL  没有 ATTACHMENT_LIMIT_BYTES —— Gitee 单附件 100MB 上限"
+                "没写进代码，切片大小就没人管了"
+            )
         else:
             lines.append(
                 f"ok    {'更新下载只用 stdlib':<32} "
-                "download_exe 在，无 requests/httpx/aiohttp"
+                "download_exe + download_parts 在，无 requests/httpx/aiohttp"
             )
     else:
         try:
@@ -1657,10 +1666,12 @@ def _download_policy_lines() -> list[str]:
 
             if not callable(getattr(_u, "download_exe", None)):  # pragma: no cover
                 lines.append("FAIL  打包版 core.updater 里没有 download_exe")
+            elif not callable(getattr(_u, "download_parts", None)):
+                lines.append("FAIL  打包版 core.updater 里没有 download_parts")
             else:
                 lines.append(
                     f"ok    {'更新下载（打包版）':<32} 无 .py 源码（打进 PYZ），"
-                    "download_exe 已就位"
+                    "download_exe + download_parts 都已就位"
                 )
         except Exception as exc:  # noqa: BLE001
             lines.append(f"FAIL  打包版更新下载检查失败：{type(exc).__name__}: {exc}")
@@ -1691,6 +1702,56 @@ def _download_policy_lines() -> list[str]:
                 )
     except Exception as exc:  # noqa: BLE001
         lines.append(f"FAIL  下载安全行为检查失败：{type(exc).__name__}: {exc}")
+
+    # --- 2b. 行为：分片下载失败/坏片同样不损坏已有文件（v1.8.1）-----------
+    try:
+        import tempfile
+        from pathlib import Path as _Path
+
+        from core.updater import (
+            ATTACHMENT_LIMIT_BYTES,
+            DownloadError,
+            ManifestPart,
+            download_parts,
+        )
+
+        if ATTACHMENT_LIMIT_BYTES != 100 * 1024 * 1024:
+            lines.append(
+                f"FAIL  Gitee 单附件上限被改成了 {ATTACHMENT_LIMIT_BYTES} 字节"
+                "（官方是 100MB）"
+            )
+        else:
+            with tempfile.TemporaryDirectory(prefix="tl_selfcheck_parts_") as work:
+                target = _Path(work) / "existing.exe"
+                target.write_bytes(b"PRECIOUS-PARTS")
+                bad = (
+                    ManifestPart(
+                        url="http://invalid.invalid/p1.bin", size=4, sha256="0" * 64
+                    ),
+                    ManifestPart(
+                        url="http://invalid.invalid/p2.bin", size=4, sha256="0" * 64
+                    ),
+                )
+                try:
+                    download_parts(
+                        bad,
+                        target,
+                        timeout=2,
+                        expected_sha256="1" * 64,
+                        expected_size=8,
+                        min_bytes=0,
+                    )
+                except DownloadError:
+                    pass
+                if target.read_bytes() != b"PRECIOUS-PARTS":
+                    lines.append("FAIL  分片下载失败时把已有文件改掉了")
+                else:
+                    lines.append(
+                        f"ok    {'分片下载失败不损坏文件':<32} "
+                        "真跑一次失败的分片下载，目标文件逐字节未变"
+                    )
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"FAIL  分片下载安全行为检查失败：{type(exc).__name__}: {exc}")
 
     # --- 3. AI 下载器不引入 HTTP import（那条闸门不需要放宽）--------------
     downloader = PROJECT_ROOT / "core" / "ai" / "model_downloader.py"
