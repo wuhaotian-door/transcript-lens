@@ -117,6 +117,21 @@ def _lift_1_7_to_1_8(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def _lift_1_8_to_1_8_1(data: dict[str, Any]) -> dict[str, Any]:
+    """1.8 → 1.8.1：**没有数据结构变化**。
+
+    v1.8.1 是把"v1.8.2 的文档合并 + v1.9 的四项功能"打成的**发布版本**。
+    v1.9 只**新增**文件（``moral_batches.json.enc``、``models/installed.json``）
+    与配置（``update/manifest.json``、``update/ai_models.json``），加密库里
+    一个字段都没增删；``core/parser.py`` 的表格干扰修复只影响**新导入**的结果，
+    已经存进库里的班级数据原样可读。
+
+    ★ 这一跳是**发版需要**（更新检查靠版本号比大小），不是"数据结构变了" ——
+      所以照旧什么都不用改，只把标记从 1.8 抬到 1.8.1。
+    """
+    return data
+
+
 #: 版本链：``(起点, 终点, 变换函数)``。
 #:
 #: ★ 这是"未来版本在此添加分支"的那张表（任务书 2.3）。加一跳只需要
@@ -125,6 +140,7 @@ _STEPS: tuple[tuple[str, str, Callable[[dict[str, Any]], dict[str, Any]]], ...] 
     ("1.0", "1.6", _lift_1_0_to_1_6),
     ("1.6", "1.7", _lift_1_6_to_1_7),
     ("1.7", "1.8", _lift_1_7_to_1_8),
+    ("1.8", "1.8.1", _lift_1_8_to_1_8_1),
 )
 
 

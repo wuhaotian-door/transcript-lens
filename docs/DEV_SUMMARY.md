@@ -41,7 +41,7 @@
 
 **v1.8 / v1.8.1 / v1.8.2 已发布**（v1.8.2 把 5 份开发文档合并成本文，提交 `e2d7edd`）。
 
-**v1.9 已在工作区完成（未发版）**，三件事 + 一个 Bug 修复：
+**v1.9 的功能已在工作区完成**，三件事 + 一个 Bug 修复：
 
 | 项 | 落地位置 |
 |---|---|
@@ -49,6 +49,12 @@
 | 批量导入德育分 | `core/import_workers.py` + `ui/moral_import_dialog.py` + 奖学金页按钮（§二十一） |
 | AI 模型中心 | `core/ai/model_registry.py` + `ui/model_center_dialog.py` + 设置页入口（§八） |
 | 更新器改走 `update/manifest.json` | `core/updater.py`（§6.3） |
+
+★ **2026-10-10 起按 `v1.8.1` 发版**（对应提交 `e3b6e75`，标签 `1.8.1`）：
+程序版本号 `CURRENT_VERSION` 从 `"1.8"` 升到 `"1.8.1"` —— 这是**发版需要**
+（更新检查靠版本号比大小，清单版本必须大于用户手上的版本），
+不是数据结构变化；迁移链相应补了 `("1.8", "1.8.1")` 一跳空迁移。
+理由与判据见 §16.5，闸门在 `tests/test_version_migration.py`。
 
 **v1.9 之后没有待办功能**，只有第 17 节的已知限制（都是"记录在案、暂不修"
 的类型）。下一个版本要做什么，先问 Owner。
@@ -248,6 +254,20 @@ GET https://gitee.com/wuhaotiansystem/transcript-lens/raw/master/update/manifest
 | 清单 404 / 连不上 / JSON 坏 | 不报故障，**退回旧路线**（`source="release"`） |
 | 两条路都走不通 | 才报"仓库里还没有发布任何发行版" |
 | 结果来自哪条路 | `UpdateCheck.source` = `"manifest"` 或 `"release"`，界面据此显示直链与大小 |
+
+★ **2026-10-10 起仓库里这份清单是"填好的"**（`version: 1.8.1`，`app` 三件套齐全，
+指向 Gitee 发行版 `1.8.1` 的附件），不再是空模板。两个踩过的坑各留一句
+（清单自己的 `_doc` 里写得更细）：
+
+* **结构必须是顶层 `app`** —— 有人写成 `files.app` 那种嵌套结构，`parse_manifest()`
+  直接给 `(None, '清单里没有 app 段')`：**清单路线静默失效**、退回老路线，
+  清单里填的 url/size/sha256 一个都没生效，而界面上完全看不出来。
+  判据现在在仓库里：`tests/test_manifest.py::test_仓库清单只允许空模板或完全填好`
+  —— **半填也不许**（只有 url 没有 sha256 同样等于白填）。
+* **直链里的标签名必须照抄真实标签** —— 本仓库标签是 `1.8.1`（**不带 `v` 前缀**），
+  写成 `.../releases/download/v1.8.1/...` 一定 404；而且发行版页面上那两个
+  `1.8.1.zip` / `1.8.1.tar.gz` 是 Gitee **自动生成**的源码包，
+  **不等于**"已经上传了 exe 附件"。
 
 **旧路线（Release 描述正文）保留但已 deprecated**：`parse_release_body()` 与
 `latest_release()` 上面都标了 deprecated，`model_downloader.catalog_from_release()`
@@ -701,10 +721,24 @@ C:\Users\<系统用户>\AppData\Local\SGMS\
 
 ### 16.5 ⚠️ 提交号 vs 程序版本号
 
-删除激活码的提交标的是 **v1.8.1**，但 `CURRENT_VERSION` **仍然是 `"1.8"`** ——
-因为数据格式一个字节都没变，升 `CURRENT_VERSION` 会凭空让所有 v1.8 用户的库
-变成"比程序旧"、触发一次没有必要的迁移提示。**下次真有数据格式变化时，
-把版本号和迁移链一起升。**
+提交前缀（`feat(v1.8.1)` / `docs(v1.8.2)` / `feat(v1.9)`）是**开发批次**的编号，
+`CURRENT_VERSION` 是**程序**版本 —— 两者不是一回事，**但发版时必须让它们对上**。
+两次不一致都记在案：
+
+* 删激活码那批标的是 **v1.8.1**，当时 `CURRENT_VERSION` 仍是 `"1.8"` ——
+  数据格式没变，升它会让所有 v1.8 用户的库凭空变成"比程序旧"、多弹一次
+  没有必要的迁移提示，所以当时**刻意不升**；
+* **2026-10-10 正式按 `v1.8.1` 发版**（提交 `e3b6e75`，标签 `1.8.1`）：
+  `CURRENT_VERSION = "1.8.1"`。理由是**发版需要** ——
+  `core.updater.is_newer(清单版本, CURRENT_VERSION)` 决定要不要提示更新，
+  **清单里的版本号必须大于用户手上的版本号**，否则更新提示永远不出现。
+
+★ 所以这次升版本号**不是**数据结构变化，迁移链里补的是
+`("1.8", "1.8.1", _lift_1_8_to_1_8_1)` 这样一跳空迁移（`return data`）。
+规矩仍是 AGENTS.md §23b：**每升一次 `CURRENT_VERSION`，`_STEPS` 就要多一跳**，
+哪怕什么都没改。判据现在落在**仓库内**（`%TEMP%` 会被系统清理，靠不住）：
+`tests/test_version_migration.py` 遍历 `known_data_versions()`，
+任何一个旧版本迁不过来（断档 → `MigrationError`）就直接红。
 
 ---
 
@@ -756,11 +790,23 @@ C:\Users\<系统用户>\AppData\Local\SGMS\
 | `tests/test_parser_filters.py` | v1.9 三类表格干扰过滤 | 49 |
 | `tests/test_import.py` | 批量导入德育分（校验四规则 / CSV / 落库） | 40 |
 | `tests/test_model_registry.py` | 模型清单解析 / 内存闸门 / 装没装 / 勾选 | 109 |
-| `tests/test_manifest.py` | `update/manifest.json` 优先 + 退回旧路线 | 58 |
+| `tests/test_manifest.py` | `update/manifest.json` 优先 + 退回旧路线 + **仓库那份清单不许半填** | 58 |
+| `tests/test_version_migration.py` | **版本链无断档**（§23b：升版本号必须补一跳）+ 迁移记账 | 19 |
 
-（v1.9 全量实测 **264 passed**。）
+（v1.8.1 全量实测 **283 passed**。加这个文件的原因见下。）
+
+★ **`tests/test_version_migration.py` 是 2026-10-10 补的**：以前"升版本号要补迁移跳"
+这条只有 `%TEMP%` 里的开发套件守着，而 **`%TEMP%` 会被系统清理** ——
+那天实测 `tl_migrate_test.py`（连同 `tl_docs_gate_test.py` / `tl_noact_gate_test.py` /
+`tl_category_gate_test.py` 等一批）已经**不见了**，`python %TEMP%\tl_migrate_test.py`
+直接 `[Errno 2] No such file or directory`。
+**规则落在仓库里才守得住**，所以把版本链的判据搬进了 pytest。
 
 runner 是 `%TEMP%\tl_run_all.ps1`（**不在仓库里**，是本机开发工具；**v1.9 起 31 个套件**）。
+⚠️ **2026-10-10 起它已经不完整**：套件文件被系统清理掉了一大半，
+`tl_run_all.ps1` 自己还在但跑不起来 —— 所以**发版时的验证以仓库内为准**：
+`python -m pytest tests/ -q` + `python main.py --selfcheck` + `--bootcheck`
++ `build_exe.ps1`（打包后自动跑这两个）。下面这段是它完整时的覆盖范围，留作记录：
 覆盖四类：源码闸门（selfcheck / bootcheck）、策略闸门
 （`tl_category_gate_test.py` / `tl_updater_gate_test.py` / `tl_v18_gate_test.py` /
 `tl_noact_gate_test.py` / `tl_docs_gate_test.py`）、链路测试（`tl_migrate_test.py` / `tl_updater_test.py` /
@@ -957,7 +1003,7 @@ HTTP 服务器验续传 / `tl_boot_test.py` 三种启动模式 / `tl_visual_new.
 | 自测：德育分 30 行假数据含 3 行故意错，确认 errors.csv 正确 | ✅ `%TEMP%\tl_v19_ui_test.py`（27 行入、3 行出，三条理由各不相同） |
 | 交付：跑 `tests/test_calc.py` 和新增 `tests/test_import.py` | ✅ 见 §18.2 全表 |
 | 交付：**更新 AGENTS.md 新增 §30 模型中心、§31 批量导入** | ⚠️ §30 已被"激活码系统已删除"占用 → 实际落 **§31 / §32** |
-| 交付：commit 带 **v1.9** 前缀，**不推 Gitee** | ✅ 见 §16.5（提交号 ≠ 程序版本号，`CURRENT_VERSION` 仍是 `1.8`，没有数据格式变化就不升） |
+| 交付：commit 带 **v1.9** 前缀，**不推 Gitee** | ✅ 提交 `e3b6e75`（当时按 Owner 要求没推）。**2026-10-10 Owner 改口"提交推送"，已推 master**；同一天按 **v1.8.1** 正式发版，`CURRENT_VERSION` 随之 1.8 → 1.8.1 —— 见 §16.5（提交号 ≠ 程序版本号；那次不升是"没有数据格式变化"，这次升是"发版需要，清单版本必须大于用户手上版本"） |
 
 ### 22.2 指令二：修复成绩导入解析器的表格干扰 Bug
 

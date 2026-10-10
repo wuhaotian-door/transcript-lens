@@ -322,17 +322,38 @@ def test_fetch_manifest_连不上() -> None:
     assert problem != ""
 
 
-def test_fetch_manifest_仓库里那份模板能解析但不可用() -> None:
-    """★ 仓库里的 ``update/manifest.json`` 是**模板**：发版时人要填三件套。
+def test_仓库清单只允许空模板或完全填好() -> None:
+    """★ 仓库里的 ``update/manifest.json`` 只允许两种状态，**不许半填**。
 
-    它必须能被解析（结构合法），但绝不能是"可用"的 ——
-    否则一个还没填 url 的清单就能触发下载。
+    1. **空模板**：三件套（url / size / sha256）全空 —— 解析得出来但
+       ``usable is False``，发版时人要照着填；
+    2. **填好了**：三件套齐全 —— ``usable is True``，此时 url 必须是本仓库
+       Gitee 发行版附件的直链，sha256 必须是 64 位。
+
+    ★ 为什么加这条（2026-10-10 实测踩到）：有人把清单写成
+      ``{"product":…, "files":{"app":{…}}}`` —— **没有顶层 ``app`` 段** ——
+      解析器直接给 ``(None, '清单里没有 app 段')``，于是**清单路线静默失效**、
+      退回老的发行版正文路线：清单里填的 url/size/sha256 一个都没生效，
+      而界面上看不出任何异常。半填（只有 url、没有 sha256）同理。
+
+    ★ 也**不能**反过来断言"必须不可用" —— 发版那天的清单本来就该是可用的，
+      那样会拦住正常发版。
     """
     raw = (ROOT / "update" / "manifest.json").read_bytes()
     app, problem = U.parse_manifest(json.loads(raw.decode("utf-8")))
-    assert app is not None, problem
-    assert app.usable is False
-    assert app.url == "" and app.size == 0 and app.sha256 == ""
+    assert app is not None, f"仓库清单结构不对，根本解析不出来：{problem}"
+    if app.usable:
+        assert app.url.startswith("https://"), app.url
+        assert "/releases/download/" in app.url, app.url
+        assert app.size > 0
+        assert len(app.sha256) == 64
+        assert app.version, "填好的清单必须写明版本号"
+    else:
+        assert app.url == "" and app.size == 0 and app.sha256 == "", (
+            "清单只填了一半 —— 半填的清单不会被采用（usable=False），等于白填："
+            "要么三件套全空当模板，要么三件套齐全"
+        )
+        assert problem != ""
 
 
 # ---------------------------------------------------------------------------
