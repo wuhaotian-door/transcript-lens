@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 import pandas as pd
@@ -83,6 +84,13 @@ from core.archival import (
 )
 from core.calculator import MAX_SCORE, MIN_SCORE, CalculationScope, calculate_many
 from core.crypto_store import CryptoError, CryptoStore
+from core.database import (
+    GRADE_HISTORY_FILE,
+    USE_OVERWRITE,
+    USE_SKIP,
+    ConflictQuestion,
+    GradeHistoryDB,
+)
 from core.excel_io import ExcelEngineError, friendly_error, read_frame
 from core.parser import Category
 from core.scholarship import ClassRecord, save_class, validate_class_name
@@ -95,6 +103,12 @@ from ui.review_dialog import confirm_courses
 __all__ = [
     "ACTION_COLUMN",
     "COLUMN_TITLES",
+    "CONFLICT_BUTTONS",
+    "CONFLICT_DISMISSED",
+    "CONFLICT_OVERWRITE",
+    "CONFLICT_OVERWRITE_ALL",
+    "CONFLICT_SKIP",
+    "CONFLICT_SKIP_ALL",
     "FILTER_LABELS",
     "FILTER_ORDER",
     "FIRST_SCOPE_COLUMN",
@@ -105,7 +119,15 @@ __all__ = [
     "SCOPE_HEADER",
     "SEMESTER_TERMS",
     "AnalysisPage",
+    "ask_conflict_choice",
+    "conflict_message",
+    "conflict_result_text",
+    "conflicts_of",
+    "grade_history_records",
+    "new_batch_id",
     "out_of_range_scores",
+    "resolve_conflict_choice",
+    "resolve_conflicts",
     "scope_breakdown",
 ]
 
@@ -325,6 +347,207 @@ def out_of_range_scores(parsed: Any, limit: int = 8) -> list[str]:
     return out
 
 
+# --------------------------------------------------------------- 成绩历史
+#
+# v1.9 二期 D3：导入前先看"这个学生这个学期是不是已经有成绩了"，
+# 有冲突就问一次覆盖还是跳过。四个按钮的文案是**任务书逐字指定**的，
+# 所以抽成常量 —— 界面文案只此一份，改一处就是改全部。
+CONFLICT_OVERWRITE = "覆盖"
+CONFLICT_SKIP = "跳过"
+CONFLICT_OVERWRITE_ALL = "全部覆盖"
+CONFLICT_SKIP_ALL = "全部跳过"
+#: 弹窗按钮顺序（任务书给的顺序）。
+CONFLICT_BUTTONS: tuple[str, ...] = (
+    CONFLICT_OVERWRITE,
+    CONFLICT_SKIP,
+    CONFLICT_OVERWRITE_ALL,
+    CONFLICT_SKIP_ALL,
+)
+#: 弹窗被关掉 / 点了外面 —— 最保守的行为是**不覆盖**（= 跳过）。
+CONFLICT_DISMISSED = USE_SKIP
+
+
+def conflict_message(question: Any) -> str:
+    """冲突弹窗的正文 —— **逐字**按任务书：``检测到学生 {姓名} 已有 {学期} 成绩，是否覆盖？``"""
+    return (
+        f"检测到学生 {getattr(question, 'student', '') or '（未知）'}"
+        f" 已有 {getattr(question, 'semester', '')} 成绩，是否覆盖？"
+    )
+
+
+def resolve_conflict_choice(choice: str | None) -> str:
+    """把一个按钮文案翻成覆盖策略。
+
+    * ``覆盖`` / ``全部覆盖`` → :data:`core.database.USE_OVERWRITE`（删旧写新）
+    * ``跳过`` / ``全部跳过`` → :data:`core.database.USE_SKIP`（保留旧记录）
+    * ``None``（关窗、Esc、点外面）→ **跳过** —— 破坏性更小的那一侧。
+
+    认不出来的文案也一律按**跳过**，绝不"看不懂就当覆盖"。
+    """
+    if choice in (CONFLICT_OVERWRITE, CONFLICT_OVERWRITE_ALL):
+        return USE_OVERWRITE
+    return CONFLICT_DISMISSED
+
+
+def ask_conflict_choice(parent: Any, question: Any) -> str:
+    """弹一次冲突窗，返回 ``覆盖`` / ``跳过`` / ``全部覆盖`` / ``全部跳过``。
+
+    ★ 关掉弹窗（Esc / 右上角 X）拿到的是 ``None``，按**跳过**处理
+      —— 覆盖是删数据的动作，不能因为"用户随手关了个窗"就发生。
+    """
+    box = QMessageBox(parent)
+    box.setWindowTitle("同学期成绩冲突")
+    box.setIcon(QMessageBox.Icon.Question)
+    box.setText(conflict_message(question))
+    existing = getattr(question, "existing", 0) or 0
+    box.setInformativeText(
+        # ★ 这个数字是"加密库里这个学生这个学期**已经存了几条**"
+        #   （core.database.GradeHistoryDB.apply 的 existing_counts），
+        #   不是"这一批撞上几门"—— 覆盖删掉的是全部同键旧行，
+        #   用户要知道的是"我原来那些还在不在"，所以显示已有条数。
+        f"加密库里这个学生这个学期已经有 {existing} 条成绩。\n"
+        "覆盖 = 删掉旧记录、写进这一批；跳过 = 保留旧记录、这一批里重复的课不导入"
+        "（同一批里没冲突的新课照常写进去）。\n"
+        "关掉这个窗口按跳过处理。"
+    )
+    buttons: dict[Any, str] = {}
+    for text in CONFLICT_BUTTONS:
+        buttons[box.addButton(text, QMessageBox.ButtonRole.AcceptRole)] = text
+    box.setDefaultButton(next(iter(buttons)))  # 默认停在「覆盖」上，回车=覆盖
+    box.exec()
+    clicked = box.clickedButton()
+    return buttons.get(clicked, CONFLICT_SKIP)
+
+
+def grade_history_records(
+    parsed: Any,
+    results: dict[CalculationScope, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """把这一批摊成成绩历史表的行（**冲突检测与实际写库共用这一份**）。
+
+    * 给了 ``results``（算完之后）：分数与学分原样取自
+      ``CalculationResult.course_scores``（口径①，和班级快照同一份数据）。
+    * 没给（**算之前**）：课程名从 ``parsed.courses`` 取，分数留空。
+      冲突检测只关心"哪些学生 · 哪些课"，不需要分数 —— 所以这一步
+      可以在写库**之前**跑，而且不需要先算一遍加权。
+
+    ★ 只搬运，不做任何算术。
+    ★ **空 ≠ 0**：没考的课 ``score`` 是 ``None``，原样写 ``None``，
+      绝不当成 0 分写进库（红线 2）。
+    ★ 身份是 ``student_id``（学号），姓名只作为 ``student_name`` 随行捎带、
+      供冲突弹窗显示；:class:`core.database.GradeHistoryDB` 不会把它落盘。
+    """
+    overall = results.get(CalculationScope.ALL) if results else None
+    if overall is not None:
+        pairs = [
+            (getattr(c, "name", ""), getattr(c, "score", None), getattr(c, "credit", None))
+            for c in getattr(overall, "course_scores", ()) or ()
+        ]
+    else:
+        pairs = [(getattr(c, "name", ""), None, None)
+                 for c in getattr(parsed, "courses", ()) or ()]
+    records: list[dict[str, Any]] = []
+    for row in getattr(parsed, "valid_rows", ()) or ():
+        for name, score, credit in pairs:
+            if not name:
+                continue
+            records.append(
+                {
+                    "student_id": getattr(row, "student_id", "") or "",
+                    "student_name": getattr(row, "student", "") or "",
+                    "course_name": name,
+                    "score": score,
+                    "credit": credit,
+                }
+            )
+    return records
+
+
+def conflicts_of(db: Any, records: list[dict[str, Any]], semester: str) -> list[Any]:
+    """挑出这批里**已经有记录**的 ``(学生, 学期)``，一个学生一个问题。
+
+    ★ 同一批里一个学生会出现很多次（每门课一行），所以按学号**去重** ——
+      否则弹窗会把同一个学生问 N 遍。
+    ★ 没有学号的行直接跳过：冲突检测的键就是学号，没有它无从比对
+      （这类行照样由 ``core.database`` 按自己的规则处理）。
+    """
+    questions: list[Any] = []
+    seen: set[str] = set()
+    for record in records or ():
+        sid = (record.get("student_id") or "").strip()
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        if not db.has_semester(sid, semester):
+            continue
+        questions.append(
+            ConflictQuestion(
+                sid,
+                (record.get("student_name") or record.get("student") or sid),
+                semester,
+                len(db.semester_rows(sid, semester)),
+            )
+        )
+    return questions
+
+
+def resolve_conflicts(
+    questions: list[Any],
+    ask: Any,
+) -> tuple[dict[str, str], bool]:
+    """逐个问过去，返回 ``({学号: 策略}, 是否有"全部…")``。
+
+    * 选了 ``全部覆盖`` / ``全部跳过`` 就**记住**，后面的人不再问
+      （本次导入内有效 —— 下一次导入重新问）。
+    * ``ask`` 返回 ``None``（弹窗被关掉）按**跳过**。
+    * 空问题列表直接返回空表：**没有冲突就一个窗都不弹**。
+    """
+    decisions: dict[str, str] = {}
+    if not questions:
+        return decisions, False
+    blanket: str | None = None
+    stopped = False
+    for question in questions:
+        if blanket is not None:
+            decisions[question.student_id] = blanket
+            continue
+        choice = ask(question) if ask is not None else None
+        policy = resolve_conflict_choice(choice)
+        if choice == CONFLICT_OVERWRITE_ALL:
+            blanket, stopped = USE_OVERWRITE, True
+        elif choice == CONFLICT_SKIP_ALL:
+            blanket, stopped = USE_SKIP, True
+        decisions[question.student_id] = policy
+    return decisions, stopped
+
+
+def conflict_result_text(counts: dict[str, Any]) -> str:
+    """结果弹窗正文：``覆盖 N 条 / 新增 M 条 / 跳过 K 条``。"""
+    overwritten = int(counts.get("overwritten", 0) or 0)
+    inserted = int(counts.get("inserted", 0) or 0)
+    skipped = int(counts.get("skipped", 0) or 0)
+    return f"覆盖 {overwritten} 条 / 新增 {inserted} 条 / 跳过 {skipped} 条"
+
+
+def new_batch_id(now: Any = None, existing: Any = ()) -> str:
+    """这一批的批次号，形如 ``20261027-1``（日期 + 当天第几批）。
+
+    ★ 第几批这一位**从已有批次号里推**，不另建一个计数器文件 ——
+      §15 的教训：索引和真数据一旦对不上，界面就会显示一个不存在的东西。
+      同一天已经导过 ``20261027-1``，这一批就是 ``20261027-2``。
+    """
+    stamp = (now or datetime.now()).strftime("%Y%m%d")
+    largest = 0
+    for batch in existing or ():
+        text = str(batch or "")
+        head, _, tail = text.partition("-")
+        if head != stamp:
+            continue
+        if tail.isdigit():
+            largest = max(largest, int(tail))
+    return f"{stamp}-{largest + 1}"
+
+
 @dataclass(frozen=True)
 class TableRow:
     """表格一行的身份。**行序就是身份**，姓名只是显示用的。
@@ -385,6 +608,10 @@ class AnalysisPage(QWidget):
         self._anchor_report: Any = None
         self._source: str = ""
         self._scope: CalculationScope = DEFAULT_FILTER
+        #: ``{学号: "overwrite"|"skip"}`` —— 本次导入问过的同学期覆盖策略。
+        #: ★ **只在本次导入内有效**：下一次导入重新问（覆盖是删数据的动作，
+        #:   不能因为"上次选过"就默认继承）。
+        self._grade_decisions: dict[str, str] = {}
         self._build()
 
     # ---------------------------------------------------------------- 搭界面
@@ -514,6 +741,9 @@ class AnalysisPage(QWidget):
         """
         self._username = username or ""
         self._archive = None
+        # ★ 覆盖策略同样是**上一个人的决定**，换人必须丢掉 ——
+        #   否则新用户第一次导入会继承上一个人的"全部覆盖/全部跳过"。
+        self._grade_decisions = {}
 
     @property
     def store(self) -> CryptoStore:
@@ -738,6 +968,15 @@ class AnalysisPage(QWidget):
             self._set_status("计算失败。", error=True)
             return
 
+        # ★ v1.9 二期 D3：「课程确认完、写库之前」先问一次同学期覆盖策略。
+        #   位置是任务书指定的 —— 用户刚确认完课程（知道这一批是哪几门），
+        #   而成绩历史表还没被动过，覆盖的后果这时候才说得清楚。
+        #   没有冲突就一个窗都不弹（本方法返回空表，后面流程一个字不变）。
+        try:
+            self._grade_decisions = self._resolve_grade_conflicts(parsed, results)
+        except Exception:  # noqa: BLE001 - 冲突检测坏了不该拦住导入
+            self._grade_decisions = {}
+
         # 归档：侧写辅导页的"趋势 / 定型·可救"从这里来，本页算一次就够。
         #
         # ★ 必须把**已有归档**一起带上做 append。不带的话每导一次就把上一个
@@ -778,8 +1017,77 @@ class AnalysisPage(QWidget):
         #   存不上**不拦界面** —— 成绩已经算完并显示了，存班级只是顺带的事；
         #   真失败会在状态行里明说，不静默。
         self._save_class(class_name, self._source)
+        # ★ v1.9 二期 D3：这一批写进成绩历史表（覆盖 / 跳过按刚才问的结果）。
+        #   **放在最后**：上面那些显示用的状态都落定了，写库失败只影响这一张表，
+        #   状态行里明说一句就行（和"班级存不上"同一个待遇，不打断用户看成绩）。
+        self._save_grade_history(parsed, results)
         # 把名单推给侧写辅导页（它靠这个建左侧列表）
         self.roster_changed.emit(self.roster())
+
+    # ------------------------------------------------------------ 成绩历史
+    def _resolve_grade_conflicts(self, parsed: Any, results: Any) -> dict[str, str]:
+        """查这一批里谁同学期已经有成绩，有冲突就逐个问。返回 ``{学号: 策略}``。
+
+        * **没有冲突时一个窗口都不弹**（``questions`` 为空 → 直接返回空表）。
+        * 返回空表同时意味着"没有强制跳过的学生"，所以写库时缺省走**覆盖**
+          （= 正常入库），这正是没冲突时该有的行为。
+        """
+        self._grade_decisions = {}
+        if not self._username:
+            return {}
+        records = grade_history_records(parsed, results)
+        if not records:
+            return {}
+        history = GradeHistoryDB(username=self._username, store=self._store)
+        questions = conflicts_of(history, records, self.term)
+        if not questions:
+            return {}
+        decisions, _blanket = resolve_conflicts(
+            questions, lambda question: ask_conflict_choice(self, question)
+        )
+        return decisions
+
+    def _save_grade_history(self, parsed: Any, results: Any) -> None:
+        """把这一批写进 ``grade_history.json.enc``，然后弹一行结果。
+
+        ★ 数字全部来自 :meth:`core.database.GradeHistoryDB.apply` 的返回值 ——
+          界面不自己数，数错了没人看得出来。
+        ★ 写盘失败（没登录 / 库坏了）只写状态行，**不弹错误框** ——
+          成绩已经算完并显示了，这是顺带存一份历史。
+        """
+        if not self._username:
+            return
+        records = grade_history_records(parsed, results)
+        if not records:
+            return
+        decisions = dict(getattr(self, "_grade_decisions", None) or {})
+        try:
+            history = GradeHistoryDB(username=self._username, store=self._store)
+            batch = new_batch_id(
+                existing=[row.get("import_batch_id") for row in history.rows()]
+            )
+            counts = history.apply(
+                records,
+                semester=self.term,
+                batch_id=batch,
+                policy=USE_OVERWRITE,
+                # ★ 冲突已经在导入前问过了，这里**只回答**不问 ——
+                #   再弹一次就是问两遍，而且第二次弹在"已经算完"之后，
+                #   用户根本没有上下文回答它。
+                on_conflict=lambda conflicted: {
+                    question.student_id: decisions.get(question.student_id, USE_SKIP)
+                    for question in conflicted
+                },
+            )
+        except (CryptoError, ValueError, OSError) as exc:
+            self._note_history_failure(f"{exc}")
+            return
+        except Exception as exc:  # noqa: BLE001 - 意外也不能炸掉整条导入
+            self._note_history_failure(f"{exc.__class__.__name__}")
+            return
+        QMessageBox.information(
+            self, "成绩历史已保存", conflict_result_text(counts)
+        )
 
     def _load_archive(self) -> Archive | None:
         """从加密库读回纵向归档，作为本次导入的 append 底座。
@@ -841,6 +1149,18 @@ class AnalysisPage(QWidget):
             self._status.text()
             + f"\n⚠ 班级成绩没能存进加密库（{reason}）—— "
             "奖学金测算那一页会看不到这个班。"
+        )
+
+    def _note_history_failure(self, reason: str) -> None:
+        """成绩历史存不上时的状态行提示（同样不弹窗）。
+
+        ★ 和 :meth:`_note_class_failure` 分开写，是为了**一个字都不动**
+          班级/归档那两条既有路径的文案 —— "现有流程一个字不变"。
+        """
+        self._status.setText(
+            self._status.text()
+            + f"\n⚠ 成绩历史没能存进加密库（{reason}）—— "
+            "个人档案页的成绩明细会看不到这一批。"
         )
 
     def _refresh_flags(self) -> None:

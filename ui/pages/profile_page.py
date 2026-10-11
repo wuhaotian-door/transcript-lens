@@ -1,56 +1,49 @@
-"""🎯 侧写辅导页 —— 左侧学生名单（可搜索） + 右侧三层侧写。
+"""🎯 个人档案页 —— 左侧学生名单（可搜索） + 右侧两个标签页。
 
 ★ 文件名说明：Spec 五/六 把这一页定名为 ``profile_page.py``（"侧写"），
   所以**个人中心**那一页在 :mod:`ui.pages.account_page`，别走错。
 
-布局::
+布局（v1.9 第二阶段改成"左侧保留 + 右侧两个标签页"）::
 
     +------------------+---------------------------------------+
-    | 学生名单          |  【张三（2023001）】 学业肖像          |
-    | 🔍 [搜索姓名/学号] |   发展意愿                             |
-    | 张三（2023001）   |   辅导提纲                             |
-    | 李四（2023002）   |                                       |
+    | 学生名单          |  【张三（2023001）】                   |
+    | 🔍 [搜索姓名/学号] |  [ 成绩明细 | 总评与侧写 ]  ← QTabWidget|
+    | 张三（2023001）   |   按学期分组的课程树 / 肖像 + AI 侧写   |
+    | 李四（2023002）   |  -------------------------------------|
+    |                  |  发展意愿       |  辅导提纲             |
     +------------------+---------------------------------------+
 
-★ 为什么要有这一层列表
----------------------
+标签页 1「成绩明细」：按**学期**分组的 课程 / 成绩 / 学分 树（可展开折叠）。
+学期顺序**只认** :data:`core.archival.SEMESTER_ORDER`（经
+``sorted_records`` / ``semester_rank``），本页不另抄一份表 —— 抄了就会漂移，
+症状是"大二下排在大一上前头"。
+★ **空 ≠ 0**（红线 2）：没选 / 没考的课，成绩列显示**空白**，绝不显示 0。
 
-原来点侧栏「侧写辅导」直接落到**上一次那一名学生**身上 —— 用户看到的是别人的
-数据，还以为是在看自己刚点的那个人。现在：
-
-* 点侧栏 → 落在**名单**上（右侧是谁取决于你在名单里点了谁，没点就是提示语）；
-* 从智育分析页点「侧写」→ 才带着具体学生跳过来，并在名单里选中他。
-
-★ 身份用**学号**，不用姓名
--------------------------
-
-同名学生（历届都有）按姓名索引会**互相串号**：意愿互相覆盖、预警取错行。
-本页一律用 ``payload["key"]``（``sid:<学号>``，没学号才退回 ``name:<姓名>``）
-作为意愿的键。没学号的学生会在界面上**明说**同名风险。
-
-三层结构（Spec 六）::
-
-    第一层 · 学业肖像卡片     均分 / 趋势 / 已定型短板 / 可抢救项
-    第二层 · 发展意愿         QButtonGroup + 6 个 QRadioButton → 落加密盘
-    第三层 · 辅导提纲         本地规则拼三段文字（只读）+ 一键复制
+标签页 2「总评与侧写」：学业肖像（均分 / 三档口径加权 / 趋势 / 短板 / 可抢救项）
++ **AI 侧写正文**（``core.database.ProfileStore.side_text``，读不到就给
+「点击生成」按钮）。
 
 ★ 关于"不重新算"
 ----------------
 
 Spec 说「数据来源：student dict 里已有的字段，不重新算」。本页严格遵守：
 均分、趋势、定型/可救分区全部来自 :mod:`core.archival` 的
-``trend()`` / ``partition()`` / ``merge_records()`` —— 那些是 core 里**已经有**的函数，
-不是本页新写的算术。
+``trend()`` / ``partition()`` / ``merge_records()``，三档加权来自
+``core.calculator`` —— 那些是 core 里**已经有**的函数，不是本页新写的算术。
 
 唯一的例外是「提至 85 可 +0.X」这一句：它天生是个假设运算，不算是算不出来的。
 处理办法是**复用 core 自己的** ``core.calculator.weighted_average`` ——
 把某一门课的分数换掉之后，把整串课程重新喂给它。这样"假设分"和"实际分"
 出自同一份实现，**绝不会出现两个数字打架**。本页自己一行加减乘除都没写。
+
+★ 界面上**没有** GPA / 排名：仓库里没有它们的真源函数（已全库 grep 确认），
+  按铁律五"没有真源就不显示该字段"。有真源才加得回来。
 """
 
 from __future__ import annotations
 
 import dataclasses
+import logging
 from typing import Any, Callable
 
 from PySide6.QtCore import QRect, QSize, Qt
@@ -60,6 +53,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QFrame,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -71,14 +65,19 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QStyle,
     QStyledItemDelegate,
+    QTabWidget,
     QTextEdit,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from core.archival import merge_records, partition, trend
+from core.archival import SEMESTER_ORDER, merge_records, partition, semester_rank, trend
 from core.calculator import CalculationScope, weighted_average
 from core.crypto_store import CryptoError, CryptoStore
+from core.database import GradeHistoryDB, ProfileStore
+from core.scholarship import list_classes, load_moral
 from ui.anim import make_card
 from ui.intentions import (
     INTENTION_OPTIONS,
@@ -88,12 +87,27 @@ from ui.intentions import (
     student_key,
 )
 
+#: 口径的中文说法**只从智育分析页拿**（那一页是 ``scope_breakdown`` 的真源），
+#: 本页不另写一份翻译 —— 两份翻译迟早会有一份说错（上一版就把"选修"写成了
+#: "归限选"，而且没人发现）。
+from ui.pages.analysis_page import scope_breakdown
+
 __all__ = [
+    "GRADE_TREE_COLUMNS",
     "ITEM_HEIGHT",
     "LIST_WIDTH",
     "RESCUE_TARGET",
+    "SIDE_TEXT_EMPTY_HINT",
     "StudentItemDelegate",
     "ProfilePage",
+    "build_side_text_prompt",
+    "format_credit",
+    "format_score",
+    "grade_rows_from_records",
+    "group_grades_by_term",
+    "moral_of",
+    "read_side_text",
+    "term_of_archive",
     # 下面这几个是给成长档案页复用的（同一个"学生名单"长相同一份实现，
     # 不复制第二遍 —— 复制出来的那份迟早会和这份长得不一样）
     "_ROLE_HAS_ID",
@@ -123,6 +137,239 @@ ITEM_HEIGHT = 54
 
 #: 头像圆的直径
 _AVATAR = 34
+
+#: 右侧第 1 个标签页的表头（三列：课程 / 成绩 / 学分）
+GRADE_TREE_COLUMNS = ("课程", "成绩", "学分")
+
+#: 没有侧写正文时显示的那句话（判据：`test_profile_merge.py` 认这一串）
+SIDE_TEXT_EMPTY_HINT = "还没有侧写。点右上角的「AI 侧写」生成。"
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# 成绩明细 / 侧写：**纯逻辑**（零 Qt，pytest 直接测）
+# ---------------------------------------------------------------------------
+
+
+def format_score(score: Any) -> str:
+    """成绩列的文字。
+
+    ★ **空 ≠ 0**（红线 2）：没选 / 没考的课显示**空白**，绝不显示 ``0``。
+    """
+    if score is None or score == "":
+        return ""
+    try:
+        return f"{float(score):g}"
+    except (TypeError, ValueError):
+        return str(score)
+
+
+def format_credit(credit: Any) -> str:
+    """学分列的文字。缺失（``None``）同样显示**空白**，不是 0。"""
+    if credit is None or credit == "":
+        return ""
+    try:
+        return f"{float(credit):g}"
+    except (TypeError, ValueError):
+        return str(credit)
+
+
+def term_of_archive(archive: Any) -> str:
+    """归档里**最近一个**学期的标签（用来给没有 term 的明细行标学期）。
+
+    取 ``_ordered_records`` 的最后一个 —— 那是 order 最大的学期，
+    也就是"最近一次导入的学期"。
+    """
+    records = _ordered_records(archive)
+    return str(getattr(records[-1], "term", "") or "") if records else ""
+
+
+def _ordered_records(archive: Any) -> list[Any]:
+    """归档里这个学生的学期记录，按 ``core.archival`` 的顺序。
+
+    ★ 学期顺序**必须**来自 :mod:`core.archival`（``sorted_records`` 用的是
+      ``semester_rank`` / ``SEMESTER_ORDER``）—— 本页不另抄一份表，
+      抄了就会漂移，症状是"大二下排在大一上前头"。
+    """
+    if archive is None:
+        return []
+    ordered = getattr(archive, "sorted_records", None)
+    if callable(ordered):
+        try:
+            return list(ordered())
+        except Exception:  # noqa: BLE001 - 坏档案不该拦住看明细
+            pass
+    records = list(getattr(archive, "records", ()) or ())
+    return sorted(records, key=lambda rec: semester_rank(getattr(rec, "term", "")))
+
+
+def grade_rows_from_records(archive: Any) -> list[dict[str, Any]]:
+    """归档 → ``[{"term": ..., "course": ..., "score": ..., "credit": ...}]``。
+
+    只搬运，不改口径：``score is None``（没选这门课）原样留着，
+    由 :func:`format_score` 决定显示成空白。
+    """
+    rows: list[dict[str, Any]] = []
+    for record in _ordered_records(archive):
+        term = str(getattr(record, "term", "") or "")
+        for course in getattr(record, "courses", ()) or ():
+            rows.append({
+                "term": term,
+                "course": str(getattr(course, "name", "") or ""),
+                "score": getattr(course, "score", None),
+                "credit": getattr(course, "credit", None),
+                "category": str(getattr(course, "category", "") or ""),
+            })
+    return rows
+
+
+def group_grades_by_term(rows: list[dict[str, Any]],
+                         terminal_terms: Any = None) -> list[tuple[str, list[dict[str, Any]]]]:
+    """按学期分组，并把学期排成时间顺序。
+
+    参数：
+        rows: :func:`grade_rows_from_records` 那种行；也接受 ``core.database``
+            的原始行（键是 ``course_name`` / ``score`` / ``credit``）
+        terminal_terms: **已终结**的学期（转成 ``set`` 再传进来最省）。
+            归档记录本身带的 ``term`` 就是终结学期；成绩历史表的行没有这个
+            概念，所以只有调用方显式喂进来时才用得上。
+
+    规则：
+        * 终结学期**永远排在最前**（和 :func:`core.archival.merge_records`
+          的既有行为一致，不再另立一套）；
+        * 其余学期按 ``SEMESTER_ORDER`` 的时间顺序；认不出的排在最后；
+        * 同一个学期里，有分数的排前面（高的在前），没分数的排最后、按课程名；
+        * 课程名为空的（终结学期里的占位）单独归一堆，名字统一成
+          「（历史课程名缺失）」。
+
+    返回 ``[(学期, [行, ...]), ...]``，学期已去重且排好序。
+    """
+    terminal = {str(t or "").strip() for t in (terminal_terms or ())}
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for row in rows or ():
+        if not isinstance(row, dict):
+            continue
+        term = str(row.get("term") or row.get("semester") or "").strip()
+        course = str(row.get("course") or row.get("course_name") or "").strip()
+        if not course:
+            if term not in terminal:
+                # 非终结学期里课程名不该为空 —— 空课程名无法按主键去重，
+                # 也就无从显示，直接跳过（不编一个假名字出来）。
+                continue
+            course = "（历史课程名缺失）"
+        buckets.setdefault(term, []).append({
+            "term": term,
+            "course": course,
+            "score": row.get("score", None),
+            "credit": row.get("credit", None),
+            "category": str(row.get("category") or ""),
+        })
+
+    def rank(term: str) -> tuple[int, int, str]:
+        known = term in SEMESTER_ORDER
+        return (
+            0 if term in terminal else 1,
+            0 if known else 1,
+            f"{semester_rank(term):03d}" if known else term,
+        )
+
+    ordered: list[tuple[str, list[dict[str, Any]]]] = []
+    for term in sorted(buckets, key=rank):
+        courses = buckets[term]
+        courses.sort(key=lambda row: (
+            row["score"] is None,
+            -(row["score"] if isinstance(row["score"], (int, float)) else 0.0),
+            row["course"],
+        ))
+        ordered.append((term, courses))
+    return ordered
+
+
+def moral_of(store: CryptoStore, username: str, key: str,
+             class_names: Any = None) -> int | None:
+    """在某一个班里找这名学生的德育分。
+
+    ★ **没录 ≠ 0**（红线 2）：找不到就返回 ``None``，界面把它显示成空白。
+      这也是为什么这个函数不返回 ``0`` —— 0 分和"没录"在奖学金那一页
+      是两种完全不同的待遇（备注里必须写"德育分未录入，按 0 计"）。
+
+    ``class_names`` 给了就只查那些班（省一次扫目录）；没给就 :func:`list_classes`。
+    """
+    if not username or not key:
+        return None
+    if class_names is None:
+        try:
+            class_names = [record.class_name for record in list_classes(store, username)]
+        except (CryptoError, ValueError, OSError):
+            return None
+    for name in class_names:
+        try:
+            scores = load_moral(store, username, name)
+        except (CryptoError, ValueError, OSError):
+            continue
+        if key in scores:
+            return scores[key]
+    return None
+
+
+def build_side_text_prompt(student: str, student_id: str, key: str, grades: Any,
+                           moral: Any = None) -> str:
+    """把"已有的成绩与德育分"拼成一段提示词，交给 AI 谈话助手。
+
+    ★ **只拼已有字段，不做任何算术**（铁律五）：平均分 / 加权 / 排名一概不
+      在这里算，也一概不往里写 —— 提示词里出现一个本页算出来的数字，
+      就等于绕开了"算术只在 core 里做"这条规矩。
+    ★ 键一律用 ``sid:<学号>``；没有学号才退回 ``name:<姓名>``，
+      并且**明说同名风险**（AGENTS §9）。
+    """
+    lines = [
+        "请根据下面这名学生已有的成绩，写一段学业侧写（优势、短板、"
+        "下学期可以怎么补），不要编造没有出现的数字。",
+        "",
+        f"学生：{student or '（未填）'}",
+        f"学号：{student_id.strip() or '（成绩表里没有学号）'}",
+    ]
+    if key.startswith(KEY_PREFIX_NAME):
+        lines.append("注意：这名学生没有学号，若班上有同名的人，不要把他人的成绩算进来。")
+    lines.extend(["", "已有成绩（只列已导入的字段，空白＝没选或没考）："])
+    grouped = group_grades_by_term(list(grades or ()))
+    if grouped:
+        for term, courses in grouped:
+            lines.append(f"【{term or '未标注学期'}】")
+            for row in courses:
+                score = format_score(row["score"])
+                credit = format_credit(row["credit"])
+                detail = f"成绩 {score}" if score else "成绩（空白）"
+                detail += f"　学分 {credit}" if credit else "　学分（空白）"
+                lines.append(f"· {row['course']}　{detail}")
+    else:
+        lines.append("（还没有导入任何成绩明细）")
+    if moral is None:
+        lines.append("")
+        lines.append("德育分：未录入")
+    else:
+        lines.extend(["", f"德育分：{moral}"])
+    return "\n".join(lines)
+
+
+def read_side_text(store: Any, student_id: str, key: str) -> str:
+    """读侧写正文（``ProfileStore.side_text``）。
+
+    读不到（没登录 / 库坏了 / 这个学生没存过）一律返回空串 ——
+    侧写是便利数据，坏掉不该拦住看成绩。
+    """
+    sid = (key or student_id or "").strip()
+    if not sid or store is None:
+        return ""
+    getter = getattr(store, "side_text", None)
+    if not callable(getter):
+        return ""
+    try:
+        return getter(sid) or ""
+    except Exception:  # noqa: BLE001 - 读不出来就当没有
+        return ""
+
 
 
 # ---- 条目上挂的数据（delegate 绘制时读）-----------------------------------
@@ -299,15 +546,33 @@ class ProfilePage(QWidget):
         self._key_by_index: dict[int, str] = {}
         #: 由主窗口注入：``index -> payload``（名单里的行号 → 侧写原料）
         self._provider: Callable[[int], dict[str, Any] | None] | None = None
+        #: ``core.database.ProfileStore``（懒建；建失败时记 ``False`` 不再重试）
+        self._profile_store: Any = None
+        #: ``core.database.GradeHistoryDB``（懒建，同上）
+        self._grade_db: Any = None
+        #: 德育分查过的班级名（一次登录只扫一遍目录）
+        self._moral_cache: list[str] | None = None
+        #: 标签池：``(布局, 名字) -> [QLabel, ...]``。**控件复用、不 deleteLater**
+        self._tag_pool: dict[str, list[QLabel]] = {}
+        #: 当前标签页下标（只用来记住位置，切页不做重新计算）
+        self._active_tab = 0
         self._build()
 
     # ---------------------------------------------------------------- 外部
     def set_user(self, username: str) -> None:
-        """切账户时调用（登录、切换账号后）。会重新读这个人的意愿。"""
+        """切账户时调用（登录、切换账号后）。会重新读这个人的意愿。
+
+        ★ 顺带丢掉"上一个人的库句柄"：``ProfileStore`` 与 ``GradeHistoryDB``
+          都是按用户名解析路径的，留着就会把 A 的侧写写到 B 的目录里
+          （和 :meth:`AnalysisPage.set_user` 清 ``_archive`` 是同一条道理）。
+        """
         self._username = username or ""
         self._intentions = (
             load_intentions(self._store, self._username) if self._username else {}
         )
+        self._profile_store = None
+        self._grade_db = None
+        self._moral_cache = None
         if self._payload is not None:
             self._render()
 
@@ -465,7 +730,7 @@ class ProfilePage(QWidget):
         """搜索过滤之后还看得见的条数（自检用）。"""
         return sum(1 for i in range(self._list.count()) if not self._list.item(i).isHidden())
 
-    # --- 右：详情 ---
+    # --- 右：详情（两个标签页） ---
     def _build_detail_pane(self) -> QWidget:
         pane = QWidget()
         box = QVBoxLayout(pane)
@@ -473,7 +738,8 @@ class ProfilePage(QWidget):
         box.setSpacing(0)
 
         self._empty = QLabel(
-            "👈  在左边点一名学生，这里显示他的学业肖像、发展意愿和辅导提纲。\n\n"
+            "👈  在左边点一名学生，这里显示他的成绩明细、学业肖像、"
+            "发展意愿和辅导提纲。\n\n"
             "名单来自「📊 智育分析」导入的成绩表。还没导入的话，先去那一页导一份。"
         )
         self._empty.setObjectName("Placeholder")
@@ -484,25 +750,87 @@ class ProfilePage(QWidget):
         self._body = QWidget()
         body_box = QVBoxLayout(self._body)
         body_box.setContentsMargins(0, 0, 0, 0)
-        body_box.setSpacing(14)
+        body_box.setSpacing(12)
+
+        # ★ 标签页**不放进滚动区**：滚起来会把标签头一起滚走。
+        #   滚动区在标签页**里面**（下面两个 pane 各自带一个）。
+        self._tabs = QTabWidget()
+        self._tabs.setObjectName("ProfileTabs")
+        self._tabs.addTab(self._build_grades_pane(), "成绩明细")
+        self._tabs.addTab(self._build_review_pane(), "总评与侧写")
+        self._tabs.currentChanged.connect(self._on_tab_changed)
+        body_box.addWidget(self._tabs, 1)
+
+        # 标签页下面：发展意愿（左）+ 辅导提纲（右）。
+        # ★ 这两张卡**常驻不重建** —— 页面里绝不 deleteLater 重建控件，
+        #   也就绝不会踩到"透明度效果缓存 pixmap → 整页变白"那个坑（AGENTS §4b）。
+        bottom = QHBoxLayout()
+        bottom.setSpacing(14)
+        intention = self._build_intention()
+        outline = self._build_outline()
+        intention.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        bottom.addWidget(intention, 1)
+        bottom.addWidget(outline, 1)
+        body_box.addLayout(bottom)
+
+        box.addWidget(self._body, 1)
+        self._body.hide()
+        return pane
+
+    # --- 标签页 1：成绩明细 ---
+    def _build_grades_pane(self) -> QWidget:
+        pane = QWidget()
+        box = QVBoxLayout(pane)
+        box.setContentsMargins(0, 10, 0, 0)
+        box.setSpacing(8)
+
+        self._grades_note = QLabel("")
+        self._grades_note.setObjectName("Muted")
+        self._grades_note.setWordWrap(True)
+        box.addWidget(self._grades_note)
+
+        self._grade_tree = QTreeWidget()
+        self._grade_tree.setObjectName("GradeTree")
+        self._grade_tree.setColumnCount(len(GRADE_TREE_COLUMNS))
+        self._grade_tree.setHeaderLabels(list(GRADE_TREE_COLUMNS))
+        self._grade_tree.setRootIsDecorated(True)
+        self._grade_tree.setUniformRowHeights(True)
+        self._grade_tree.setAlternatingRowColors(False)
+        self._grade_tree.setSelectionMode(QTreeWidget.SelectionMode.NoSelection)
+        self._grade_tree.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # ★ 列宽写死 + Fixed：`ResizeToContents` 不把"展开出来的子行"算进来，
+        #   点开一个学期之后列宽会跳（AGENTS §4c 第 2 条）。
+        header = self._grade_tree.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        header.setStretchLastSection(False)
+        self._grade_tree.setColumnWidth(1, 88)
+        self._grade_tree.setColumnWidth(2, 88)
+        box.addWidget(self._grade_tree, 1)
+        return pane
+
+    # --- 标签页 2：总评与侧写 ---
+    def _build_review_pane(self) -> QWidget:
+        pane = QWidget()
+        outer = QVBoxLayout(pane)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         inner = QWidget()
-        self._inner_box = QVBoxLayout(inner)
-        self._inner_box.setContentsMargins(0, 0, 6, 0)
-        self._inner_box.setSpacing(14)
+        box = QVBoxLayout(inner)
+        box.setContentsMargins(0, 10, 6, 0)
+        box.setSpacing(14)
 
-        self._inner_box.addWidget(self._build_portrait())
-        self._inner_box.addWidget(self._build_intention())
-        self._inner_box.addWidget(self._build_outline())
-        self._inner_box.addStretch(1)
+        box.addWidget(self._build_portrait())
+        box.addWidget(self._build_side_text())
+        box.addStretch(1)
 
         scroll.setWidget(inner)
-        body_box.addWidget(scroll, 1)
-        box.addWidget(self._body, 1)
-        self._body.hide()
+        outer.addWidget(scroll, 1)
         return pane
 
     # --- 第一层：学业肖像 ---
@@ -513,7 +841,7 @@ class ProfilePage(QWidget):
         box.setSpacing(10)
 
         top = QHBoxLayout()
-        self._portrait_title = QLabel("学业肖像")
+        self._portrait_title = QLabel("总评")
         self._portrait_title.setObjectName("H2")
         top.addWidget(self._portrait_title)
         top.addSpacing(12)
@@ -522,16 +850,36 @@ class ProfilePage(QWidget):
         self._avg_label.setObjectName("H1")
         top.addWidget(self._avg_label)
 
-        self._trend_tag = QLabel("—")
-        self._trend_tag.setObjectName("TagGray")
-        top.addWidget(self._trend_tag)
+        self._blank_label = QLabel("")
+        self._blank_label.setObjectName("Muted")
+        top.addWidget(self._blank_label)
         top.addStretch(1)
         box.addLayout(top)
 
         self._avg_sub = QLabel("")
         self._avg_sub.setObjectName("Muted")
         self._avg_sub.setWordWrap(True)
+        self._avg_sub.setMinimumWidth(320)
         box.addWidget(self._avg_sub)
+
+        # 三档口径的加权均分（数字来自 ``core.calculator``，本页一行都没算）
+        self._scope_label = QLabel("")
+        self._scope_label.setObjectName("Muted")
+        self._scope_label.setWordWrap(True)
+        self._scope_label.setMinimumWidth(320)
+        box.addWidget(self._scope_label)
+
+        sub_row = QHBoxLayout()
+        sub_row.setSpacing(8)
+        self._trend_tag = QLabel("—")
+        self._trend_tag.setObjectName("TagGray")
+        sub_row.addWidget(self._trend_tag)
+        self._trend_sub = QLabel("")
+        self._trend_sub.setObjectName("Muted")
+        self._trend_sub.setWordWrap(True)
+        self._trend_sub.setMinimumWidth(320)
+        sub_row.addWidget(self._trend_sub, 1)
+        box.addLayout(sub_row)
 
         box.addWidget(self._section("已定型短板", "补考不改分（红线 9），不必再纠结"))
         self._locked_box = QVBoxLayout()
@@ -542,6 +890,46 @@ class ProfilePage(QWidget):
         self._rescue_box = QVBoxLayout()
         self._rescue_box.setSpacing(4)
         box.addLayout(self._rescue_box)
+        return card
+
+    # --- 第四层：AI 侧写（正文落 ProfileStore，不落明文） ---
+    def _build_side_text(self) -> QFrame:
+        card = make_card()
+        box = QVBoxLayout(card)
+        box.setContentsMargins(20, 16, 20, 16)
+        box.setSpacing(10)
+
+        head = QHBoxLayout()
+        title = QLabel("AI 侧写")
+        title.setObjectName("H2")
+        head.addWidget(title)
+        note = QLabel("把已有成绩与德育分拼成提示词，交给 AI 谈话助手")
+        note.setObjectName("Muted")
+        head.addWidget(note)
+        head.addStretch(1)
+
+        self._ai_btn = QPushButton("点击生成")
+        self._ai_btn.setObjectName("Ghost")
+        self._ai_btn.setMinimumHeight(36)
+        self._ai_btn.setToolTip("生成的内容会存进本地加密文件")
+        self._ai_btn.clicked.connect(self._generate_side_text)
+        head.addWidget(self._ai_btn)
+        box.addLayout(head)
+
+        self._side_hint = QLabel(SIDE_TEXT_EMPTY_HINT)
+        self._side_hint.setObjectName("Muted")
+        self._side_hint.setWordWrap(True)
+        self._side_hint.setMinimumWidth(320)
+        box.addWidget(self._side_hint)
+
+        self._side_text = QTextEdit()
+        self._side_text.setObjectName("Outline")
+        self._side_text.setReadOnly(True)
+        self._side_text.setMinimumHeight(150)
+        self._side_text.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        box.addWidget(self._side_text)
         return card
 
     def _section(self, title: str, hint: str) -> QWidget:
@@ -730,10 +1118,24 @@ class ProfilePage(QWidget):
 
         default = results.get(CalculationScope.REQUIRED_LIMITED)
         overall = results.get(CalculationScope.ALL)
+        required = results.get(CalculationScope.REQUIRED_ONLY)
 
         head = f"{name}（{student_id}）" if student_id else name
         self._portrait_title.setText(f"{head} · 学业肖像")
         self._avg_label.setText(_fmt(default.weighted_average if default else None))
+        # GPA / 排名**不显示**：仓库里没有真源（见模块 docstring）。
+        # 这句话是给用户看的说明，免得他以为是加载失败。
+        self._blank_label.setText("（GPA 与排名暂无数据来源）")
+
+        # --- 三档口径的加权均分（数字全部来自 core.calculator）---
+        scope_bits: list[str] = []
+        for scope, result in ((CalculationScope.ALL, overall),
+                              (CalculationScope.REQUIRED_LIMITED, default),
+                              (CalculationScope.REQUIRED_ONLY, required)):
+            if result is None:
+                continue
+            scope_bits.append(f"{scope_breakdown(scope)} {_fmt(result.weighted_average)}")
+        self._scope_label.setText("　·　".join(scope_bits) if scope_bits else "暂无加权均分")
 
         # --- 趋势（core.archival.trend）---
         trend_info = trend(archive) if archive is not None else None
@@ -755,55 +1157,48 @@ class ProfilePage(QWidget):
             self._trend_tag.setObjectName("TagGray")
             terms_text = _terms_text(trend_info)
         self._repolish(self._trend_tag)
-
-        parts = [f"仅必修+限选均分 {_fmt(default.weighted_average if default else None)}"]
-        if overall is not None:
-            parts.append(f"全口径 {_fmt(overall.weighted_average)}")
-        parts.append(terms_text)
-        self._avg_sub.setText("　·　".join(parts))
+        self._trend_sub.setText(terms_text)
 
         # --- 已定型短板 / 可抢救项（全部来自 core.archival）---
-        self._clear_layout(self._locked_box)
-        self._clear_layout(self._rescue_box)
-
+        # ★ 用**复用标签池**（`_fill_tags`）而不是 deleteLater 重建：
+        #   本页任何 `deleteLater()` 都会撞上 AGENTS §4b 那个"透明度效果缓存
+        #   旧 pixmap → 整页画成空白"的坑，代价是只有截图才看得见。
         part = partition(archive) if archive is not None else None
         locked = list(part.get("locked", [])) if part else []
         absent = list(part.get("absent", [])) if part else []
 
-        if locked:
-            for entry in locked:
-                credit = _credit_of(archive, entry.get("term", ""), entry.get("course", ""))
-                text = f"· {entry.get('course', '?')}"
-                if credit is not None:
-                    text += f"　{credit:g} 学分"
-                text += f"　（{entry.get('term', '')} 已定型）"
-                self._locked_box.addWidget(self._tagged(text, "TagGray"))
-        else:
-            self._locked_box.addWidget(self._tagged("· 没有已定型的挂科课", "TagGray"))
-
+        locked_rows: list[tuple[str, str]] = []
+        for entry in locked:
+            credit = _credit_of(archive, entry.get("term", ""), entry.get("course", ""))
+            text = f"· {entry.get('course', '?')}"
+            if credit is not None:
+                text += f"　{credit:g} 学分"
+            text += f"　（{entry.get('term', '')} 已定型）"
+            locked_rows.append((text, "TagGray"))
+        if not locked:
+            locked_rows.append(("· 没有已定型的挂科课", "TagGray"))
         for entry in absent:
-            self._locked_box.addWidget(
-                self._tagged(
-                    f"· {entry.get('course', '?')}　缺考（还能安排补考，"
-                    f"{entry.get('term', '')}）",
-                    "TagOrange",
-                )
-            )
+            locked_rows.append((
+                f"· {entry.get('course', '?')}　缺考（还能安排补考，"
+                f"{entry.get('term', '')}）",
+                "TagOrange",
+            ))
+        self._fill_tags(self._locked_box, locked_rows)
 
         rescues = self._compute_rescues(payload)
+        rescue_rows: list[tuple[str, str]] = []
         if rescues:
             for course_name, credit, score, gain in rescues:
-                self._rescue_box.addWidget(
-                    self._tagged(
-                        f"· {course_name}　{credit:g} 学分　当前 {score:g} 分　→　"
-                        f"提至 {RESCUE_TARGET:g} 可 {gain:+.3f}",
-                        "TagOrange",
-                    )
-                )
+                rescue_rows.append((
+                    f"· {course_name}　{credit:g} 学分　当前 {score:g} 分　→　"
+                    f"提至 {RESCUE_TARGET:g} 可 {gain:+.3f}",
+                    "TagOrange",
+                ))
         else:
-            self._rescue_box.addWidget(
-                self._tagged("· 没有明显可抢救的课（分数都已达标或学分太小）", "TagGray")
+            rescue_rows.append(
+                ("· 没有明显可抢救的课（分数都已达标或学分太小）", "TagGray")
             )
+        self._fill_tags(self._rescue_box, rescue_rows)
 
         # --- 没学号的警告 ---
         if student_id:
@@ -833,6 +1228,203 @@ class ProfilePage(QWidget):
 
         # --- 提纲 ---
         self._outline.setPlainText(self._build_outline_text(payload, rescues, current))
+
+        # --- 标签页 1：成绩明细 ---
+        self._render_grades(key, archive)
+
+        # --- 标签页 2：AI 侧写正文 ---
+        self._render_side_text(key)
+
+    # ------------------------------------------------- 标签页 1（成绩明细）
+    def _history(self) -> Any:
+        """``GradeHistoryDB`` 懒建（库坏了 / 没登录时返回 ``None``）。"""
+        if self._grade_db is None:
+            try:
+                self._grade_db = GradeHistoryDB(store=self._store,
+                                                username=self._username)
+            except Exception:  # noqa: BLE001 - 历史表读不了，归档那份照样显示
+                logger.exception("初始化 GradeHistoryDB 失败")
+                self._grade_db = False
+        return self._grade_db or None
+
+    def _grade_rows(self, key: str, archive: Any) -> list[dict[str, Any]]:
+        """优先用归档里的课程明细；归档没有就查成绩历史表（**带学期**的行）。
+
+        两个来源都空了就返回空列表 —— 界面上说明"还没有导入明细"，
+        绝不编一个数字出来。
+        """
+        rows = grade_rows_from_records(archive)
+        if rows:
+            return rows
+        db = self._history()
+        if db is None or not key:
+            return []
+        try:
+            return [dict(row) for row in db.rows() if row.get("student_id") == key]
+        except Exception:  # noqa: BLE001 - 明细读不出来不该拦住整页
+            logger.exception("读取成绩历史失败（%s）", key)
+            return []
+
+    def _render_grades(self, key: str, archive: Any) -> None:
+        if not hasattr(self, "_grade_tree"):
+            return
+        tree = self._grade_tree
+        tree.clear()
+
+        rows = self._grade_rows(key, archive)
+        # 归档记录自己带 term；成绩历史表的行本来就逐行带 semester。
+        # 只有"两边都没有"时才留空，界面上显示成「未标注学期」。
+        default_term = term_of_archive(archive)
+        for row in rows:
+            row.setdefault("term", "")
+            if not row["term"]:
+                row["term"] = default_term
+        grouped = group_grades_by_term(rows, terminal_terms={default_term} if default_term else None)
+
+        for semester, courses in grouped:
+            head = QTreeWidgetItem([semester or "未标注学期", "", ""])
+            font = head.font(0)
+            font.setBold(True)
+            head.setFont(0, font)
+            head.setFirstColumnSpanned(True)
+            tree.addTopLevelItem(head)
+            for row in courses:
+                child = QTreeWidgetItem([
+                    row["course"],
+                    format_score(row["score"]),
+                    format_credit(row["credit"]),
+                ])
+                child.setTextAlignment(1, int(Qt.AlignmentFlag.AlignRight
+                                              | Qt.AlignmentFlag.AlignVCenter))
+                child.setTextAlignment(2, int(Qt.AlignmentFlag.AlignRight
+                                              | Qt.AlignmentFlag.AlignVCenter))
+                head.addChild(child)
+        tree.expandAll()
+
+        if not grouped:
+            note = "还没有这名学生的成绩明细。先在「📊 智育分析」导入他的成绩表。"
+        else:
+            course_count = sum(len(courses) for _term, courses in grouped)
+            note = (f"{len(grouped)} 个学期，共 {course_count} 门课。"
+                    "空白＝没选或没考（不是 0 分）。")
+        if hasattr(self, "_grades_note"):
+            self._grades_note.setText(note)
+
+    # ------------------------------------------------- 标签页 2（AI 侧写）
+    def _side_store(self) -> Any:
+        """``ProfileStore`` 懒建：库坏了 / 没登录不该让页面开不起来。"""
+        if self._profile_store is None:
+            try:
+                self._profile_store = ProfileStore(store=self._store,
+                                                   username=self._username)
+            except Exception:  # noqa: BLE001 - 侧写存不了，页面照用
+                logger.exception("初始化 ProfileStore 失败")
+                self._profile_store = False
+        return self._profile_store or None
+
+    def _render_side_text(self, key: str) -> None:
+        if not hasattr(self, "_side_text"):
+            return
+        text = read_side_text(self._side_store(), "", key)
+        self._side_text.setPlainText(text)
+        if text:
+            self._side_hint.setText("侧写正文存放在本地加密文件里，只在本机可见。")
+            self._ai_btn.setText("重新生成")
+        else:
+            self._side_hint.setText(SIDE_TEXT_EMPTY_HINT)
+            self._ai_btn.setText("点击生成")
+        self._ai_btn.setEnabled(bool(key))
+
+    def _student_grades(self, key: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        return self._grade_rows(key, payload.get("archive"))
+
+    def _student_moral(self, key: str) -> Any:
+        if self._moral_cache is None:
+            names: list[str] = []
+            try:
+                names = [row.class_name for row in list_classes(self._store, self._username)]
+            except Exception:  # noqa: BLE001 - 查不到就当没录
+                logger.exception("扫班级目录失败（德育分查询降级）")
+            self._moral_cache = names
+        try:
+            return moral_of(self._store, self._username, key, self._moral_cache)
+        except Exception:  # noqa: BLE001
+            logger.exception("读德育分失败（%s）", key)
+            return None
+
+    def _generate_side_text(self) -> None:
+        """「AI 侧写」按钮：拼提示词 → 交给 AI 谈话助手 → 正文落加密库。
+
+        ★ ``ui/chat_dialog.py`` 由 C 任务并行新建：开发期它可能还不存在 /
+          还不完整，所以**必须懒 import + try/except** —— 导入期绝不能崩，
+          失败只弹一句中文提示。
+        """
+        payload = self._payload
+        if not payload:
+            QMessageBox.information(self, "AI 侧写", "先在左边点一名学生。")
+            return
+        name = str(payload.get("student") or "")
+        student_id = str(payload.get("student_id") or "").strip()
+        key = payload.get("key") or student_key(student_id, name)
+
+        prompt = build_side_text_prompt(
+            name, student_id, key,
+            self._student_grades(key, payload),
+            self._student_moral(key),
+        )
+
+        opener = self._chat_opener()
+        if opener is None:
+            QMessageBox.information(self, "AI 侧写", "AI 谈话助手暂不可用")
+            return
+
+        system_prompt = "你是高校辅导员的学业分析助手，回答用中文，不编造数字。"
+        try:
+            result = opener(self, system_prompt=system_prompt, initial_prompt=prompt)
+        except Exception:  # noqa: BLE001 - 助手内部的异常不该把整页带崩
+            logger.exception("调用 AI 谈话助手失败")
+            QMessageBox.information(self, "AI 侧写", "AI 谈话助手暂不可用")
+            return
+
+        # 助手把生成的正文直接回吐（有的实现会返回字符串）→ 立刻回写加密库。
+        text = result.get("side_text") if isinstance(result, dict) else result
+        if isinstance(text, str) and text.strip():
+            self._save_side_text(key, text)
+
+    @staticmethod
+    def _chat_opener() -> Any:
+        """拿到 ``ui.chat_dialog.open_chat``；拿不到返回 ``None``（**不抛**）。"""
+        try:
+            from ui.chat_dialog import open_chat  # 懒 import：文件可能还没建
+        except Exception:  # noqa: BLE001 - 包括 ImportError / 语法错 / 缺依赖
+            logger.info("ui.chat_dialog 尚不可用，AI 侧写按钮只提示不崩")
+            return None
+        return open_chat if callable(open_chat) else None
+
+    def save_side_text(self, text: str) -> None:
+        """把一段侧写正文存给**当前选中的学生**（也给谈话助手回调调用）。"""
+        payload = self._payload
+        if not payload:
+            return
+        name = str(payload.get("student") or "")
+        key = payload.get("key") or student_key(
+            str(payload.get("student_id") or "").strip(), name
+        )
+        self._save_side_text(key, text)
+
+    def _save_side_text(self, key: str, text: str) -> None:
+        store = self._side_store()
+        if store is None or not key:
+            QMessageBox.information(self, "AI 侧写", "侧写暂时存不进加密库（没登录？）")
+            return
+        try:
+            store.save_side_text(key, text)
+        except Exception:  # noqa: BLE001 - 存不进也要让用户看到刚生成的正文
+            logger.exception("写侧写正文失败（%s）", key)
+            self._side_text.setPlainText(text)
+            QMessageBox.information(self, "AI 侧写", "侧写暂时存不进加密库。")
+            return
+        self._render_side_text(key)
 
     def _compute_rescues(self, payload: dict[str, Any]) -> list[tuple[str, float, float, float]]:
         """算出"提至 85 能拉多少"。
@@ -874,6 +1466,38 @@ class ProfilePage(QWidget):
         return out[:MAX_RESCUE]
 
     # ---------------------------------------------------------------- 提纲
+    def _on_tab_changed(self, index: int) -> None:
+        """切标签页：记住位置（没有别的副作用，切页不做任何重新计算）。"""
+        self._active_tab = int(index)
+
+    def _fill_tags(self, layout, rows: list[tuple[str, str]]) -> None:
+        """把若干 ``(文字, 样式名)`` 填进一个 ``QVBoxLayout``，**控件复用**。
+
+        ★ 为什么不是先 deleteLater 再 addWidget：本页任何"销毁再重建"的写法
+          都可能撞上 AGENTS §4b —— 页面一旦挂过 ``QGraphicsOpacityEffect``，
+          效果会缓存源 pixmap，内部增删控件后不会失效，**整页画成空白**，
+          而且静态断言全绿、只有截图才看得见。控件池没有这个风险。
+        """
+        key = str(id(layout))
+        pool = self._tag_pool.setdefault(key, [])
+        # 不够就补
+        while len(pool) < len(rows):
+            label = QLabel("")
+            label.setWordWrap(True)
+            layout.addWidget(label)
+            pool.append(label)
+        # 多余的藏起来（**不删**：删了下次还得重建）
+        for index, label in enumerate(pool):
+            if index < len(rows):
+                text, tag = rows[index]
+                if label.objectName() != tag:
+                    label.setObjectName(tag)
+                    self._repolish(label)
+                label.setText(text)
+                label.show()
+            else:
+                label.hide()
+
     def _build_outline_text(
         self,
         payload: dict[str, Any],
@@ -1005,14 +1629,6 @@ class ProfilePage(QWidget):
         label.setObjectName(tag)
         label.setWordWrap(True)
         return label
-
-    @staticmethod
-    def _clear_layout(layout) -> None:
-        while layout.count():
-            item = layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
 
     @staticmethod
     def _repolish(widget: QWidget) -> None:
