@@ -1,12 +1,14 @@
 {
   "schema": 1,
-  "updated": "2026-10-08",
+  "updated": "2026-10-27",
   "_doc": [
     "AI 学习助手的模型清单。程序用 Gitee raw 读这份文件（core/ai/model_registry.py 的 GITEE_RAW_MODELS），界面入口是设置页的「模型中心」。",
     "改这份文件 = 改线上清单，所以改完必须提交到 master 才会生效。",
     "字段：id 唯一键（也是磁盘上的账本键）/ label 界面中文名 / group 分组（「推荐」永远排最前）/ file 落盘文件名 / url 直链 / size 字节数 / sha256 小写 64 位 / minRamGb 建议内存 / defaultCheck 是否默认勾选 / note 界面提示。",
     "★ size 和 sha256 必须是**真值**：size 差超过 1% 会被判成「下回来的不是这个文件」，sha256 对不上会直接拒绝落盘。",
-    "下面两条取自 ModelScope 上 Qwen 官方 GGUF 仓库的 q4_k_m 量化版，体积/哈希/直链都用 2026-10-08 的接口返回值核对过，直链实测支持 Range（HTTP 206，续传要用）。"
+    "下面六条的体积/哈希/直链都用接口返回值核对过，直链实测支持 Range（HTTP 206，续传要用）。",
+    "★ 只放**单文件** .gguf：下载器按单个文件校验，分片（xxx-00001-of-00002.gguf）下不了。",
+    "★ minVramGb 会读（数字或「6GB」这类写法），参与「轻松 / 勉强 / 困难」三档判定；默认勾选只看「轻松」那一档，不再看 defaultCheck。"
   ],
   "models": [
     {
@@ -32,6 +34,58 @@
       "minRamGb": 8,
       "defaultCheck": false,
       "note": "效果更好，建议 16GB 内存；下载要 2GB 左右，别在流量上点"
+    },
+    {
+      "id": "qwen2.5-0.5b-instruct-q4_k_m",
+      "label": "Qwen2.5 0.5B 指令版（Q4_K_M 量化）",
+      "group": "推荐",
+      "file": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+      "url": "https://modelscope.cn/models/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/master/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+      "size": 491400032,
+      "sha256": "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db",
+      "minRamGb": 4,
+      "minVramGb": 2,
+      "defaultCheck": true,
+      "note": "全清单最轻的一条（约 469MB），集显和 8GB 办公机都能跑，适合日常问答复核；复杂推理会吃力"
+    },
+    {
+      "id": "qwen2.5-coder-1.5b-instruct-q4_k_m",
+      "label": "Qwen2.5 Coder 1.5B 指令版（Q4_K_M 量化）",
+      "group": "推荐",
+      "file": "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+      "url": "https://modelscope.cn/models/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/master/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+      "size": 1117320768,
+      "sha256": "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046",
+      "minRamGb": 4,
+      "minVramGb": 3,
+      "defaultCheck": false,
+      "note": "代码与结构化文本专精（约 1.04GB），生成评分规则、清洗 Excel 列名这类活更稳；8GB 内存或集显可用"
+    },
+    {
+      "id": "qwen2.5-7b-instruct-q4_k_m",
+      "label": "Qwen2.5 7B 指令版（Q4_K_M 量化）",
+      "group": "高级",
+      "file": "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+      "url": "https://modelscope.cn/models/second-state/Qwen2.5-7B-Instruct-GGUF/resolve/master/Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+      "size": 4683073952,
+      "sha256": "a30c3c08ca3284a7b59fa35cd835ec50b4a54e211379692b0e48a34bdb72c2fb",
+      "minRamGb": 16,
+      "minVramGb": 6,
+      "defaultCheck": false,
+      "note": "深度侧写与长文总结（约 4.36GB），要独显或 16GB 内存；集显能加载但会明显变慢"
+    },
+    {
+      "id": "chatglm3-6b-q4_k_m",
+      "label": "ChatGLM3 6B 对话版（Q4_K_M 量化）",
+      "group": "高级",
+      "file": "chatglm3-6b.Q4_K_M.gguf",
+      "url": "https://hf-mirror.com/mradermacher/chatglm3-6b-GGUF/resolve/main/chatglm3-6b.Q4_K_M.gguf",
+      "size": 4140343136,
+      "sha256": "b2ab9109616d7a38ec8b9fe605b373dd049afcb8c83829e5e3170827dc4a288a",
+      "minRamGb": 12,
+      "minVramGb": 5,
+      "defaultCheck": false,
+      "note": "备选中文模型（约 3.86GB），中文对话与公文腔更自然；走 HF Mirror，下载慢时换时段再试"
     }
   ]
 }

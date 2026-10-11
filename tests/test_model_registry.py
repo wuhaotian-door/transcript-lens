@@ -35,6 +35,9 @@ from core.ai.model_registry import (
     GITEE_RAW_MODELS,
     INSTALLED_FILE,
     INSTALLED_SCHEMA,
+    LOAD_EASY,
+    LOAD_HARD,
+    LOAD_TIGHT,
     LOCAL_GROUP,
     SHA256_MIN_LEN,
     SIZE_TOLERANCE,
@@ -522,22 +525,32 @@ def test_parse_任何垃圾输入都不抛异常(payload: Any) -> None:
 def test_fetch_本机服务返回真实清单(model_site: str) -> None:
     models, warnings, status = fetch_model_list(f"{model_site}/ai_models.json", timeout=5)
     assert warnings == [], f"真实清单应当零警告，实际：{warnings}"
-    assert len(models) == 2, f"真实清单正好 2 条，实际 {len(models)} 条"
-    assert status == "已从远端取到 2 个模型。", f"状态说明不对：{status}"
+    assert len(models) >= 4, f"真实清单至少 4 条（v1.9 扩了模型集），实际 {len(models)} 条"
+    assert status == f"已从远端取到 {len(models)} 个模型。", f"状态说明不对：{status}"
 
     for model in models:
         assert isinstance(model.size, int) and model.size > 0, f"{model.id} 的 size 必须是正整数"
         assert len(model.sha256) == SHA256_MIN_LEN, f"{model.id} 的 sha256 必须是 64 位"
         assert model.sha256 == model.sha256.lower(), f"{model.id} 的 sha256 应该是小写"
-        assert model.url.startswith("https://modelscope.cn/"), f"{model.id} 的直链应指向 ModelScope"
+        assert model.url.startswith(("https://modelscope.cn/", "https://hf-mirror.com/")), (
+            f"{model.id} 的直链只能来自 ModelScope 或 HF Mirror"
+        )
 
-    assert models[0].id == "qwen2.5-1.5b-instruct-q4_k_m", "第一条 id 变了"
-    assert models[1].id == "qwen2.5-3b-instruct-q4_k_m", "第二条 id 变了"
-    assert models[0].size == REAL_SIZE_1_5B, "1.5B 的体积和清单对不上"
-    assert models[1].size == REAL_SIZE_3B, "3B 的体积和清单对不上"
-    assert models[0].min_ram_gb == 4.0 and models[1].min_ram_gb == 8.0, "内存要求读错了"
-    assert models[0].default_check is True, "1.5B 应当默认勾选"
-    assert models[1].default_check is False, "3B 不该默认勾选"
+    # ★ 不许只有单一来源：HF 直连在本机实测超时（WinError 10060），
+    #   ChatGLM3 那条只能走 hf-mirror —— 这两条断言钉住"兜底源确实在用"。
+    hosts = {model.url.split("/")[2] for model in models}
+    assert hosts <= {"modelscope.cn", "hf-mirror.com"}, f"出现了计划外的来源：{sorted(hosts)}"
+    assert "hf-mirror.com" in hosts, "至少要有 1 条走 hf-mirror 兜底源"
+
+    by_id = {model.id: model for model in models}
+    for legacy in ("qwen2.5-1.5b-instruct-q4_k_m", "qwen2.5-3b-instruct-q4_k_m"):
+        assert legacy in by_id, f"{legacy} 是老清单就有的条目，不该消失"
+    assert by_id["qwen2.5-1.5b-instruct-q4_k_m"].size == REAL_SIZE_1_5B, "1.5B 的体积和清单对不上"
+    assert by_id["qwen2.5-3b-instruct-q4_k_m"].size == REAL_SIZE_3B, "3B 的体积和清单对不上"
+    assert by_id["qwen2.5-1.5b-instruct-q4_k_m"].min_ram_gb == 4.0, "1.5B 的内存要求读错了"
+    assert by_id["qwen2.5-3b-instruct-q4_k_m"].min_ram_gb == 8.0, "3B 的内存要求读错了"
+    assert by_id["qwen2.5-1.5b-instruct-q4_k_m"].default_check is True, "1.5B 应当默认勾选"
+    assert by_id["qwen2.5-3b-instruct-q4_k_m"].default_check is False, "3B 不该默认勾选"
 
     # 再和服务的那份文件本身对一遍：解析结果不许和 JSON 里写的漂移。
     raw = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))["models"]
@@ -952,16 +965,27 @@ def test_check_memory_ram_gb为None时用真实探测() -> None:
         assert note == f"本机内存 {have:.1f} GB，够跑（需要 0.25 GB）", f"说明文案不对：{note!r}"
 
 
-def test_default_checked只挑内存够的() -> None:
+def test_default_checked只勾轻松档不看清单的默认标记() -> None:
+    """★ v1.9 B4 的语义变更（``AGENTS.md`` 第 33 节）：默认勾选只看"本机跑它轻松"。
+
+    清单里的 ``defaultCheck`` **不再参与**这个判断（它现在只用来给「推荐」角标）；
+    所以下面 ``b`` 明明写着 ``defaultCheck=False``，本机跑得轻松时照样被预勾。
+    """
     models = [
         _model("a", default_check=True, min_ram_gb=4),
         _model("b", default_check=False, min_ram_gb=4),
         _model("c", default_check=True, min_ram_gb=64),
     ]
-    assert default_checked(models, ram_gb=8) == ["a"], "只有 a 既标了默认又跑得动"
-    assert default_checked(models, ram_gb=128) == ["a", "c"], "内存够之后 c 也该进默认勾选"
+    # 8GB：a / b 轻松（8 ≥ 4），c 困难（8 < 64 × 0.7 = 44.8）→ 只勾 a、b。
+    assert default_checked(models, ram_gb=8) == ["a", "b"], (
+        "按轻松档筛，不看清单的 defaultCheck（b 没标默认也照样勾上）"
+    )
+    assert default_checked(models, ram_gb=128) == ["a", "b", "c"], "128GB 上 c 也轻松了"
+    assert default_checked(models, ram_gb=3) == [], (
+        "3GB：a / b 只到「勉强」（3 ≥ 4 × 0.7 = 2.8），不预勾"
+    )
+    assert default_checked(models, ram_gb=1) == [], "内存不够时一条都不勾（困难）"
     assert default_checked([], ram_gb=8) == [], "空输入返回空列表"
-    assert default_checked(models, ram_gb=1) == [], "内存不够时一条都不勾"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="GlobalMemoryStatusEx 只在 Windows 上有")
@@ -1006,13 +1030,13 @@ def test_build_choices内存不足的行不可勾选(tmp_path: Path) -> None:
     assert heavy.memory_note == "内存不足：本机 4.0 GB，需要 8 GB", f"说明文案不对：{heavy.memory_note!r}"
     assert heavy.checked is False, "内存不够的行不该被默认勾上"
     assert heavy.selectable is False, "内存不够的行不可勾选"
-    assert heavy.checked_by_default is False, "内存不够就不算默认勾选"
+    assert heavy.checked_by_default is False, "8GB 要求在 4GB 机器上是「困难」→ 不预勾"
     assert heavy.state == STATE_MISSING, "磁盘上没有它 → 未装"
 
     assert light.memory_ok is True, "4GB 要求在 4GB 机器上算够"
-    assert light.checked is True, "min_ram_gb=4 且 defaultCheck=True 的那条应当勾上"
+    assert light.checked is True, "轻松档（4 ≥ 4）的那条应当勾上"
     assert light.selectable is True, "内存够的行可勾选"
-    assert light.checked_by_default is True, "清单标了默认且内存够 → 默认勾选"
+    assert light.checked_by_default is True, "轻松档 → 默认勾选（不看清单的 defaultCheck）"
 
 
 def test_build_choices状态跟着账本走(tmp_path: Path) -> None:
@@ -1042,22 +1066,32 @@ def test_build_choices内存只探测一次(tmp_path: Path, monkeypatch: pytest.
     assert all(c.memory_ok for c in choices), "16GB 机器上 8GB 的要求都该放行"
 
 
-def test_ModelChoice_checked_by_default与selectable() -> None:
+def test_ModelChoice_checked_by_default只看负载等级() -> None:
+    """``checked_by_default`` 只认负载三档里的 **轻松**（``AGENTS.md`` 第 33 节）。"""
     plain = ModelChoice(model=_model("a"))
     assert plain.state == STATE_MISSING, "state 默认是未装"
     assert plain.memory_ok is True, "memory_ok 默认是 True"
     assert plain.memory_note == "", "memory_note 默认是空串"
     assert plain.checked is False, "checked 默认是 False（那是「当前状态」）"
-    assert plain.checked_by_default is False, "清单没标默认 → False"
+    assert plain.load_level == LOAD_EASY, "load_level 默认是轻松"
+    assert plain.checked_by_default is True, (
+        "轻松档 → 默认勾选（★ 与清单的 defaultCheck 无关）"
+    )
     assert plain.selectable is True, "内存默认够 → 可勾选"
 
     wanted = ModelChoice(model=_model("b", default_check=True))
-    assert wanted.checked_by_default is True, "清单标了默认且内存够 → True"
+    assert wanted.checked_by_default is True, "清单标了默认 + 轻松档 → True"
     assert wanted.checked is False, "checked 和 checked_by_default 是两件事，构造时不联动"
 
-    blocked = ModelChoice(model=_model("c", default_check=True), memory_ok=False)
-    assert blocked.checked_by_default is False, "内存不够时不算默认勾选"
-    assert blocked.selectable is False, "内存不够时不可勾选"
+    tight = ModelChoice(model=_model("c", default_check=True), load_level=LOAD_TIGHT)
+    assert tight.checked_by_default is False, "「勉强」不预勾，哪怕清单标了 defaultCheck"
+    assert tight.selectable is True, "「勉强」不等于不可选 —— 用户有权自己勾"
+
+    blocked = ModelChoice(
+        model=_model("d", default_check=True), load_level=LOAD_HARD, memory_ok=False
+    )
+    assert blocked.checked_by_default is False, "「困难」不预勾"
+    assert blocked.selectable is False, "困难必然同时没过内存闸门 → 不可勾选"
 
 
 def test_ModelChoice_status_text_内存不足原因优先() -> None:
