@@ -31,3 +31,19 @@ PySide6>=6.6
 
 # 开发期测试（可选）：python tests/test_calc.py 不装 pytest 也能跑
 pytest>=7.4
+
+# ★ v1.9：本地 AI 推理引擎 —— **可选依赖，故意注释掉**。
+#
+#   「AI 谈话助手」完全离线跑在本机，靠的是 llama-cpp-python 这个绑定。
+#   它是**可选的**，理由有三条：
+#
+#     1. 包体积：它自带一份编译好的 llama.cpp（几十 MB），塞进 exe 不值当；
+#     2. 平台差异：Windows 上装它要匹配编译器/轮子，装不上是常态；
+#     3. 装不上也必须能用：没有它的时候，界面照开、输入区禁用、给一句中文
+#        说明（见 core/ai/inference.engine_available），绝不崩、绝不联网。
+#
+#   所以下面这行**故意保持注释状态** —— 不要取消注释、不要写进
+#   build_exe.ps1 的依赖里。要用的人自己按 docs/DEV_SUMMARY.md 的
+#   AI 推理一节装。
+#
+# llama-cpp-python>=0.2.0

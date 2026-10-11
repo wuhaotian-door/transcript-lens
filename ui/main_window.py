@@ -241,7 +241,8 @@ class MainWindow(QMainWindow):
     def _build_topbar(self) -> WindowTitleBar:
         """顶栏 = 自定义标题栏。
 
-        左边是用户名，右边是当前页名；中间 ``addStretch(1)`` 顶开。
+        左边是用户名 + 「AI 谈话助手」入口，右边是当前页名；
+        中间 ``addStretch(1)`` 顶开。
         三个窗口按钮由 :class:`ui.frameless.WindowTitleBar` 自己加。
         """
         strip = QWidget()
@@ -252,6 +253,14 @@ class MainWindow(QMainWindow):
         self._user_label = QLabel("（未登录）")
         self._user_label.setObjectName("TopUser")
         box.addWidget(self._user_label)
+
+        # ★ v1.9：AI 谈话助手入口。**只加这一个按钮**，主窗其余部分不动。
+        #   点开的是非模态对话框，主窗照常能用；引擎没装也照样打得开。
+        self._chat_button = QPushButton("AI 谈话助手")
+        self._chat_button.setObjectName("Ghost")
+        self._chat_button.setMinimumHeight(26)
+        self._chat_button.setToolTip("打开本地 AI 谈话助手（离线运行，不联网）")
+        box.addWidget(self._chat_button)
 
         box.addStretch(1)
 
@@ -287,6 +296,27 @@ class MainWindow(QMainWindow):
         self.settings_page.set_export_provider(self.analysis_page.export_records)
         # ★ 导入完一个班 → 成长档案 / 奖学金两页立刻能选到它，不用切页重进
         self.analysis_page.class_saved.connect(self._on_class_saved)
+        # AI 谈话助手（本地离线推理）
+        self._chat_button.clicked.connect(self._open_chat_assistant)
+
+    def _open_chat_assistant(self) -> None:
+        """打开「AI 谈话助手」（**非模态**，本地离线推理）。
+
+        ★ 引擎没装 / 模型没下载时**照样打开**：对话框里给一行中文说明、
+          输入区禁用，不在这里弹一串模态框。
+
+        ★ ``ui.chat_dialog`` 是 **lazy import**：不点这个按钮就不进内存，
+          启动期一点开销都不加（对话记录从本用户的加密库里读）。
+        """
+        try:
+            from ui.chat_dialog import open_chat
+        except Exception:  # noqa: BLE001 - 打不开也要给人话，不能白点一下
+            traceback.print_exc()
+            self._chat_button.setToolTip(
+                "AI 谈话助手暂时打不开：界面模块没装上，请看日志。"
+            )
+            return
+        open_chat(self)
 
     # ---------------------------------------------------------------- 对外
     def set_user(self, username: str) -> None:
