@@ -28,9 +28,8 @@ v1.8 三份 charter），以及 v1.8.1 删除整套激活码系统的记录，�
 
 **改源码只用这三种方式**：
 
-1. IDE / 编辑器的全局替换
-2. Agent 的 `edit` / `write` 工具
-3. Python：`Path(p).read_text(encoding="utf-8")` → `write_text(..., encoding="utf-8")`
+1. IDE / 编辑器的全局替换（或 Agent 的 `edit` / `write` 工具）
+2. Python：`Path(p).read_text(encoding="utf-8")` → `write_text(..., encoding="utf-8")`
 
 读文件同理：用 `read` 工具或 Python，**不要**用 `Get-Content`。
 
@@ -39,31 +38,19 @@ v1.8 三份 charter），以及 v1.8.1 删除整套激活码系统的记录，�
 
 ## 1b. `.ps1` 里的非 ASCII 必须有 **UTF-8 BOM**
 
-Windows PowerShell 5.1 读**没有 BOM** 的 `.ps1` 时，按**系统 ANSI（本机 GBK）** 解码。
-中文按 GBK 解会错位，而错位的配对会把相邻的 ASCII 字节一起吃掉 ——
-GBK 的尾字节范围是 `0x40~0xFE`，正好包含 `{` `}` `\`。
-于是报出来的错是 `Unexpected token '}'` / `Missing closing '}'` 这种**完全看不出根因**的
-解析错误，而文件在编辑器里看着好好的。
+Windows PowerShell 5.1 读**没有 BOM** 的 `.ps1` 时，按**系统 ANSI（本机 GBK）**
+解码：中文按 GBK 解会错位，错位的配对会把相邻的 ASCII 字节一起吃掉（GBK 的
+尾字节范围 `0x40~0xFE` 正好包含 `{` `}` `\`）—— 报出来的是
+`Unexpected token '}'` / `Missing closing '}'` 这种**完全看不出根因**的解析错误，
+而文件在编辑器里看着好好的。
 
-**教训（第二次踩同一个根因）**：`edit` / `write` 工具写出来的是**不带 BOM** 的 UTF-8。
-用它改过 `build_exe.ps1` 之后，脚本立刻在 PS 5.1 下解析失败 —— 20 个解析错误。
-
-所以：**改完任何 `.ps1` 之后，跑一遍补 BOM + 语法检查**：
-
-```powershell
-# 补 BOM（只加 3 个字节，正文不动）
-$p = 'build_exe.ps1'
-$b = [IO.File]::ReadAllBytes((Resolve-Path $p).Path)
-if (-not ($b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)) {
-    [IO.File]::WriteAllBytes((Resolve-Path $p).Path, ([byte[]](0xEF,0xBB,0xBF) + $b))
-}
-
-# 语法检查（不要靠"跑一下试试"，那要等几分钟）
-$err = $null
-[void][System.Management.Automation.Language.Parser]::ParseFile(
-    (Resolve-Path $p).Path, [ref]$null, [ref]$err)
-if ($err.Count) { $err | % { "L$($_.Extent.StartLineNumber): $($_.Message)" } } else { "OK" }
-```
+**教训（第二次踩同一个根因）**：`edit` / `write` 工具写出来的是**不带 BOM** 的
+UTF-8 —— 用它改过 `build_exe.ps1` 之后，脚本立刻在 PS 5.1 下解析失败（20 个
+解析错误）。所以：**改完任何 `.ps1` 之后，跑一遍补 BOM + 语法检查** —— 补 BOM 就是
+"头 3 个字节不是 `EF BB BF` 就补上（正文不动，只加 3 个字节）"；语法检查用
+`[System.Management.Automation.Language.Parser]::ParseFile(路径, [ref]$null, [ref]$err)`，
+**不要靠"跑一下试试"，那要等几分钟**。两段命令照抄 `build_exe.ps1` 里现成的
+那一段即可；当时的现场与报错原文 → §二十三 1b。
 
 ## 2. 红线（总纲 §三 铁律 1-10 + §十三 导入解析规则，违反即重写）
 
@@ -73,8 +60,8 @@ if ($err.Count) { $err | % { "L$($_.Extent.StartLineNumber): $($_.Message)" } } 
 - 真实成绩文件、真实凭据（邮件授权码等）**一律不入库**。仓库里唯一允许存在的
   xlsx 是 `tests/fixtures/fake_*.xlsx`
 - `config/` 下只允许 `.example.json`
-- 不写注册表。**联网：v1.6 起改为有条件放行 —— 见第 13 节**（SMTP +
-  用户主动启用云端 AI 允许；自动更新 / telemetry / 静默请求仍然禁止）
+- 不写注册表。**联网：v1.6 起改为有条件放行 —— 见第 13 节**（SMTP + 用户主动启用
+  云端 AI；自动更新 / telemetry / 静默请求仍然禁止）
 
 ## 3. 落盘
 
@@ -90,37 +77,23 @@ if ($err.Count) { $err | % { "L$($_.Extent.StartLineNumber): $($_.Message)" } } 
 
 ### 4a. 一个 widget 只能有一个 `graphicsEffect`
 
-```python
-# ⛔ 卡片挂了阴影，就不要再让它淡入淡出
-card.setGraphicsEffect(QGraphicsDropShadowEffect(...))
-fade_in(card)          # 会抛 TypeError（ui/anim.py 故意拦下来）
-```
-
-阴影（`QGraphicsDropShadowEffect`）和透明度（`QGraphicsOpacityEffect`）
-抢的是同一个槽位。要淡入淡出的是**页面容器**，卡片挂在它下面。
+阴影（`QGraphicsDropShadowEffect`）和透明度（`QGraphicsOpacityEffect`）抢的是**同一个槽位**：
+卡片挂了阴影再 `fade_in(card)` 会抛 `TypeError`（`ui/anim.py` 故意拦下来）。要淡入淡出的是
+**页面容器**，卡片挂在它下面。现场代码 → §二十三 4a。
 
 ### 4b. ★ `QGraphicsOpacityEffect` 会缓存源 pixmap —— 后果是整页空白
 
-**这是本项目最阴的一个坑。** `ui/anim.py` 的 `fade_in` / `fade_out`
-**必须在动画结束后把效果摘掉**（`clear_effect`）。不摘的话：
-
-1. 切页动画给页面挂上 `QGraphicsOpacityEffect`，动画跑完效果留在那儿（opacity=1）
-2. 页面**内部**增删控件（例如侧写页重算"可抢救项"时 `deleteLater()` 掉旧标签）
-3. 效果缓存的 pixmap 不会失效 → **整页画成空白**
-4. 切走再切回来（重新跑一次淡入）才恢复正常
-
-实测复现：跳到侧写辅导页 → 点「考研」触发重建 → 整页变白。
-**静态断言查不出来**（控件都在、文字都对、几何也对），只有截图看得见。
+`ui/anim.py` 的 `fade_in` / `fade_out` **必须在动画结束后把效果摘掉**
+（`clear_effect`）。不摘的话：切页动画挂上的效果会留在那儿（opacity=1）→ 页面**内部**增删控件 →
+效果缓存的 pixmap 不失效 → **整页画成空白** → 切走再切回来才恢复。**静态断言查不出来**
+（控件都在、文字都对、几何也对），只有截图看得见。
+实测现场 → §二十三 4c。
 
 ### 4c. 验证 GUI 不能只断言控件存在，要量像素
 
-三次事故都是"断言全绿、界面上却是坏的"：
-
-| 现象 | 真因 |
-|---|---|
-| 「忘记密码？」按钮看不见 | 登录窗写死 `820x500`，内容需要 639px |
-| 表格「操作」列的按钮只剩半个字 | 行高 30px < 容器边距 12 + 按钮最小高 26 |
-| 侧写页整页空白 | 透明度效果缓存未失效（见 4b） |
+三次事故都是"断言全绿、界面上却是坏的"：「忘记密码？」按钮看不见（登录窗写死 `820x500`，
+内容需要 639px）、表格「操作」列的按钮只剩半个字（行高 30px < 容器边距 12 + 按钮最小高
+26）、侧写页整页空白（见 4b）。现场与量法 → §二十三 4c。
 
 **规矩**：
 
@@ -128,188 +101,124 @@ fade_in(card)          # 会抛 TypeError（ui/anim.py 故意拦下来）
 2. `QHeaderView.ResizeToContents` **不把 `setCellWidget` 放进去的控件算进来** ——
    操作列必须写死宽度（`setColumnWidth` + `Fixed`）。
 3. 行高要 ≥ 单元格内控件的 `minimumSizeHint().height()` + 容器上下边距。
-4. 每个"看起来对"的界面都要**截图看一眼**。见 `%TEMP%\tl_qt_drive.py`。
+4. 每个"看起来对"的界面都要**截图看一眼**（见 `%TEMP%\tl_qt_drive.py`）。
 
 ### 4d. 打包：`--exclude-module` 里绝不能有 PySide6
 
-`build_exe.ps1` 里曾有一条 `--exclude-module PySide6`（tkinter 时代的遗留）。
-换成 PySide6 之后忘了删的话，PyInstaller 会把整个 Qt 排除，
-**打出来的 exe 一启动就 ModuleNotFoundError，而源码自检照样全绿**
-（自检跑的是源码，不是包）。
-
-另外：`ui/styles.qss` 是**数据文件**，必须 `--add-data` 进包，
-否则 exe 里窗口能开、界面全白。
+`build_exe.ps1` 里绝不能有 `--exclude-module PySide6`（tkinter 时代的遗留）—— 留着的话
+PyInstaller 会把整个 Qt 排除，**exe 一启动就 `ModuleNotFoundError`，而源码自检照样全绿**
+—— 自检跑的是源码，不是包。`ui/styles.qss` 是**数据文件**，必须 `--add-data` 进包，否则 exe
+里窗口能开、界面全白。判据 → §二十三 4d。
 
 ### 4e. 无边框窗口（`ui/frameless.py`）的四条硬约束
 
 两个顶层窗口（登录窗 / 主窗）都走 `FramelessWindowHint` +
-`WA_TranslucentBackground` 自绘。系统标题栏没了，所以下面四件事必须自己扛：
+`WA_TranslucentBackground` 自绘，系统标题栏没了，四件事必须自己扛：
 
-1. **窗口自己必须显式透明。** `styles.qss` 里那条 `QMainWindow { background }`
-   会把整个窗口矩形填成不透明 —— 包括留给阴影的那圈边距，于是四个圆角外面
-   变成灰白方块，"无边框圆角"根本看不出来。必须补一条
-   `QMainWindow#FramelessWindow { background: transparent; }`。
-2. **★ 圆角不裁剪子控件。** QSS 的 `border-radius` 只管控件自己画的背景，
-   子控件照样画方的。所以贴着窗口边的那几块（侧栏、顶栏、标题栏、品牌区）
-   **各自要带对应角的圆角**，最大化时还要能一起取消。
-3. **不要手算拖拽/缩放的像素。** `QWindow.startSystemMove()` /
-   `startSystemResize()` 把动作交还系统：多显示器 DPI、Aero Snap、
-   Win+方向键全都自动正确。手算 `move()` 这些全都没有。
-4. **最大化时要把阴影边距收成 0、圆角关掉。** 不收的话，四周那圈透明边
-   会在屏幕边缘留一道缝，圆角还会和屏幕直角打架。
+1. **窗口自己必须显式透明**：补一条
+   `QMainWindow#FramelessWindow { background: transparent; }`，否则
+   `QMainWindow { background }` 会把留给阴影的那圈边距也填成不透明。
+2. **★ 圆角不裁剪子控件**：贴边的几块（侧栏 / 顶栏 / 标题栏 / 品牌区）
+   **各自要带对应角的圆角**，最大化时一起取消。
+3. **不要手算拖拽/缩放的像素**：用 `QWindow.startSystemMove()` /
+   `startSystemResize()`（多显示器 DPI、Aero Snap、Win+方向键才全都正确）。
+4. **最大化时把阴影边距收成 0、圆角关掉**（否则屏幕边缘留缝、圆角与直角打架）。
 
 ### 4f. ★ `QWidget` 自带只读的 `maximized` 属性 —— `setProperty` 会**静默失败**
 
-```python
-widget.setProperty("maximized", "true")   # 返回 False，不抛异常，什么都没发生
-```
+`Q_PROPERTY(bool maximized READ isMaximized)` 是**只读**的（`isWritable()` 为
+`False`），往它 `setProperty("maximized", "true")` 不抛异常、只返回 `False` ——
+于是 QSS 里的 `[maximized="true"]` 选择器**永远匹配不上**：样式没生效，日志干净。
 
-`QWidget` 的 `Q_PROPERTY(bool maximized READ isMaximized)` 是**只读**的
-（`QWidget.metaObject()` 里 `isWritable()` 是 `False`）。往只读属性上
-`setProperty` 不会报错，只会返回 `False` —— 于是 QSS 里的
-`[maximized="true"]` 选择器**永远匹配不上**：样式没生效，日志干干净净。
-
-**规矩**：动态属性名一律加前缀（本项目用 `tlMaximized`，见
-`ui/frameless.py` 的 `MAXIMIZED_PROP`），并且 `setProperty` 之后
-**读回来确认**，不要信返回值（实测动态属性也可能返回假值）。
-回归自检：`property_name_is_safe()` + `%TEMP%\tl_qt_drive.py`。
+**规矩**：动态属性名一律加前缀（本项目 `tlMaximized`），`setProperty` 之后**读回来确认**，
+不要信返回值（动态属性也会返回假值）。回归自检 `property_name_is_safe()` +
+`%TEMP%\tl_qt_drive.py`。
 
 ### 4g. ★ `Qt.Edge` 是 `enum.Flag`，`int()` 会抛 `TypeError`
 
-```python
-return edges if int(edges) else None      # ⛔ TypeError
-return edges if edges else None           # ✓ Flag 有定义好的 __bool__
-```
-
-PySide6 的 `Qt.Edge` 继承 `Flag` 而不是 `IntFlag`，`int()` 直接抛。
-**这个分支鼠标每动一下都会走到** —— 于是异常从 `eventFilter` 里冒出来，
-Qt 只打一行 `Error calling Python override of QObject::eventFilter()` 就吞掉：
-界面上是"边框光标永远不变"，日志里是看不懂的 TypeError。
-需要数值时用 `edges.value`。
+`return edges if int(edges) else None` ⛔ → `return edges if edges else None` ✓（`Flag` 有
+定义好的 `__bool__`）；需要数值时用 `edges.value`。**这个分支鼠标每动一下都会走到** ——
+异常从 `eventFilter` 里冒出来，Qt 只打一行
+`Error calling Python override of QObject::eventFilter()` 就吞掉：界面是"边框光标永远不变"，
+日志是看不懂的 TypeError。
 
 ### 4h. 验证 GUI 必须**真的动鼠标**，不能只调函数
 
-上面 4g 那个 bug 躲过了源码自检、躲过了截图、躲过了 76 项冒烟
-（那些都不产生鼠标事件），**只在自动化里鼠标恰好停在窗口上时才炸**。
-现在 `tl_qt_drive.py` 里有一步 `QTest.mouseMove()` 扫过四边四角，
-专门逼 `eventFilter` 跑一遍。
+4g 那个 bug 躲过了源码自检、截图和 76 项冒烟（那些都不产生鼠标事件），**只在自动化里鼠标
+恰好停在窗口上时才炸**（经过 → §二十三 4h）；`tl_qt_drive.py` 因此有一步
+`QTest.mouseMove()` 扫过四边四角。
 
-**规矩**：凡是挂在 `eventFilter` / `mouseMoveEvent` / `hoverEvent` 上的逻辑，
-测试必须用 `QTest.mouseMove()` 真的走一遍，不能只直接调背后的纯函数。
+**规矩**：凡是挂在 `eventFilter` / `mouseMoveEvent` / `hoverEvent` 上的逻辑，测试必须用
+`QTest.mouseMove()` 真的走一遍，不能只调背后的纯函数。完整经过 → §二十三 4h。
 
 ### 4i. `QRadioButton` 互斥组里，已选中的那个**取消不掉**
 
-```python
-# ⛔ 六个单选里当前亮着"考研"，切到"还没选意愿的学生"时：
-for option, radio in buttons.items():
-    radio.setChecked(option == "")        # "考研" 依然是亮的
-```
-
-互斥组（`QButtonGroup.setExclusive(True)`）不允许把当前选中项直接
-`setChecked(False)`。界面上就是：从"有志愿的学生"切到"没选的学生"，
-状态栏写着"还没有选意愿"、按钮却亮着上一个学生的志愿 —— 看着像串号，
-其实是单选组的行为。**换人回填必须先 `setExclusive(False)`，填完再打开。**
+互斥组（`QButtonGroup.setExclusive(True)`）不允许把当前选中项直接 `setChecked(False)` ——
+界面上是"状态栏写着还没有意愿、按钮却亮着上一个学生的志愿"，像串号，其实是单选组的行为。
+**换人回填必须先 `setExclusive(False)`，填完再打开。** 现场 → §二十三 4i。
 
 ### 4j. `QGraphicsDropShadowEffect` 挂整窗的代价：约 40ms/次切页
 
 实测（1900×1200，150% DPI）：阴影开中位 523ms、关 483ms（**+8%**）。
-Qt 会缓存效果的源 pixmap，页面淡入淡出**不会**每帧重新模糊整窗（否则 +1200ms），
-所以这个代价可以接受 —— 但**别在动画期间额外触发整窗 `update()`**。
+Qt 会缓存效果的源 pixmap，页面淡入淡出**不会**每帧重新模糊整窗（否则 +1200ms），所以代价
+可接受 —— 但**别在动画期间额外触发整窗 `update()`**。测法 → §二十三 4j。
 
 ### 4k. ★★★ 窗口动画的 `finished` 回调里**不许销毁那个窗口** —— 会静默炸进程
 
-**本项目最会骗人的一个 bug。** 症状：双击 exe → 开屏 → 打招呼 → **然后就没了**，
-界面不出来、点任务栏也没反应、**没有任何报错**（`--windowed` 连 stdout 都没有），
-退出码 `0xC0000409`（STATUS_STACK_BUFFER_OVERRUN）。
+症状：双击 exe → 开屏 → 打招呼 → **然后就没了**（界面不出来、**没有任何报错**，退出码
+`0xC0000409` = STATUS_STACK_BUFFER_OVERRUN）。根因是动画回调里销毁窗口造成两步 use-after-free（三步推导 → §二十三 4k）。
 
-根因是两步 use-after-free：① 动画的 parent 就是它作用的那个窗口
-（`QPropertyAnimation(window, b"windowOpacity", window)`）；② 回调里把窗口最后一个
-Python 引用丢掉（`AppFlow.welcome = None`）→ 窗口当场析构 → 动画跟着没；
-③ Qt 发完 `finished` 之后 `QAbstractAnimationPrivate::setState` 还要继续用那个动画对象
-（注销统一计时器、处理 deleteWhenStopped）→ 踩空 → 进程直接消失。
+**正确写法是让回调延后一拍** —— ⛔ `anim.finished.connect(lambda: on_done())`；✓
+`anim.finished.connect(lambda: QTimer.singleShot(0, window, on_done))`。`ui/anim.py` 的
+`_drop` 必须是 `finished` 上的**第一个**槽，并用 `shiboken6.isValid()` 判活之后再碰动画对象。
 
-**光把清理槽排到前面是不够的**（试过，照样崩）。正确写法是**让回调延后一拍**：
-
-```python
-# ⛔ 同步回调：on_done 里一销毁窗口就踩空
-anim.finished.connect(lambda: on_done())
-
-# ✓ 延后一拍。用 singleShot 的 context 重载 ——
-#   窗口先一步没了的话，这次回调会被自动跳过，不会去碰死对象
-anim.finished.connect(lambda: QTimer.singleShot(0, window, on_done))
-```
-
-`ui/anim.py` 的 `_drop` 必须是 `finished` 上的**第一个**槽，并且用 `shiboken6.isValid()`
-判活之后再碰动画对象（见 `is_alive`）。
-
-**为什么 400 多项测试一条都没抓到？** 那条路径**从来没被跑过** —— 测试为省 1.5 秒
-一律 `skip_to_end()`，这 bug 只在"欢迎页**真的**淡出"时才成立。所以现有两道闸门
-**都别再拆掉**：`%TEMP%\tl_boot_test.py`（`auto` / `login` / `switch` 三个真实时序，
-每个**单独进程**，退出码即断言）和 `transcript-lens.exe --bootcheck`；
-`build_exe.ps1` 打完包**两个都跑**，非 0 直接判失败。
-
-**规矩**：任何"动画结束后销毁触发它的那个对象"的代码，回调必须延后一拍；
-并且**必须有测试真的把动画跑完**，不许 skip。
+**规矩**：任何"动画结束后销毁触发它的那个对象"的代码，回调必须延后一拍；并且**必须有测试
+真的把动画跑完**，不许 `skip_to_end()`。两道闸门**都别再拆掉**：`%TEMP%\tl_boot_test.py`
+（`auto` / `login` / `switch` 三个真实时序，每个**单独进程**，退出码即断言）和
+`transcript-lens.exe --bootcheck`；`build_exe.ps1` 打完包**两个都跑**，非 0 判失败。
+逐步推导与 400 项测试为何没抓到 → §二十三 4k。
 
 ### 4l. ★★ 启动慢的两个真凶：`QSplashScreen` 和标题里的 emoji
 
 实测（`%TEMP%\tl_splash_probe.py` / `tl_perf_bench.py`，带 `sleep(0.15)` 对照组校准）：
-**跟动画时长、跟机器性能都无关**，是两笔一次性开销 ——
+**跟动画时长、跟机器性能都无关**，是两笔一次性开销：`QSplashScreen` 比自绘 `QWidget` 慢
+**865ms**（`ui/splash.py` 已改成自绘 `QWidget`）；开屏标题里的 **emoji 一个字 241.7ms**
+（只删开屏 pixmap 里的，**已映射窗口**里的 emoji 不占启动时间）；剩下 765ms 全黑是因为开屏
+**先发 finished 再淡出**，现在**先叫下一个窗口、再淡出自己**（`ui/splash.py._start_fade_out`）
+—— 因果 → §二十三 4l。
+各变体完整实测表 → §二十三 4l。
 
-* **`QSplashScreen` 比 `QWidget` 慢 865ms**（164~167ms vs 1028~1035ms；每个变体
-  单独起进程测，排除"第一次创建原生窗口"那笔）。跟半透明 / 无边框 / 透明度全无关。
-  `ui/splash.py` 已改成自绘 `QWidget`。
-* **开屏标题里的 📊 一个字 241.7ms**（去掉 emoji 只要 0.2ms）：emoji 要现场加载
-  Segoe UI Emoji 做彩色字形合成。只删开屏 pixmap 里的；**已映射窗口**里的 emoji
-  （侧栏 / 页标题）不占启动时间。
-* 剩下 **765ms 全黑**缘于开屏**先发 finished 再淡出** —— 现在**先叫下一个窗口、
-  再淡出自己**（`ui/splash.py._start_fade_out`），量法见 `tl_splash_trace.py` 打点。
-
-**预热的三条规矩**（`AppFlow._prewarm_main` 提前建好主窗并 `show()`，
-`MainWindow.__init__` 已 `setWindowOpacity(0.0)`，映射出来全透明、看不见）：
-
-★ **不能在 `run()` 之后紧接着预热** —— `run()` 只是把淡入动画 start 出去，那一刻
-窗口还一帧没画；跑 600ms 同步工作会把**淡入动画冻在第一帧**，用户看到"点了没反应"。
-所以挂在 `on_shown` 上。
-★ 停留时间要**扣掉**预热耗时（`HOLD_MS - spent`）。第一版"干完活再计时"，
-欢迎页实际停留 `HOLD_MS + 600ms` —— 白等 600ms。
-★ `HOLD_MS` = **1500**（总纲 §10.2 写死的）。因为扣时间，这 1500 里含主窗构造
-那 ~600ms，**不是** 1500 + 600。
+**预热的三条规矩**（`AppFlow._prewarm_main` 提前建好主窗并 `show()`）★ **不能在 `run()`
+之后紧接着预热**（那样会把**淡入动画冻在第一帧**，用户看到"点了没反应"，所以挂在
+`on_shown` 上）；★ 停留时间要**扣掉**预热耗时（`HOLD_MS - spent`）；★ `HOLD_MS` = **1500**
+（总纲 §10.2 写死的）—— 因为扣时间，这 1500 里含主窗构造那 ~600ms，**不是** 1500 + 600。
+三条各自的踩坑现场 → §二十三 4l。
 
 ### 4m. 切页卡顿：淡出那一段是纯粹的等待
 
-实测一次切页的耗时 vs 两段动画时长（真跑 `StackSwitcher`，取中位数）：
-
-| 淡出 + 淡入 | 180+240（原） | 120+180 | 90+150 | 0+150 | **0+130（现在）** |
-|---|---|---|---|---|---|
-| 实测切页 | **439 ms** | 326 ms | 260 ms | 166 ms | **~137 ms** |
-
-`180 → 0` 一项就省掉近 300ms，是整条链上最划算的一刀。用户感知的界线大致是
-"100ms 以内算瞬时、200ms 以上能感到迟滞"。
-**砍淡出是对的**：那一段旧页在变淡、新页还没出现，用户盯着一个越来越空的屏幕，
-它不传递任何信息。要回淡出就把 `ui/anim.py` 的 `FADE_OUT_MS` 设回 180，
-`switch()` 会自动走回淡出分支，**两条路径都有测试覆盖**。
+实测一次切页的耗时 vs 两段动画时长（真跑 `StackSwitcher`，取中位数）：`180+240`（原）→
+**439 ms**、`120+180` → 326 ms、`90+150` → 260 ms、`0+150` → 166 ms、**`0+130`（现在）
+→ ~137 ms**。`180 → 0` 一项就省掉近 300ms，是整条链上最划算的一刀：那段旧页在变淡、新页
+还没出现，用户盯着一个越来越空的屏幕，它不传递任何信息。要回淡出就把 `ui/anim.py` 的
+`FADE_OUT_MS` 设回 180，`switch()` 会自动走回淡出分支，**两条路径都有测试覆盖**。
 
 ## 5. 密码找回：已接通邮箱（网易 163 SMTP）
 
-- **恢复码 = 唯一的第二把钥匙。** 注册成功时生成一串 24 位找回码，
-  本地存一份"用它包起来的库密钥"（`u_<uid>/recovery.json.enc`，应用级密文），
-  同时把码寄到用户邮箱。忘密码时凭它解出库密钥、设新密码，**成绩一条不丢**。
-- ★ **为什么不能"发个新验证码就重置"**：库密钥只在本地、只被密码包裹。
-  忘密码那天它已经解不开了，"现在发一封邮件"发不出任何有用的东西 ——
-  能解开它的只有**注册时**生成、并已用它包好密钥的那一串码。
-  **这个时序是命门，任何"优化"都不能改它。**
+- **恢复码 = 唯一的第二把钥匙。** 注册成功时生成一串 24 位找回码，本地存一份"用它包起来的库
+  密钥"（`u_<uid>/recovery.json.enc`，应用级密文）并把码寄到用户邮箱；忘密码时凭它解出库密钥、
+  设新密码，**成绩一条不丢**。
+- ★ **不能改成"发个新验证码就重置"**：库密钥只在本地、只被密码包裹，忘密码那天已经解不开；
+  唯一能解开它的是**注册时**生成、并已用它包好密钥的那串码。**这个时序是命门。**
 - 注册**必须填邮箱并验证**（6 位验证码 / 10 分钟 / 最多试 5 次 / 60 秒冷却）。
-- 个人中心可以「重新生成找回码」——要再输一次密码（生成需要库密钥），
-  顺带挡住"别人趁你没锁屏偷偷把找回码换成他的邮箱"。
+- 个人中心可以「重新生成找回码」——要再输一次密码（生成需要库密钥）。
 
 ### 5a. ★ 邮件授权码绝不许进仓库
 
-真实凭据在 `%LOCALAPPDATA%\SGMS\email.json`（**仓库外**）。
-仓库里只有 `config/email.example.json` 模板，字段全空。
+真实凭据在 `%LOCALAPPDATA%\SGMS\email.json`（**仓库外**）；仓库里只有
+`config/email.example.json` 模板，字段全空。
 
-`main.py --selfcheck` 里有一条**反扫**：从 AppData 读出密钥，
-再拿它扫全仓库源码，命中就报 FAIL。
+`main.py --selfcheck` 里有一条**反扫**：从 AppData 读出密钥，再拿它扫全仓库源码，
+命中就报 FAIL。
 
 > ⚠️ 写这条检查时**不要把密钥写进 main.py** —— 那正好犯了要防的错。
 > 反过来做：密钥从配置文件读，代码里永远只有"比较"这个动作。
@@ -317,33 +226,23 @@ anim.finished.connect(lambda: QTimer.singleShot(0, window, on_done))
 
 ### 5b. 网络请求必须走后台线程
 
-`ui/workers.py` 的 `run_async`。在按钮回调里直接 `smtplib.sendmail()` 的话：
-顺利时卡 1 秒，**网络不通时卡满 15 秒超时**（`SMTP_TIMEOUT`），
-期间窗口不重绘、Windows 可能弹"无响应"。
+`ui/workers.py` 的 `run_async`。在按钮回调里直接 `smtplib.sendmail()` 的话：顺利时卡 1 秒，
+**网络不通时卡满 15 秒超时**（`SMTP_TIMEOUT`），期间窗口不重绘、Windows 可能弹"无响应"。
 回调在主线程执行，所以回调里可以安全碰控件。
 
 ## 6. 命令行开关：`in` 是精确匹配，不是前缀匹配
 
-```python
-# ⛔ 踩过的写法
-if "--mailcheck" in args:
-    return run_mailcheck(send_test="--mailcheck-send" in args)
-```
-
-`args = ["--mailcheck-send"]` 时，`"--mailcheck" in args` 是 **False**
-（列表的 `in` 比的是整个元素）。于是 `--mailcheck-send` 匹配不上任何分支，
-**掉进最后的 GUI 分支把窗口开起来** —— 命令行下表现是
-「卡死、一个字都不输出、退出码永远拿不到」，而且源码和打包版**一样卡**，
-极难往参数解析上想。
+⛔ 踩过的写法：`if "--mailcheck" in args:` —— `args = ["--mailcheck-send"]` 时它是 False
+（列表的 `in` 比的是**整个元素**），于是匹配不上任何分支、**掉进最后的 GUI 分支把窗口开起来**
+（症状：卡死、不输出、退出码永远拿不到）。
 
 **规矩**：长的开关先判；不确定就用 `any(a.startswith("--mailcheck") for a in args)`。
-回归测试见 `%TEMP%\tl_cli_test.py`（含静态检查：断言分支顺序）。
+回归测试 `%TEMP%\tl_cli_test.py`（含静态检查：断言分支顺序）。
 
 ## 7. 诊断命令必须逐行即时输出
 
-`run_mailcheck` 原先攒到最后一次性写报告，结果卡住时**什么都没有** ——
-一个不输出的诊断等于没有诊断。改成 `emit()` 每步立刻落盘 + `flush`，
-一眼就能看出停在哪一步（实测就是靠它定位到"根本没进 mailcheck 分支"）。
+`run_mailcheck` 原先攒到最后一次性写报告，卡住时**什么都没有** —— **不输出的诊断等于没有
+诊断**。改成 `emit()` 每步立刻落盘 + `flush`，一眼看出停在哪一步 → §二十三 7。
 
 ## 8. 验证打包后的 exe 之后，先把它彻底关掉再重打
 
@@ -351,54 +250,37 @@ if "--mailcheck" in args:
 PermissionError: [WinError 5] 拒绝访问: '...\dist\transcript-lens.exe'
 ```
 
-onefile 的 exe 启动时会**再起一个子进程**（bootloader + 真正的应用）。
-只 `Stop-Process` 父进程的话，子进程还活着、exe 文件还锁着，下一次打包就炸。
+onefile 的 exe 启动时会**再起一个子进程**（bootloader + 真正的应用）；只 `Stop-Process`
+父进程的话，子进程还活着、exe 文件还锁着，下一次打包就炸。**按进程名杀**（不是按 PID）：
+`Get-Process -Name 'transcript-lens*' | Stop-Process -Force` 之后
+`Start-Sleep -Seconds 3`（句柄释放有延迟）。`build_exe.ps1` 的自检跑这个 exe 的
+`--selfcheck` 时自己不会锁文件 —— **锁文件的只可能是手动启动的那一份**。
 
-```powershell
-Get-Process -Name 'transcript-lens*' | Stop-Process -Force
-Start-Sleep -Seconds 3      # 句柄释放有延迟，马上重试可能还是被占用
-```
-
-按进程名杀（而不是按 PID）才杀得干净。
-`build_exe.ps1` 的自检也会调 `--selfcheck` 跑这个 exe，自己不会锁文件 ——
-**锁文件的只可能是手动启动的那一份**。
-
-> 另外：**新建出来的 exe 第一次启动会被 Defender 全盘扫描**，
-> 冷启动可能比之后慢好几倍。别把第一次启动的耗时当成性能基准。
+> ★ 新建出来的 exe 第一次启动会被 Defender 全盘扫描，冷启动可能比之后慢好几倍 —— 别把
+> 第一次启动的耗时当成性能基准。完整经过 → §二十三 8。
 
 ## 9. ★ 界面上"这个学生是谁"一律用**学号**，不许用姓名
 
-同名学生历届都有。凡是拿姓名当键的地方，都会**串号**，而且不报错：
+同名学生历届都有 —— 凡是拿姓名当键的地方都会**串号**，而且不报错（`ui/intentions.py` 的
+意愿字典、`ui/flags.build_flags()` 的 `{姓名: flag}`、表格按姓名查结果）。
 
-| 位置 | 症状 |
-|---|---|
-| `ui/intentions.py` 的意愿字典 | 两个张三互相覆盖志愿 |
-| `ui/flags.build_flags()` 的 `{姓名: flag}` | 两个张三只留得下一个 flag |
-| 表格按姓名查结果 | 两行显示同一份数字 |
-
-**规矩**：
-
-1. 身份一律走 `ui.intentions.student_key(student_id, student)`：
-   有学号 → `sid:<学号>`；没有才退回 `name:<姓名>`（**并且界面要明说同名风险**）。
-2. 逐行显示的预警用 `ui.flags.build_flags_by_index()`（**按行序返回列表**），
-   不要用 `build_flags()` 的姓名字典。
-3. 表格的列下标一律从 `COLUMN_TITLES` 推导（`NAME_COLUMN` / `ID_COLUMN` /
-   `FIRST_SCOPE_COLUMN` / `FLAG_COLUMN` / `ACTION_COLUMN`），**禁止手写元组** ——
-   上次手写表头漏了一个口径列，整体错位一格，「侧写」按钮正好压在
-   「红标原因」的单元格上。
-4. 老数据（裸姓名键）在 `load_intentions` 里自动补 `name:` 前缀；
-   侧写页还会在**同名唯一**时把 `name:张三` 迁到 `sid:...`（不唯一就不猜）。
+**规矩**：① 身份一律走 `ui.intentions.student_key(student_id, student)` —— 有学号 →
+`sid:<学号>`，没有才退回 `name:<姓名>`（**并且界面要明说同名风险**）；② 逐行预警用
+`ui.flags.build_flags_by_index()`（**按行序返回列表**），不要用 `build_flags()` 的姓名字典；
+③ 表格列下标一律从 `COLUMN_TITLES` 推导（`NAME_COLUMN` / `ID_COLUMN` / `FIRST_SCOPE_COLUMN` /
+`FLAG_COLUMN` / `ACTION_COLUMN`），**禁止手写元组**；④ 老数据（裸姓名键）在
+`load_intentions` 里自动补 `name:` 前缀，侧写页在**同名唯一**时把 `name:张三` 迁到
+`sid:...`。手写列下标那次的现场 → §二十三 9。
 
 ## 10. 智育分析页的计算口径筛选
 
 三个 Toggle：`必修` / `必修+限选` / `全部` —— 正好是 `CalculationScope` 的三档，
-**不新增口径、不改口径定义**（真源：总纲 **§1.2** 三口径表 ——
-① 必修+限选+选修 ② 必修+限选 ③ 仅必修。默认必修+限选计入，**选修默认剔除**）。
+**不新增口径、不改口径定义**（真源：总纲 **§1.2** 三口径表 —— ① 必修+限选+选修
+② 必修+限选 ③ 仅必修；默认必修+限选计入，**选修默认剔除**）。
 
-> ⚠️ 旧规格（v1.3 Spec + v1.6 / v1.7 / v1.8 三份 charter）**已全部合并删除**，
-> 现在**只认 `docs/DEV_SUMMARY.md`（开发总纲）**。旧的「61 / 246 行」、
-> 「5.2 / 第 3 章 / 第 4 章」这些编号**一律不再引用**；要查旧编号对应现在
-> 哪一节，看总纲**第二十节**那张对照表。
+> ⚠️ 旧规格（v1.3 Spec + v1.6 / v1.7 / v1.8 三份 charter）**已全部合并删除**，现在**只认
+> `docs/DEV_SUMMARY.md`（开发总纲）**；旧编号（「61 / 246 行」、「5.2 / 第 3 章 / 第 4 章」）
+> **一律不再引用** —— 对应哪一节见总纲**第二十节**对照表。
 
 - 切筛选只做三件事：`showColumn` / `hideColumn` 对齐当前口径列；
   红标**跟着当前口径重算**（分母变了，挂科/缺考的判定基础就变了）；
@@ -408,83 +290,60 @@ Start-Sleep -Seconds 3      # 句柄释放有延迟，马上重试可能还是�
 
 ### 10a. 表头三档**共用一句「加权均分」**
 
-同一时刻只有一档列可见（另外两档 `hideColumn`），表头再写"口径①/②/③"
-就是重复信息。三条信息各归各位：
+同一时刻只有一档列可见（另外两档 `hideColumn`）。三条信息各归各位：**表头**说这一列是什么
+数据（恒定，`SCOPE_HEADER`）；**筛选按钮 + 状态行**说现在算的是哪一档（`FILTER_LABELS`）；
+**表下方明细行**把三档各是多少逐档写全名（`SCOPE_COLUMNS` 第二项）。
 
-| 位置 | 职责 | 真源 |
-|---|---|---|
-| **表头** | 这一列是什么数据（恒定） | `SCOPE_HEADER` |
-| **筛选按钮 + 状态行** | 现在算的是哪一档 | `FILTER_LABELS` |
-| **表下方明细行** | 三档各是多少，逐档写全名 | `SCOPE_COLUMNS` 第二项 |
+★ 所以 `COLUMN_TITLES` 里三档口径列是**同一个字符串**，**测试不能再靠表头文字
+区分是哪一档** —— 要按下标判（`FIRST_SCOPE_COLUMN + SCOPE_COLUMNS 里的档位`）。
+`%TEMP%\tl_qt_drive.py` 和 `tl_smoke_new.py` 都已改成按下标判，并加了
+"三档表头必须完全相同"的断言。
 
-★ 所以 `COLUMN_TITLES` 里三档口径列是**同一个字符串**，
-**测试不能再靠表头文字区分是哪一档** —— 要按下标判
-（`FIRST_SCOPE_COLUMN + SCOPE_COLUMNS 里的档位`）。
-`%TEMP%\tl_qt_drive.py` 和 `tl_smoke_new.py` 都已经改成按下标判，
-并额外加了一条"三档表头必须完全相同"的断言。
-
-★ 证据链一点没丢：明细行仍然把三档**同时**列出来、各带全名和
-`Σ学分 / Σ成绩×学分`。
+★ 明细行仍然把三档**同时**列出来、各带全名和 `Σ学分 / Σ成绩×学分`。
 
 ### 10b. ★ 为什么是**互斥三档**，而不是三个可自由勾选的类别
 
-旧 charter 6.4 当年写的是（现在记在总纲 §1.3）"三个独立 Toggle：必修 / 限选 /
-选修，可多选组合"。**按字面做成任意组合是做不到的**：能算出什么数由
-`CalculationScope` 决定（`core/calculator.py`，**铁律一冻结**，只有①全部
-②必修+限选 ③仅必修三个成员），`{限选}`、`{选修}`、`{限选,选修}` **没有对应口径**；
-要支持它们只能改封板文件（违反铁律一）或在界面里自己乘一遍加权（违反铁律五）。
-所以界面保留**互斥三档**，但把"这一档算了哪几类"写在明面上，让总纲 §一 那条纠正
-**在界面上看得见**：按钮气泡与状态行走 `scope_breakdown()`（读
-`CalculationScope.categories`），表下常驻说明用 `CALC_SCOPE_NOTE`。
-★ 上一版文档把"选修"写成"归限选"却没人发现，根因就是**按钮上只写"全部"**，
-没人知道"全部"含不含选修；现在任何一个位置都能一眼看出来。行为门见第 19 节。
+旧 charter 6.4 当年写的是（现在记在总纲 §1.3）"三个独立 Toggle：必修 / 限选 / 选修，可多选
+组合"。**按字面做成任意组合是做不到的**：能算出什么数由 `CalculationScope` 决定
+（`core/calculator.py`，**铁律一冻结**，只有①全部 ②必修+限选 ③仅必修三个成员），
+`{限选}`、`{选修}`、`{限选,选修}` **没有对应口径**；要支持它们只能改封板文件（违反铁律一）
+或在界面里自己乘一遍加权（违反铁律五）。**所以界面保留互斥三档**，把"这一档算了哪几类"
+写在明面上：按钮气泡与状态行走 `scope_breakdown()`（读 `CalculationScope.categories`），
+表下常驻说明用 `CALC_SCOPE_NOTE`。行为门见第 19 节；推导 → §二十三 10b。
 
 ## 11. 切页锁的看门狗必须**把页面落到位**，不是只放锁
 
-```python
-# ⛔ 只放锁：动画还在跑，用户再点侧栏就是两段动画抢同一个 opacity；
-#    而且界面会停在"侧栏亮着 A、内容还是 B"且永不自愈
-self._busy = False
+⛔ 只放锁（`self._busy = False`）不行：动画还在跑，用户再点侧栏就是两段动画抢
+同一个 opacity，界面会停在"侧栏亮着 A、内容还是 B"且永不自愈。
+✓ 必须**把 index 落到位 + 摘掉残留的透明度效果 + 再放锁**
+（`self._stack.setCurrentIndex(self._pending)` → `clear_effect(...)` →
+`self._land(...)`）。
 
-# ✓ 把 index 落到位 + 摘掉残留的透明度效果 + 再放锁
-self._stack.setCurrentIndex(self._pending); clear_effect(...); self._land(...)
-```
-
-阈值 `LOCK_TIMEOUT_MS` = **1500ms**（总纲 §10.3 指定；原来因为一次 1513ms 的
-抖动被调到 2500，但那是**旧的 420ms 动画 + 首帧绘制重页面**造成的。
-现在一次切页中位 ~137ms，1500ms 是 10 倍余量，够宽了）。
-
-**但它仍然不是"卡住多久算卡住"** —— 它的职责是"绝不能把一个本来会
-正常结束的动画砍掉"。哪天动画又变长了，先重量再决定要不要放宽，
-**不要**因为"感觉不够快"就往下调。
-回归测试见 `%TEMP%\tl_qt_drive.py` 的"看门狗落位"那一段。
+阈值 `LOCK_TIMEOUT_MS` = **1500ms**（总纲 §10.3 指定）。**它的职责是"绝不能把一个本来会
+正常结束的动画砍掉"**，不是"卡住多久算卡住"（现在一次切页中位 ~137ms，1500ms 是 10 倍
+余量）。动画又变长了就先重量再决定要不要放宽，**不要**因为"感觉不够快"就往下调；回归测试
+见 `%TEMP%\tl_qt_drive.py` 的"看门狗落位"那一段。
 
 ## 12. 性能基线（改完要重量，别凭感觉）
 
-两处都是用户明确反馈过的卡顿。数字全部来自实测，脚本留在 `%TEMP%`。
+两处都是用户反馈过的卡顿；数字全部实测，脚本留在 `%TEMP%`。
 
-| 指标 | 改之前 | 现在 | 怎么量 |
-|---|---|---|---|
-| 切页（中位） | 439 ~ 500 ms | **~137 ms** | `%TEMP%\tl_perf_bench.py` |
-| 启动到主窗可见（源码） | 6681 ms | **3055 ms** | `%TEMP%\tl_startup_time.py` |
-| 开屏 `show()` | 1030 ms | **165 ms** | `%TEMP%\tl_splash_probe.py` |
-| 开屏 pixmap 绘制 | 242 ms | **~1 ms** | `%TEMP%\tl_perf_bench.py` |
-| 欢迎页停留 | 1500 ms | **1500 ms（总纲 §10.2 定死）** | `ui/welcome.py` 的 `HOLD_MS` |
+| 指标 | 改之前 → 现在 | 怎么量 |
+|---|---|---|
+| 切页（中位） | 439 ~ 500 ms → **~137 ms** | `%TEMP%\tl_perf_bench.py` |
+| 启动到主窗可见（源码） | 6681 ms → **3055 ms** | `%TEMP%\tl_startup_time.py` |
+| 开屏 `show()` | 1030 ms → **165 ms** | `%TEMP%\tl_splash_probe.py` |
+| 开屏 pixmap 绘制 | 242 ms → **~1 ms** | `%TEMP%\tl_perf_bench.py` |
+| 欢迎页停留 | 1500 ms → **1500 ms（总纲 §10.2 定死）** | `ui/welcome.py` 的 `HOLD_MS` |
 
-> ⚠️ 欢迎页那 1500ms **不要**再"优化"掉。它一度是 900ms，
-> 但总纲 §10.2 明确写了 1.5s，文档优先。要动先问，不要凭手感调。
+> ⚠️ 欢迎页那 1500ms **不要**再"优化"掉：总纲 §10.2 明确写了 1.5s，**文档优先** ——
+> 要动先问，不要凭手感调（第 25c 条）。
 
-**量性能的三条规矩**（都是这轮踩出来的）：
-
-1. **必须带对照组。** 每次先跑 `time.sleep(0.2)` 确认量到的是 200ms 左右。
-   这轮有过一次所有数字都是 0.0ms 的假测量 —— 差点据此改了错误的代码。
-2. **一次性的成本要单独起进程测。** "第一次创建原生窗口"约 165ms，
-   在同一个进程里连续测会把账算到第二个变体头上（`tl_splash_probe.py`
-   就是为这个写成 `argv[1]` 选变体的）。
-3. **别用写死的 `pump(1600)` 去等状态。** 这轮把链上每个时长都改了，
-   所有写死等待的断言同时变成假绿或假红（`tl_boot_test.py` 就是这么坏的）。
-   一律用轮询 `wait_until(pred, timeout)`；确需断言"某件事发生过"时用**锁存器**
-   （spy/flag），不要靠撞时机。
+**量性能的两条规矩**：① **必须带对照组，一次性的成本必须单独起进程测** —— 先跑
+`time.sleep(0.2)` 确认量到的是 200ms 左右；"第一次创建原生窗口"约 165ms，同进程连测会把账
+算到第二个变体头上 —— `tl_splash_probe.py` 为此写成 `argv[1]` 选变体。② **别用写死的
+`pump(1600)` 去等状态** —— 一律用轮询 `wait_until(pred, timeout)`，确要断言"某件事发生过"
+就用**锁存器**（spy/flag）→ §二十三 12。
 
 ## 13. ★ 联网红线（**有条件放行**）
 
@@ -494,10 +353,10 @@ self._stack.setCurrentIndex(self._pending); clear_effect(...); self._land(...)
 
 | 场景 | 条件 | 实现 |
 |---|---|---|
-| SMTP 发邮件 | 仅找回密码流程，用户主动点「发送验证码」触发 | `core/email_recovery.py` |
-| 辅导员手动启用云端大模型 | 设置页手动开 + 手动填 API Key，**只在点「深度评估」时**调用 | `core/ai/`（骨架） |
+| SMTP 发邮件 | 仅找回密码流程，用户点「发送验证码」触发 | `core/email_recovery.py` |
+| 辅导员手动启用云端大模型 | 设置页手动开 + 填 API Key，**只在点「深度评估」时**调用 | `core/ai/`（骨架） |
 | **更新检查** | 用户点「检查更新」→ `urllib.request` 只读一次 Gitee 版本号 | `core/updater.py` |
-| **更新下载 / AI 模型下载** | 用户点「开始下载」并勾选文件 → `urllib.request` 流式下载 | `core/updater.download_exe` |
+| **更新下载 / AI 模型下载** | 用户点「开始下载」并勾选文件 → 流式下载 | `core/updater.download_exe` |
 
 ★ **v1.8 把"更新下载"加进了白名单，但 ❌ 那一条没变**：
 
@@ -506,53 +365,43 @@ self._stack.setCurrentIndex(self._pending); clear_effect(...); self._land(...)
    任何形式的「输码解锁 / 联网校验用户资格」 · requests/httpx 用于上述场景之外
 ```
 
-所以"允许下载"的准确含义是：**每一次下载前面都必须有一个用户点过确认的弹窗**。
-代码里不许有"启动时顺便检查/下载一下"的路径 —— 判据之一是
-`_updater_policy_lines()` 里那条"import 期零网络"
-（把 `urlopen` 换成炸弹再重新 import 一遍模块，见第 21 节）。
+所以"允许下载"的含义是：**每一次下载前面都必须有一个用户点过确认的弹窗**；代码里
+不许有"启动时顺便检查/下载一下"的路径 —— 判据之一是 `_updater_policy_lines()` 里
+那条"import 期零网络"（`urlopen` 换成炸弹后重新 import，见第 21 节）。
 
 ### selfcheck 怎么守（`main._network_policy_report`）
 
-★ **守卫要落在行为上，不能落在"这个包在不在"上。** 原来那条
-"打包里见到 requests 就 FAIL"在改成"有条件放行"之后就错了，而且它只能查打包版，
-源码版什么都查不到。现在五条：
+★ **守卫要落在行为上，不能落在"这个包在不在"上**（原来那条"打包里见到 requests 就 FAIL"
+只能查打包版、源码版什么都查不到）。现在五条：① **静态扫
+`core/ai/*.py`**，出现任何
+`import requests/httpx/urllib.request/socket/http.client/openai/anthropic` 就 FAIL（正则只认
+真正的 import 语句，不认注释里提到的名字）；② **拿脏数据调一次 `redact_student`**，看姓名 /
+学号 / 身份证会不会漏出去；③ 非白名单联网库**仍然**不该在包里 —— 但报错文案改成"AI/更新都还是
+骨架，是不是有人偷偷加了依赖"；④ **更新检查**三条（`_updater_policy_lines`，见第 21 节）；
+⑤ **更新下载**三条（`_download_policy_lines`，见第 26 节）。
 
-1. **静态扫 `core/ai/*.py`**，源码里出现任何
-   `import requests/httpx/urllib.request/socket/http.client/openai/anthropic`
-   就 FAIL（正则只认真正的 import 语句，不认注释里提到的名字）；
-2. **拿脏数据调一次 `redact_student`**，看姓名/学号/身份证会不会漏出去；
-3. 非白名单联网库**仍然**不该在包里 —— 但报错文案改成
-   "AI/更新都还是骨架，是不是有人偷偷加了依赖"，不再是"违反铁律"；
-4. **更新检查**三条（`_updater_policy_lines`，见第 21 节）；
-5. **更新下载**三条（`_download_policy_lines`，见第 26 节）。
-
-★ 第 1 条**不需要为了 v1.8 放宽** —— `core/ai/model_downloader.py`
-刻意一行 `urllib` 都没有，字节流复用 `core.updater.download_exe`。
-所以"`core/ai/` 零 HTTP import"这条闸门照旧全量生效，扫描范围一个字没动。
+★ 第 1 条**不需要为了 v1.8 放宽**（理由见第 28 节）："`core/ai/` 零 HTTP import" 这条闸门
+照旧全量生效，扫描范围一个字没动。完整原文 → §二十三 13。
 
 ## 14. 奖学金测算（总纲 §九，**规则已定死**）
 
     final = 智育加权(口径① 全口径) × 0.7 + 德育分 × 0.3
 
-* 班级内按 final 降序；前 X / 接下来 Y / 再 Z 名分一、二、三等
-  （X/Y/Z **每班独立配置**，存 `class_{班级号}_quota.json.enc`）；
-* **特等奖**：final 进入前 X 名 **且** 每门科目原始成绩 ≥ 90。
-  **不占名额**（拿特等的人从名额池里移出去、后面的人往前补）；
-  **默认不叠加**，勾了"允许叠加"就显示成 `特等+一等`（统计时**两边都数**）。
-* 输出列、四种奖的配色、名额与特等的完整口径 → **总纲 §9.1-§9.4**，这里不重复。
+* 班级内按 final 降序；前 X / 接下来 Y / 再 Z 名分一、二、三等（X/Y/Z **每班独立配置**，
+  存 `class_{班级号}_quota.json.enc`）。输出列、四种奖配色、名额与特等的完整口径 →
+  **总纲 §9.1-§9.4**。
+* **特等奖**：final 进入前 X 名 **且** 每门原始成绩 ≥ 90。**不占名额**（拿特等的人移出名额
+  池、后面的人往前补）；**默认不叠加**，勾了"允许叠加"显示 `特等+一等`（统计**两边都数**）。
 
-★ **德育分没录 ≠ 0 分**（红线 2 的同一条道理）。没录的人按 0 参与测算，
-但**必须在备注里写明**"德育分未录入，按 0 计" —— 不写的话辅导员会以为
-这个人真的德育 0 分。表格里没录的格子是**空白**，不是 `0`。
+★ **德育分没录 ≠ 0 分**（红线 2 的同一条道理）：没录的人按 0 参与测算，但**必须备注**
+"德育分未录入，按 0 计"（表格里没录的格子是**空白**，不是 `0`）。
 
-★ **`core/scholarship.py` 里一行加权算术都没有。** 智育分是导入时
-`core.calculator` 用口径①算好、存进 `class_{班级号}.json.enc` 的；
-这里只做"乘 0.7 / 加 德育×0.3 / 排序 / 截名额" —— 那几步是**奖项规则**的算术，
-总纲 §9.1 给了公式，不算"自己发明算术"。**除此之外不许再加算术。**
+★ **`core/scholarship.py` 里一行加权算术都没有。** 智育分是导入时 `core.calculator` 用
+口径①算好、存进 `class_{班级号}.json.enc` 的；这里只做"乘 0.7 / 加 德育×0.3 / 排序 /
+截名额" —— 公式见总纲 §9.1。**除此之外不许再加算术。**
 
-★ 特等奖的"每门 ≥90"只检查**这个学生真考了的课**（`score is not None`）：
-没选的课不参与判定，**不会**被当成 0 分拖累他；缺考（数字 0）**算考了**，
-0 < 90，所以拿不到特等 —— 这是对的。
+★ 特等奖的"每门 ≥90"只检查**这个学生真考了的课**（`score is not None`）：没选的课不参与
+判定，**不会**被当成 0 分拖累他；缺考（数字 0）**算考了**，0 < 90，拿不到特等。
 
 ## 15. 班级号规范
 
@@ -574,9 +423,8 @@ self._stack.setCurrentIndex(self._pending); clear_effect(...); self._land(...)
 | **密码级** | `store.save(session, ...)` | ✅ 要 | **成绩**、意愿标签的原始库 |
 | **应用级** | `core/user_store.save_user_json` | ❌ 不要 | 班级快照、德育分、名额、纵向归档、AI 设置 |
 
-★ 为什么辅助数据走应用级：**自动登录时没有密码**（只有 session token），
-库密钥解不开。意愿、德育分这类"辅导员自己录进去的东西"如果按密码级加密，
-自动登录进来就全是空的。
+★ 为什么辅助数据走应用级：**自动登录时没有密码**（只有 session token），库密钥解不开 ——
+按密码级加密的话，自动登录进来就全是空的。
 
 ★ **成绩绝不许往应用级里塞。** 这是这条分工的底线。
 
@@ -584,28 +432,17 @@ self._stack.setCurrentIndex(self._pending); clear_effect(...); self._land(...)
 
 **症状**：点侧栏切页，落定之后界面**略微抖一下**。
 
-**根因（实测钉死）**：原来给新页挂 `QGraphicsOpacityEffect` 做 0→1 淡入。
-一旦挂了效果，Qt 就把整页渲染进**一张离屏 pixmap**，而那条路径上
-**文字的光栅化方式不一样**（没有 ClearType，字形次像素取整也不同）。
-动画跑完、效果一摘，整页**重新光栅化一遍**，所有字都换了个画法。
+**根因（实测钉死）**：给新页挂 `QGraphicsOpacityEffect` 会把整页渲染进**一张离屏 pixmap**
+（那条路径**没有 ClearType**）—— 效果一摘整页重光栅化一遍，字全换了画法。量法
+`%TEMP%\tl_clean_probe.py`（带对照组校准）：摘掉效果前后 **17.4% 的像素不同**、最大通道差
+**240**。推导 → §二十三 17。
 
-量法 `%TEMP%\tl_clean_probe.py`（带对照组校准）：挂着效果 @1.0 vs 摘掉效果
-**17.4% 的像素不同**、最大通道差 **240**；同一坐标一边 `#0f173b`、一边 `#ffffff` |
-
-**修法**：页面**永远不挂效果**。要淡入的改成盖在上面的一层**纯色幕布**淡出
-（`ui/anim.py` 的 `_PageCover` + `StackSwitcher._after_out`）：
-
-1. 先 `setCurrentIndex` —— 新页立刻走**正常渲染路径**画出来；
-2. 再盖一块 `#F1F5F9` 的纯色幕布；
-3. 幕布淡出 → 新页从背景里浮出来，视觉上和"淡入"一模一样。
-
-幕布是一整块纯色，离屏渲染和直接渲染**逐像素一致**，摘效果时没有任何可看出来的
-变化。判据（`%TEMP%\tl_cover_verify.py`）：**落定后再等 1 秒，两帧必须逐像素相同**
-（改之前这里差 17.4%）。
-
-★ 顺带修掉的一个真竞态：原来 `setCurrentIndex` 之后才 `set_opacity(new, 0.0)`，
-实测中间有 **6.27ms** 的窗口是新页已 current 但**没有效果** ——
-任何一次落在那个窗口里的 paint 都会画出全不透明的一帧。现在是先挂 0 再换页。
+**修法**：页面**永远不挂效果** —— 要淡入的改成盖在上面的一层**纯色幕布**淡出
+（`ui/anim.py` 的 `_PageCover` + `StackSwitcher._after_out`）：先 `setCurrentIndex`（新页立刻
+走**正常渲染路径**画出来）→ 再盖一块 `#F1F5F9` 幕布 → 幕布淡出，新页从背景里浮出来，视觉
+上和"淡入"一样。幕布是整块纯色，离屏渲染与直接渲染**逐像素一致**；判据：**落定后再等 1 秒，
+两帧必须逐像素相同**（改之前差 17.4%，`%TEMP%\tl_cover_verify.py`）。顺带修掉的真竞态（**6.27ms** 窗口，
+先挂 0 再换页）→ §二十三 17。
 
 ## 18. 加一个页面前先想清楚"数据从哪来"
 
@@ -613,52 +450,33 @@ v1.6 新增的两个页面（成长档案、奖学金测算）都遵守同一条
 
 * **不重新解析 Excel、不重新算加权** —— 导入时算一遍，把结果存进加密库
   （`class_{班级号}.json.enc` / `archive.json.enc`），页面只负责显示；
-* **口径固定**：档案页固定用「必修+限选」，**不跟智育分析页的筛选按钮联动**
-  —— 跟着屏幕上的临时视图变，会出现"上学期看是 84、这学期看是 86"。
+* **口径固定**：档案页固定用「必修+限选」，**不跟智育分析页的筛选按钮联动** ——
+  跟着屏幕上的临时视图变，会出现"上学期看是 84、这学期看是 86"。
 
-★ 页面之间的数据流一律走**一处真源 + 信号刷新**：
-分析页导入完 → `class_saved` 信号 → 主窗 `_on_class_saved` 通知另外两页
-`reload_classes()` / `reload()`。刷新失败**只打日志、不弹窗**
-（数据已经存进去了，某一页没刷新出来是显示问题，不该打断用户看成绩）。
+★ 页面之间的数据流一律走**一处真源 + 信号刷新**：分析页导入完 → `class_saved` 信号 →
+主窗 `_on_class_saved` 通知另外两页 `reload_classes()` / `reload()`。刷新失败**只打日志、
+不弹窗**（数据已经存进去了）。
 
 ## 19. ★★ 必修 / 限选 / 选修是**三个独立类别**（总纲 §一 + §三 铁律 8）
 
-总纲 §1.1 收录的原话：**"必修、限选、选修是三个完全独立的类别，绝不混同"**、
-**"任何将选修归入限选的逻辑都是 bug"**。十节速查表里也单列了这一条。
+总纲 §1.1 的原话：**"必修、限选、选修是三个完全独立的类别，绝不混同"**、**"任何将
+选修归入限选的逻辑都是 bug"**。
 
-真源只有两处，别在别处再判断一遍：
+真源两处，别在别处再判断：`core.parser.Category`（`REQUIRED="必修"` /
+`LIMITED="限选"` / `ELECTIVE="选修"`，+ `UNKNOWN`）与
+`core.calculator.CalculationScope.categories`（每档允许计入的类别集合）。三档口径及枚举值
+（总纲 §1.2）：① 总加权 = 必修＋限选＋选修（＋未标类别），`CalculationScope.ALL`；② 仅必修
++限选，`CalculationScope.REQUIRED_LIMITED`；③ 仅必修，`CalculationScope.REQUIRED_ONLY`。
 
-| 真源 | 内容 |
-|---|---|
-| `core.parser.Category` | `REQUIRED="必修"` / `LIMITED="限选"` / `ELECTIVE="选修"`（+ `UNKNOWN`） |
-| `core.calculator.CalculationScope.categories` | 每档口径允许计入的类别集合 |
+★ **行为门** `main._category_policy_report()`（`--selfcheck` 里跑）：不只数枚举值，而是**真算
+一遍**三门各属一类的样例 —— 高等数学(4学分)必修 = 80 ｜ 专业英语(2学分)限选 = 90 ｜ 音乐鉴赏
+(1学分)选修 = 100 → 口径① 600/7 = 85.714286、口径② 500/6 = 83.333333、口径③ 320/4 = 80。
+**只要有人把选修当成限选算进②，② 立刻变成 85.714286 == ①，检查当场 FAIL**
+（`%TEMP%\tl_category_gate_test.py` 注入了这条违规验证过）。
 
-三档口径（总纲 §1.2）：
-
-| 口径 | 类别 | 枚举值 |
-|---|---|---|
-| ① 总加权 | 必修＋限选＋选修（＋未标类别） | `CalculationScope.ALL` |
-| ② 仅必修+限选 | 必修＋限选 | `CalculationScope.REQUIRED_LIMITED` |
-| ③ 仅必修 | 必修 | `CalculationScope.REQUIRED_ONLY` |
-
-★ **行为门**：`main._category_policy_report()`（`--selfcheck` 里跑）。它不只数
-枚举值，而是**真算一遍**三门各属一类的样例：
-
-    高等数学(4学分)必修 = 80 ｜ 专业英语(2学分)限选 = 90 ｜ 音乐鉴赏(1学分)选修 = 100
-    口径① 600/7 = 85.714286    口径② 500/6 = 83.333333    口径③ 320/4 = 80
-
-**只要有人把选修当成限选算进②，② 立刻变成 85.714286 == ①，检查当场 FAIL。**
-（已实测：把 `CalculationScope.REQUIRED_LIMITED.categories` 临时改成含选修，
-三条 FAIL 同时报出来 —— 见 `%TEMP%\tl_category_gate_test.py`。）
-
-★ 界面上的对应物：`ui/pages/analysis_page.py` 的 `scope_breakdown()` 把每档
-"算了哪几类"翻成人话，挂在按钮气泡 / 状态行 / 表下说明上（见 10b）。
-
-★ ⚠️ **一处已知的历史遗留，别当成 bug 顺手改**：冻结的 `core/parser.py` 里
-`CATEGORY_KEYWORDS` 把 **"专业选修"** 归到 **限选**（关键字命中数打平时按
-`必修 > 限选 > 选修` 取先出现的）。那是个**校名别名**（多数培养方案里
-"专业选修课"就是限选课），而且 parser 铁律一封板，**一个字符都不许动**。
-真要改，是 Owner 的事，不是 Agent 的事。
+★ ⚠️ **一处已知的历史遗留，别当成 bug 顺手改**：冻结的 `core/parser.py` 里 `CATEGORY_KEYWORDS`
+把 **"专业选修"** 归到 **限选**（校名别名）—— 且 parser 铁律一封板，**一个字符都不许动**。
+（取值规则与推导 → §二十三 19）
 
 ## 20. ★ 学期标签：导入必须选学期，档案必须**累加**
 
@@ -674,38 +492,29 @@ v1.6 新增的两个页面（成长档案、奖学金测算）都遵守同一条
 
 ### 20b. ★★ 光加下拉框不够 —— 必须把已有档案带进去 append
 
-```python
-# ⛔ 每导一次就把上一个学期整份覆盖掉：档案永远只有一个学期，
-#    趋势 Δ 永远显示"单次导入，暂无趋势"
-self._archive = build_archive(parsed, self.term, source=name)
+调用必须带上 `archive=` 这个实参（把加密库里的档案读回来当底座，用
+`self._load_archive()`）：⛔ `build_archive(parsed, self.term, source=name)` 每导一次就把上一个
+学期整份覆盖掉（档案永远只有一个学期、趋势 Δ 永远显示"单次导入，暂无趋势"）；
+✓ `build_archive(parsed, self.term, archive=self._load_archive(), source=name)`。
 
-# ✓ 先把加密库里的档案读回来当底座
-self._archive = build_archive(
-    parsed, self.term, archive=self._load_archive(), source=name
-)
-```
-
-`core.archival.build_archive(..., archive=...)` **不改入参**，返回追加后的新
-`Archive`；同一个 `(key, term)` 重复导入会**保留两份**并记一条 warning ——
-绝不静默丢掉某一次导入。
+`core.archival.build_archive(..., archive=...)` **不改入参**，返回追加后的新 `Archive`；同一个
+`(key, term)` 重复导入会**保留两份**并记一条 warning —— 绝不静默丢掉某一次导入。
 
 ### 20c. 落盘与串号
 
-* 归档走**应用级**加密（`core/user_store`，第 16 节）：自动登录没有密码，
-  密码级的话重新打开就空了。
-* `AnalysisPage.set_user()` 必须**清掉内存里那份 `_archive`** ——
-  它是上一个人的，留着会让下一个人导入时把两个人的学期并进同一份档案。
-* `user_file()` 是按 `users.json` 里的 **uid** 解析路径的：
-  **账户不存在时 `save_user_json` 直接抛 `CryptoError("本机没有账户…")`**。
-  测试里建临时 store 时**必须先 `store.register()`**，否则"档案落盘"整条
-  断言会假红（第一版 `tl_semester_test.py` 就是这么翻车的）。
+* 归档走**应用级**加密（`core/user_store`，第 16 节）：自动登录没有密码。
+* `AnalysisPage.set_user()` 必须**清掉内存里那份 `_archive`** —— 它是上一个人的，
+  留着会让下一个人导入时把两个人的学期并进同一份档案。
+* `user_file()` 按 `users.json` 里的 **uid** 解析路径：**账户不存在时 `save_user_json`
+  直接抛 `CryptoError("本机没有账户…")`** —— 测试里建临时 store **必须先
+  `store.register()`**。
 
 ### 20d. 判据
 
-`%TEMP%\tl_semester_test.py`（31 项）真的连导三个学期：
-大一上（同页）→ 大二下（同页）→ **新建页面**再导大三上（= 重启程序的等价场景）。
-断言：三份记录都在、趋势 Δ 是**真涨的**（第三份表分数确实更高，Δ>0）、
-磁盘上 `archive.json.enc` 读回来也是三个学期、文件里**扫不到明文姓名**。
+`%TEMP%\tl_semester_test.py`（31 项）真的连导三个学期：大一上（同页）→ 大二下（同页）→
+**新建页面**再导大三上（= 重启程序的等价场景）。断言：三份记录都在、趋势 Δ 是**真涨的**
+（第三份表分数确实更高，Δ>0）、磁盘上 `archive.json.enc` 读回来也是三个学期、文件里
+**扫不到明文姓名**。
 
 ## 21. ★ 更新检查：`urllib.request` 是唯一允许的 stdlib 联网
 
@@ -718,8 +527,8 @@ self._archive = build_archive(
 | **import 期零网络** | 把 `urllib.request.urlopen` 换成"一调用就抛"的桩，**重新 import 一遍模块** | 静态 grep 抓不住间接调用；重新 import 是行为验证 |
 | 超时 == 5s | 直接断言 `DEFAULT_TIMEOUT == 5` | 总纲 §六 写死的 |
 
-★ 三条守卫**都验证过会 FAIL**（`%TEMP%\tl_updater_gate_test.py` 往
-`core/updater.py` 里真注入违规，跑完按字节还原）—— 不验一次就不算有牙。
+★ 三条守卫**都验证过会 FAIL**（`%TEMP%\tl_updater_gate_test.py` 真注入违规再按字节还原）
+—— 不验一次就不算有牙。
 
 ### 21a. 请求必须走后台线程
 
@@ -732,26 +541,19 @@ self._archive = build_archive(
 2026-09-27 实测：仓库公开可读（200），但 `/releases` 返回 `200 []`、
 `/releases/latest` 返回 **404** —— **一个发行版都没发过**。
 
-所以只打 `latest` 的话，在发布第一个发行版之前这功能永远只能报"检查失败"，
-而那不是实话。`check_for_update()` 因此有四种状态，界面对每种说不同的话：
+所以只打 `latest` 的话，发布第一个发行版之前这功能永远只能报"检查失败"，而那不是实话。
+`check_for_update()` 因此有四种状态：`newer`（弹窗"发现新版本 vX，是否前往下载？"）、
+`current`（"当前已是最新版本"）、`no-release`（"…还没有发布任何发行版"）、`error`
+（"检查失败，请手动访问仓库"）。
 
-四种状态：`newer`（弹窗"发现新版本 vX，是否前往下载？"）、`current`（"当前已是
-最新版本"）、`no-release`（"…还没有发布任何发行版"，即**接口通了**、只是没东西可下）、
-`error`（"检查失败，请手动访问仓库"）。
-
-★ **`check_latest_version()` 的契约一个字没改**（总纲 §六 指定的那个）：
-成功给版本号字符串，失败给 `None`。要分状态用 `check_for_update()`。
-
-★ **列表非空但读不出版本号** ≠ "没有发行版"。第一版把这两种混成一种，
-界面上会说"仓库里还没有发布任何发行版"，而仓库里明明挂着东西 —— **那是句假话**。
+★ **`check_latest_version()` 的契约一个字没改**（总纲 §六 指定的那个）：成功给版本号字符串，
+失败给 `None`；要分状态用 `check_for_update()`。★ **列表非空但读不出版本号** ≠ "没有发行版"
+（第一版把两者混成一种 → 界面说假话）。
 
 ### 21c. ★ v1.8 起：**可以下载，但绝不自动**
 
-v1.7 时这里写的是"绝不自动下载、绝不自动替换，只打开浏览器"。
-**总纲 §四 改了这条**（把"更新下载"加进白名单，
-第六节给了完整的下载 → 重启 → 替换流程），所以那段话已被取代。
-
-**现在正确的说法是**：
+v1.7 时这里写的是"绝不自动下载、绝不自动替换，只打开浏览器"；**总纲 §四 已经把"更新下载"
+加进白名单**（第六节给了完整的下载 → 重启 → 替换流程），那段话已被取代：
 
 | | |
 |---|---|
@@ -759,11 +561,9 @@ v1.7 时这里写的是"绝不自动下载、绝不自动替换，只打开浏�
 | ❌ 仍然禁止 | **静默/自动下载** —— 启动时、定时、后台，一律不许 |
 | ❌ 仍然禁止 | **热替换**（趁自己还活着去覆盖自己的 exe）—— 那是必失败或写出半截文件 |
 
-每一次下载前面都必须有一个**用户点过确认的弹窗**，
-代码里不许有"启动时顺便查一下/下一下"的路径。
-
-★ 判断"是不是偷偷联网了"的判据仍然是第 21 节那条**行为**检查
-（`urlopen` 换成炸弹后重新 import 模块），不是读源码找关键字。
+每一次下载前面都必须有一个**用户点过确认的弹窗**，代码里不许有"启动时顺便查一下/下一下"
+的路径。★ "是不是偷偷联网了"的判据仍是第 21 节那条**行为**检查（`urlopen` 换成炸弹后重新
+import 模块），不是读源码找关键字。
 
 ## 22. ★ 数据迁移与版本保护（总纲 §十二）
 
@@ -785,26 +585,22 @@ v1.7 时这里写的是"绝不自动下载、绝不自动替换，只打开浏�
 ```
 
 所以 `backup_vault()` 备份的是**整个目录**。只备份 `users.json` 等于没备份 ——
-成绩全在 `u_*/` 里。
-
-★ **备份目录本身必须排除**：备份放在数据目录**里面**（总纲 §12.2 的路径），
-不排除的话每迁一次目录就翻一倍。
+成绩全在 `u_*/` 里。★ **备份目录自己必须排除**（备份就放在数据目录**里面**，总纲 §12.2 的
+路径）—— 不排除的话每迁一次就翻一倍。
 
 ### 22b. 标记写在哪、什么时候写
 
 * 键：**两个键同时写**（`core.version.VAULT_VERSION_KEYS`）：
   `__vault_version__`（总纲 §12.3 的值）和 `vault_version`
   （任务书 2.1 / 旧 v1.8 charter §1.1 两次给的值）。**读取时哪个有值认哪个。**
-  * 为什么写两份：键名在两份文档之间**对不上**，让实现去猜哪边赢的风险是"某次
-    真迁移把标记写到一个启动检测读不到的键上"。成本是两个 JSON 字段，收益是"谁读都对"。
-    唯一写入点是 `core.version.stamp_vault_version()`，`--selfcheck` 断言两键都在且相等。
-* 位置：`users.json` 顶层，跟着 `UserIndex` 走 —— 因为 `save_users()`
-  每次都从 `UserIndex.to_dict()` 重写整个文件，标记**不挂在 UserIndex 上
-  就会被下一次写盘悄悄抹掉**。
-* 时机：`CryptoStore.register()`（建第一个用户 = 初始化这个库）调
-  `init_vault()`。**只在没有标记时盖** —— 覆盖已有标记会让"检测到旧版数据"
-  永远发现不了旧数据。写在**明文**的 `users.json` 里，是因为启动检测发生在
-  **登录之前**，那时没有密码，密文一概打不开。
+  唯一写入点是 `core.version.stamp_vault_version()`，`--selfcheck` 断言两键都在且相等
+  （为什么非写两份不可 → §二十三 22b）。
+* 位置：`users.json` 顶层，跟着 `UserIndex` 走 —— `save_users()` 每次都从
+  `UserIndex.to_dict()` 重写整个文件，标记**不挂在 UserIndex 上就会被下一次写盘悄悄
+  抹掉**。
+* 时机：`CryptoStore.register()`（建第一个用户 = 初始化这个库）调 `init_vault()`。
+  **只在没有标记时盖**（覆盖已有标记会让"检测到旧版数据"永远发现不了旧数据）。写在
+  **明文**的 `users.json` 里，因为启动检测发生在**登录之前** —— 那时没有密码，密文打不开。
 
 ### 22c. 流程（`core.migrator`）
 
@@ -820,11 +616,11 @@ if needs_migration(data):                   # ★ 判真假**必须**用这个
 写成 `if check_compatibility(data):` 会恒为真。判真假请用 `needs_migration()`。
 
 ★ `migrate()` 的 `password` 参数：给了就先验证它真能开这个库；
-**启动路径上传空**（那时候还没登录）。当前 1.0→1.7 这条链不需要密码
-（没有数据结构变化、不重包裹密钥），参数留着是为了将来那一跳不用改签名。
+**启动路径上传空**（那时候还没登录）。当前这条链不需要密码（没有数据结构变化、
+不重包裹密钥），参数留着是为了将来那一跳不用改签名。
 
-★ **回滚只恢复 `users.json`** —— 迁移全程只动过这一个文件。
-整目录回滚会把备份之后新写的数据盖掉，那才是真的丢数据。
+★ **回滚只恢复 `users.json`** —— 迁移全程只动过这一个文件；整目录回滚会把备份之后新写的
+数据盖掉，那才是真的丢数据。
 
 ### 22d. 版本比程序新时
 
@@ -835,8 +631,8 @@ if needs_migration(data):                   # ★ 判真假**必须**用这个
 
 `%TEMP%\tl_migrate_test.py`（62 项）用**真实目录**跑完整条链：
 新建库带标记 / 老库判成 1.0 / 备份内容齐全（含 `app.salt` 和成绩密文）/
-同秒连备两次不覆盖 / 迁移后仍能登录且成绩一条不丢 /
-**备份失败时 users.json 一个字节没动** / **写回失败时逐字节回滚**。
+同秒连备两次不覆盖 / 迁移后仍能登录且成绩一条不丢 / **备份失败时 users.json 一个字节没动** /
+**写回失败时逐字节回滚**。
 
 ## 23. 版本号管理规范
 
@@ -854,49 +650,36 @@ if needs_migration(data):                   # ★ 判真假**必须**用这个
 | `ui/pages/account_page._ABOUT` | `("版本", f"v{CURRENT_VERSION}")` |
 | 三个顶层窗口标题 | `setWindowTitle(f"... v{CURRENT_VERSION}")` |
 
-★ 各写一份字符串，迟早出现"设置页写着 1.7、更新检查却按 1.6 比"
-这种事，而且**不报错，只是行为不对**。`--selfcheck` 里有一条断言
+★ 各写一份字符串，迟早出现"设置页写着 1.7、更新检查却按 1.6 比"这种事，而且**不报错，
+只是行为不对** —— `--selfcheck` 断言
 `core.updater.CURRENT_VERSION is core.version.CURRENT_VERSION`。
 
 ### 23a. ★★ UI 里**一个版本号字面量都不许有**（总纲 §三 铁律 10）
 
-这不是假想风险 —— v1.8 开工时在 `ui/` 里抓到**三处**写死的 `"v1.0"`：
+不是假想风险 —— v1.8 开工时在 `ui/` 里抓到**三处**写死的 `"v1.0"`：
+`login_window.APP_VERSION`、`splash.py` 的默认参数、`account_page._ABOUT`。**三处全都不报错**，
+只是一直在说假话（程序是 1.8、界面写着 1.0；静态 grep 也查不出来）—— 位置与症状 → §二十三 23a。
 
-| 位置 | 症状 |
-|---|---|
-| `ui/login_window.py` 的 `APP_VERSION` | 登录窗左栏永远显示 `v1.0` |
-| `ui/splash.py` 的 `version` 默认参数 | 开屏版本号永远 `v1.0` |
-| `ui/pages/account_page.py` 的"关于"表 | 个人中心永远写着 `v1.0` |
+**判据**（`main._version_source_report()`，`--selfcheck` 里跑）：① **静态** —— 用 `ast` 扫
+`ui/**/*.py` 的**字符串字面量**，出现"整串就是个版本号"（`^v?\d+\.\d+(\.\d+)*$`）就
+FAIL（注释不在 AST 里，文档字符串显式跳过）；② **行为** —— 真读
+`login_window.APP_VERSION`、`SplashScreen` 默认参数、`account_page._ABOUT`，必须等于
+`f"v{CURRENT_VERSION}"`。
 
-三处都**不报错**，只是一直在说假话（程序是 1.8、界面写着 1.0）。
-而且**静态 grep 查不出来** —— `ui/anim.py` 的注释里合法地写着
-"旧 charter v1.6 第 5.2 节"、`ui/pages/settings_page.py` 的文档字符串提到
-`docs/DEV_SUMMARY.md`，一刀切地搜 `1.0` / `1.6` 全是误报。
-
-**判据**（`main._version_source_report()`，`--selfcheck` 里跑）：
-
-1. **静态**：用 `ast` 扫 `ui/**/*.py` 的**字符串字面量**，
-   出现"整串就是个版本号"（`^v?\d+\.\d+(\.\d+)*$`）就 FAIL。
-   注释根本不在 AST 里，文档字符串被显式跳过 —— 所以"引用"不会误伤。
-2. **行为**：把 `login_window.APP_VERSION`、`SplashScreen` 的默认参数、
-   `account_page._ABOUT` 真的读出来，必须等于 `f"v{CURRENT_VERSION}"`。
-
-★ 闸门**验过有牙**：往 `ui/splash.py` 注入一处 `version: str = "v1.0"`，
-立刻 FAIL 并指名 `ui\splash.py:183`（见 `%TEMP%\tl_v18_gate_test.py`）。
+★ 闸门**验过有牙**：往 `ui/splash.py` 注入一处 `version: str = "v1.0"`，立刻 FAIL
+并指名 `ui\splash.py:183`（`%TEMP%\tl_v18_gate_test.py`）。
 
 ★ 写文档（`.md`）时该写版本号就写 —— 这条只管**界面代码**。
 
-★ 比较一律走 `compare_versions()`（**数值**逐位比）。
-`"1.10" > "1.9"` 用字符串比会得出 False，等真出 1.10 那天才暴露。
-
-★ `normalize_version()` **不削末尾的 0**（第一版削了，`"1.0"`→`"1"`，
-备份名和迁移链查表同时坏掉）。`"1.7.0"` 和 `"1.7"` 算不算同一个版本
-**是 `compare_versions()` 的事**（缺位按 0 补），不是规范化的事。
+★ 比较一律走 `compare_versions()`（**数值**逐位比）——`"1.10" > "1.9"` 用字符串比会得出
+False，等真出 1.10 才暴露。★ `normalize_version()` **不削末尾的 0**（第一版削了，
+`"1.0"`→`"1"`，备份名和迁移链查表同时坏掉）；`"1.7.0"` 和 `"1.7"` 算不算同一个版本**是
+`compare_versions()` 的事**（缺位按 0 补），不是规范化的事。
 
 ### 23b. 升版本号 = **同时补迁移链的一跳**
 
-改完 `CURRENT_VERSION`，必须去 `core/migrator.py` 的 `_STEPS` 补一跳 ——
-**哪怕什么数据结构都没改，也要写个 `return data` 的空函数**。
+改完 `CURRENT_VERSION`，必须去 `core/migrator.py` 的 `_STEPS` 补一跳 —— **哪怕什么数据结构
+都没改，也要写个 `return data` 的空函数**。
 
 不补的后果是**老用户启动时直接报错**：
 
@@ -909,56 +692,26 @@ v1.7 → v1.8 时实测踩到（`--selfcheck` 的迁移检查当场 FAIL，拦�
 
 ## 24. ★ 界面上不许出现 Markdown 记号（总纲 §三 铁律 9）
 
-`QLabel` / tooltip 都是**纯文本**（或用 Qt 富文本），`**加粗**` 会**原样显示**
-两个星号。踩过两次：
+`QLabel` / tooltip 都是**纯文本**（或用 Qt 富文本），`**加粗**` 会**原样显示**两个星号。
+踩过两次：分析页表下常驻说明 `**绝不并进限选**`、奖学金页「允许特等叠加」的气泡
+`**不占**` —— 两次都是**所有静态断言全绿、只有截图才看见**。
 
-* 分析页表下常驻说明 `**绝不并进限选**`
-* 奖学金页「允许特等叠加」的气泡 `**不占**`
-
-两次都是**所有静态断言全绿、只有截图才看见**。
-
-判据：`%TEMP%\tl_label_lint.py`（7 项）。它是**运行时遍历**，不是扫源码 ——
-文案可能是拼出来的（`CALC_SCOPE_NOTE` 就是模块级常量拼进 QLabel 的）。
-主窗 162 处控件文字 / 气泡 + 登录窗 + 欢迎页全过一遍，
-出现 `**` / `__` / 反引号即 FAIL，并且第 4 节带反向自检。
+判据：`%TEMP%\tl_label_lint.py`（7 项）。它是**运行时遍历**，不是扫源码（文案可能是拼出来的
+—— `CALC_SCOPE_NOTE` 就是模块级常量拼进 QLabel 的）：主窗 162 处控件文字 / 气泡 + 登录窗 +
+欢迎页全过一遍，出现 `**` / `__` / 反引号即 FAIL，并且第 4 节带反向自检。
 
 ★ 写文档（`.md`）时该加粗就加粗 —— 这条只管**界面文案**。
 
 ## 25. 已知限制清单（**记录，不是待办**）
 
-这三条都是**确认过的真实行为**，不是"感觉可能有问题"。
-动它们之前先想清楚要不要解封 `core/calculator.py`（铁律一）。
+三条都是**确认过的真实行为**。动它们之前先想清楚要不要解封 `core/calculator.py`（铁律一）。
 
-### 25a. `core/parser.py` 把「专业选修」归到限选
-
-校名别名（多数培养方案里"专业选修课"就是限选课），parser 铁律一封板、**一个字符
-都不许动**；真要改是 Owner 的事。判据与理由见**第 19 节末**。
-
-### 25b. ★ 分数 > 100 会**静默掉出加权分母**，但仍留在 `course_scores` 里
-
-实测（2026-09-26）：张三高等数学 91 改成 101 之后
-
-```
-口径② 从 85.052632 → 82.928571      （手算 1161/14 —— 5 个学分凭空少了）
-total_credit 从 19 → 14
-course_scores 里**仍然列着** ('高等数学', 101.0, 5.0)
-```
-
-后果两边不一致：智育加权把那门课当没算，而奖学金特等奖「每门 ≥90」判的是
-`score is not None`，于是**一个 101 的笔误会算作达标**。
-
-★ **已经做的缓解**：`ui.pages.analysis_page.out_of_range_scores()` 在
-**强制人工确认**弹窗（红线 3）里把超范围的格子单独列一栏。
-**不动 calculator**，也不会算错。
-
-★ **没做**：改 `core/calculator.py` 让它报错或夹取 —— 铁律一封板。
-
-### 25c. 欢迎页 1.5s：启动比 900ms 那版多约 600ms
-
-总纲 §10.2 写的是"欢迎页 1.5s 时间问候"（原文出自旧 charter v1.7 第六节）。
-中间一度被压到 900ms（性能整改时自己定的，不是文档要求），v1.7 已按文档回到 1.5s。
-
-**这是文档定义值，不是 Agent 自定的**，不要再"优化"掉。要动先问。
+* **25a** `core/parser.py` 把「专业选修」归**限选**（校名别名）—— 铁律一封板，**一个字符都
+  不许动**；要改是 Owner 的事。
+* **25b ★ 分数 > 100 会静默掉出加权分母**，却仍留在 `course_scores` 里（实测 91 改成 101：
+  口径② 85.052632→82.928571、`total_credit` 19→14）—— 智育把它当没算，奖学金「每门 ≥90」却
+  算它达标。缓解只在界面（`out_of_range_scores()` 进强制确认弹窗），**不动 calculator**。
+* **25c** 欢迎页 1.5s 是总纲 §10.2 的**文档定义值** —— 不要再优化掉，要动先问。
 
 ## 26. ★★ 自动更新器：四个"绝不"（总纲 §六）
 
@@ -976,11 +729,10 @@ course_scores 里**仍然列着** ('高等数学', 101.0, 5.0)
 
 ### 26b. ★ `.bat` 正文必须是纯 ASCII（踩过一次）
 
-第一版 `rem` 注释写了中文，被自己的断言逮住。**中文注释在这里真会出事**：
-`cmd.exe` 按当前代码页逐字节解码 bat，中文按 GBK 解错位后，
-错位配对的尾字节范围（`0x40~0xFE`）正好包含 `"` 和 `\` ——
-会把后面那句 `copy /Y "%SRC%" "%DST%"` 的引号**吃掉**，报错完全看不出根因。
-和 §1b（`.ps1` 的 BOM）是同一个根因。
+第一版 `rem` 注释写了中文，被自己的断言逮住：`cmd.exe` 按当前代码页**逐字节**解码 bat，
+中文按 GBK 解错位后的尾字节范围（`0x40~0xFE`）正好包含 `"` 和 `\` —— 会把后面那句
+`copy /Y "%SRC%" "%DST%"` 的引号**吃掉**，报错完全看不出根因。和 §1b（`.ps1` 的 BOM）
+**同一个根因**，完整经过 → §二十三 26b。
 
 ### 26c. ★ 路径不写进 bat，走命令行参数（`%~1..%~4`）
 
@@ -990,14 +742,13 @@ course_scores 里**仍然列着** ('高等数学', 101.0, 5.0)
 ### 26d. 复制要重试，失败就什么都不做
 
 `for /L %%i in (1,1,60)` 每秒重试（刚退出的进程可能还占着句柄几秒）。
-60 次全失败 → `goto :giveup`，旧 exe 原样留着。
-**最坏情况是"更新没生效"，不是"程序没了"。**
+60 次全失败 → `goto :giveup`，旧 exe 原样留着 —— **最坏情况是"更新没生效"，不是"程序没了"。**
 
 ### 26e. 必须写日志
 
-bat 在**本进程退出之后**跑，那时没有控制台、没有异常、没有反馈。
-每次交接都往 `%TEMP%\SGMS_Update\apply_update.log` 写一行 ——
-没有它，"点了立即重启但版本没变"完全查不下去。
+bat 在**本进程退出之后**跑，那时没有控制台、没有异常、没有反馈。每次交接都往
+`%TEMP%\SGMS_Update\apply_update.log` 写一行 —— 没有它，"点了立即重启但版本没变"
+完全查不下去。
 
 ### 26f. 启动次序（`main()` 里）
 
@@ -1033,18 +784,17 @@ flow.start()              ← 开屏
 | `D0 CF 11 E0 A1 B1 1A E1` | `xlrd` | 老格式 xls（OLE2 复合文档） |
 | `09 00 04 00` + version | `xlrd` | 裸 BIFF 流（Excel 2.0/3.0，无 OLE2 外壳） |
 
-★ **必须显式指定引擎**：实测即使 xlrd 装好了，`pd.read_excel("真的.xls")`
-对**裸 BIFF 流**依然报 `ValueError: Excel file format cannot be determined,
-you must specify an engine manually.` —— pandas 自己的 sniff 只认 zip 和 OLE2。
+★ **必须显式指定引擎**：实测即使 xlrd 装好了，`pd.read_excel("真的.xls")` 对**裸 BIFF 流**
+依然报 `ValueError: Excel file format cannot be determined, you must specify an engine
+manually.` —— pandas 自己的 sniff 只认 zip 和 OLE2。
 
 ### 27b. ★★ "导 .xlsx 却弹出 xlrd 错误"的根因（实测复现）
 
-pandas **不看扩展名，看内容的魔数**。一个"扩展名 `.xlsx`、内容其实是 OLE2"
-的文件（**教务系统导出的老格式表经常长这样**）被判成 `"xls"` → 调 xlrd →
+pandas **不看扩展名，看内容的魔数**。一个"扩展名 `.xlsx`、内容其实是 OLE2"的文件
+（**教务系统导出的老格式表经常长这样**）被判成 `"xls"` → 调 xlrd →
 没装就抛 `ImportError: Missing optional dependency 'xlrd'. … Use pip or conda
-to install xlrd.` —— 用户看到的是"我导的是 xlsx，为什么跟我说 xlrd"，
-而且错误里还带着 pip 指令。
-**修法**：按内容选引擎 + 兜底链（认定的引擎失败就换另一个试）。
+to install xlrd.` —— 用户看到的是"我导的是 xlsx，为什么跟我说 xlrd"，错误里还带着 pip 指令。
+**修法**：按内容选引擎 + 兜底链（认定的引擎失败就换另一个试）→ §二十三 27b。
 
 ### 27c. ★ `xlrd` 必须 **>= 2.0.1**，任务书写的 `<2.0` 是错的
 
@@ -1054,12 +804,12 @@ to install xlrd.` —— 用户看到的是"我导的是 xlsx，为什么跟我�
 | 2.0.2 | 正常读出 |
 
 1.2.0 那条例外里**同样带着版本指令** —— 等于花力气把错误信息换了个写法。
-`requirements.txt` 已写 `xlrd>=2.0.1`，自检里断言这个底线。
+`requirements.txt` 已写 `xlrd>=2.0.1`，自检断言这个底线。
 
 ### 27d. ★ 铁律 1 与「要改 parser 引擎」的冲突，怎么解的
 
 旧 v1.8 charter 第七节说"`core/parser.py`：`pd.read_excel(path, engine='openpyxl')`
-显式指定"，同一份文档第三节铁律 1 又说"parser 一个字符不许改"。**自己跟自己打架。**
+显式指定"，同一份文档的第三节铁律 1 又说"parser 一个字符不许改"—— 自己跟自己打架。
 
 **解法**：`core/parser.parse_excel` 的签名里本来就有 `**read_excel_kwargs`
 并原样转发给 `pd.read_excel` —— 那个扩展点就是为这种情况留的：
@@ -1096,16 +846,16 @@ parse_excel(path, engine=engine_for(path))   # 调用方传引擎进去
 做法：`core/ai/model_downloader.py` 里**一行 `urllib` 都没有** ——
 字节流复用 `core.updater.download_exe`，本模块只管"下到哪、叫什么、装好没有"。
 
-于是两条规则都不用让步：`core/ai/` 仍然零 HTTP import（**扫描范围无需放宽**），
-模型下载仍然是 `urllib.request`（在 `core.updater` 里）。
+于是两条规则都不用让步：`core/ai/` 仍零 HTTP import（**扫描范围无需放宽**），模型下载仍是
+`urllib.request`（在 `core.updater` 里）。
 
-★ 以后往 `core/ai/` 加下载类功能**照这个模式做**：把网络关在 `core.updater` 里。
-口子一开，那条闸门就只能放宽 —— 而放宽之后的闸门等于没有。
+★ 以后往 `core/ai/` 加下载类功能**照这个模式做**：把网络关在 `core.updater` 里 ——
+口子一开，那条闸门只能放宽，而放宽之后的闸门等于没有。
 
 ## 29. 模型文件的落盘位置与判据
 
-* 位置：**`%LOCALAPPDATA%\SGMS\models\<名字>\`**，不是仓库里的 `models/`。
-  理由：1~3GB 进仓库是灾难；打包后程序目录常常只读；数据目录才是它的家。
+* 位置：**`%LOCALAPPDATA%\SGMS\models\<名字>\`**，不是仓库里的 `models/` —— 1~3GB 进仓库
+  是灾难，打包后程序目录常常只读。
 * 落盘顺序：`models/temp/<名字>__<文件名>` → 校验 → **原子改名**进 `models/<名字>/`。
 * ★ 判据是"目录里有一个非空的 `.gguf`"，**不是"目录存在"** ——
   下载中途断电会留下空目录，那个不算装好。
@@ -1116,10 +866,8 @@ parse_excel(path, engine=engine_for(path))   # 调用方传引擎进去
 
 ## 30. ★★ 激活码系统**已整套删除**（Owner 决定）—— 不许复活
 
-注册登录 + 邮箱找回密码已经跑通，**登录即全部功能可用**。于是整套删除：
-`core/activation.py`（675 行）、`config/activation.example.json`、
-设置页那张卡片、主窗顶栏「● 已激活」小圆点。
-完整清单与遗留文件处置见 `docs/DEV_SUMMARY.md` 第 16.1-16.4 节。
+**为什么删**：注册登录 + 邮箱找回密码已经跑通，**登录即全部功能可用** —— 删掉的四个文件 /
+入口与遗留文件处置 → `docs/DEV_SUMMARY.md` 第 16.1-16.4 节 + §二十三 30。
 
 **四条硬约束**：
 
@@ -1132,13 +880,13 @@ parse_excel(path, engine=engine_for(path))   # 调用方传引擎进去
    没有任何代码读它。**不许**写"启动时顺手删掉"那种代码：
    删用户数据必须是用户主动的动作。
 
-**判据**：`main._removed_gate_report()`（`--selfcheck` 里跑，三层：文件层 /
-AST 源码层 / `CHECK_MODULES` 接线层）+ `%TEMP%\tl_qt_drive.py`（运行时遍历
-主窗与登录窗全部控件文字、占位符、气泡，0 处「激活」）+
-`%TEMP%\tl_noact_gate_test.py`（24 项，注入违规会 FAIL，跑完逐字节还原）。
+**判据**：`main._removed_gate_report()`（`--selfcheck` 里跑，三层：文件层 / AST 源码层 /
+`CHECK_MODULES` 接线层；覆盖范围 → §二十三 30）+ `%TEMP%\tl_qt_drive.py`（运行时遍历主窗与
+登录窗全部控件文字、占位符、气泡，0 处「激活」）+ `%TEMP%\tl_noact_gate_test.py`（24 项，
+注入违规会 FAIL，跑完逐字节还原）。
 
-★ 用 `ast` 而不是 grep `activ`：`ui/pages/scholarship_page.py` 里有 openpyxl 的
-`book.active`，一刀切地搜必然误报 —— **误报的闸门最后一定会被关掉**。
+★ 用 `ast` 而不是 grep `activ`：`ui/pages/scholarship_page.py` 里有 openpyxl 的 `book.active`，
+一刀切搜必然误报 —— **误报的闸门最后一定会被关掉**。
 
 ## 31. ★ 模型中心（v1.9 新增）
 
@@ -1146,15 +894,15 @@ AST 源码层 / `CHECK_MODULES` 接线层）+ `%TEMP%\tl_qt_drive.py`（运行�
 `core.updater.download_exe`，照第 28 节的模式）+ `ui/model_center_dialog.py`。
 
 * 清单是 Gitee raw `update/ai_models.json`：**读不到只是警告，界面照开**
-  （给"复制链接手动下载"兜底）；默认勾选 = `defaultCheck` 为真**且**内存够。
+  （给"复制链接手动下载"兜底）；默认勾选**只认「轻松」**（见第 33 节）—— 不再看清单里的 `defaultCheck`。
 * ★ **内存闸门不许放行**：`minRamGb` 写成 `"8GB"` 要认得出；认不出必须给中文警告，
   **不能退化成 0**（见 `need <= 0` 就放行等于没闸门）。内存不够的行 `flags` 里
   **没有 `ItemIsEnabled`** —— 整行不可选，不只是不勾。
 * ★ **装没装好以磁盘为准**：`installed.json` 只是账本，`merged_with_local()` 让磁盘上
   真有的 `.gguf` 优先。写账本的门：`size` 差在 `SIZE_TOLERANCE`（0.01，下限 4096
   字节）以内**且** sha256 对得上。绝不自动下载；失败重试 1 次 → 标红 + 复制链接。
-* 判据：`tests/test_model_registry.py`（109 用例）+ `%TEMP%\tl_v19_ui_test.py`
-  （假 `fetch_model_list` / `merged_with_local` / `download_exe`，量像素）。
+* 判据：`tests/test_model_registry.py`（109 用例）+ `%TEMP%\tl_v19_ui_test.py`（假
+  `fetch_model_list` / `merged_with_local` / `download_exe`，量像素）。
 
 ## 32. ★ 批量导入德育分（v1.9 新增）
 
@@ -1172,3 +920,44 @@ AST 源码层 / `CHECK_MODULES` 接线层）+ `%TEMP%\tl_qt_drive.py`（运行�
 * ★ `ImportPlan.failures` / `skipped` / `classes` 是 **property 不是方法**。
 * 判据：`tests/test_import.py`（40 用例）+ `%TEMP%\tl_v19_ui_test.py`；探针
   **必须桩掉 `QMessageBox.information`**（模态弹窗会把 120 秒看门狗跑满）。
+
+
+## 33. ★ 模型中心增强（v1.9 二期）
+
+`core/ai/model_registry.py`（零 Qt / 零 HTTP）+ `ui/model_center_dialog.py`：
+
+* **负载三档** `LOAD_EASY / LOAD_TIGHT / LOAD_HARD` =「轻松 / 勉强 / 困难」
+  （配色 `LOAD_COLORS`），**唯一实现是 `_load_level_of()`**：内存 ≥ `minRamGb`
+  且（无 `minVramGb` 或有独显且显存够）→ easy；否则 ≥ `minRamGb × 0.7`
+  （`RAM_TIGHT_RATIO`）→ tight；否则 hard。探测最多一次 —— 不声明显存的条目不启
+  `nvidia-smi`。
+* ★ **内存探不到一律放行**（判困难会让探测失败的机器一条都勾不上）；「显存未知」≠
+  「内存未知」，后者按 `RAM_TIGHT_RATIO` = 0.7 判。**不许把"不知道"写成"是 0"**。
+* ★ **默认只勾 🟢**（easy ＋ `minRamGb` 过关），**不再看清单里的 `defaultCheck`**；
+  困难行没有 `ItemIsEnabled`、下载按钮置灰 + 气泡说明。
+* **卸载**只许用户主动点（确认框 → `delete_model()` + `forget_installed()`）；下载重试
+  1 次仍失败 →「复制链接」兜底。**文案、`load_note()` 的写法与判据 → 总纲 §二十四。**
+
+## 34. ★ AI 推理引擎（v1.9 二期）
+
+* `core/ai/inference.py` **零 HTTP import，且 import 期绝不 import `llama_cpp`**
+  （可选依赖藏在 `_import_engine()` 里）；`ui/chat_dialog.py` 挂「AI 谈话助手」。
+* `llama-cpp-python` **不进 exe、不动 `build_exe.ps1`**（`requirements.txt` 里只写
+  注释）。没引擎时 `engine_available()` 给中文原因、抛 `InferenceUnavailable` ——
+  **明确降级，不许静默失败、不许偷偷走云端**。
+* ★ **聊天历史不落明文**（红线 3）：存应用级 `chat_history.json.enc`。
+* 冻结接口（档案页要用）：`ui.chat_dialog.open_chat(parent, *, system_prompt=None,
+  initial_prompt=None, prefer_model=None)`（**签名冻结，不许改**）。
+
+## 35. ★ 档案合并与成绩覆盖（v1.9 二期）
+
+* `core/database.py` 是**逻辑表 API**（表名 / 字段 / 删除语义照任务书），底层仍是
+  `core/user_store` 应用级加密：`grade_history.json.enc` + `student_profiles.json.enc`
+  —— **不上明文 sqlite**（红线 3）。
+* 导入前冲突检测 → 弹窗「检测到学生 {姓名} 已有 {学期} 成绩，是否覆盖？」+
+  覆盖 / 跳过 / 全部覆盖 / 全部跳过；结束弹「覆盖 N 条 / 新增 M 条 / 跳过 K 条」。
+  覆盖 = 删旧写新；跳过 = 保留旧记录、该行不导入。
+* 档案页两个标签页：「成绩明细」（按学期折叠、顺序取自 `SEMESTER_ORDER`、**空 ≠ 0**）与
+  「总评与侧写」（只显示有真源的平均分/加权均分/GPA/排名）；「AI 侧写」按钮懒 import
+  `open_chat()` 并 try/except。★ 不许挂 `QGraphicsEffect`。**完整 API 与判据 → 总纲
+  §二十四。**
