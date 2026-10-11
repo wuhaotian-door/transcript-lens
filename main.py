@@ -89,6 +89,7 @@ CHECK_MODULES: tuple[str, ...] = (
     "ui.main_window",
     "ui.moral_import_dialog",
     "ui.model_center_dialog",
+    "ui.chat_dialog",
     "ui.pages",
     "ui.pages.analysis_page",
     "ui.pages.profile_page",
@@ -105,10 +106,13 @@ CHECK_MODULES: tuple[str, ...] = (
     "core.user_store",
     "core.import_workers",
     "core.scholarship",
+    "core.database",
+    "core.system_info",
     "core.ai",
     "core.ai.local_assistant",
     "core.ai.cloud_adapter",
     "core.ai.model_registry",
+    "core.ai.inference",
     "core.email_recovery",
     "core.recovery",
     "core.library",
@@ -973,6 +977,22 @@ _REVIVED_GATE_STEMS: tuple[str, ...] = (
     "activated_year",
 )
 
+#: Qt **公开 API** 里含 ``activate`` 的标识符 —— 精确到**整名**，不是子串。
+#: ★ 为什么要这一份：``QWidget.activateWindow()`` 是 Qt 标准方法
+#:   （``ui/chat_dialog.open_chat`` 用它把非模态窗口提到前台），而上面词根表里的
+#:   ``activate`` 是**子串**匹配 —— ``"activate" in "activatewindow"`` 命中它。
+#:   这正是第 30 节警告过的误报，而误报的闸门最后一定会被整个人关掉。
+#: ★ 为什么**不**直接把 ``activate`` 从词根表里删掉：删了之后
+#:   ``activate_code()`` / ``activate_user()`` 这类**真残留**会一起漏掉 ——
+#:   那是把闸门放宽，不是修误报。这里只豁免**整名相同**的标识符；
+#:   ``activate_window()`` / ``activateCode()`` 照样 FAIL。
+#: ★ 刻意**不**收裸名 ``"activate"`` —— 那正是一个"复活版本"最可能取的函数名。
+_QT_API_IDENTIFIER_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "activatewindow",  # QWidget.activateWindow()
+    }
+)
+
 #: 界面文案里出现这个词 = 又在向用户要激活码了
 _REVIVED_GATE_WORD = "激活"
 
@@ -998,6 +1018,12 @@ def _removed_gate_report() -> list[str]:
     ★ 为什么用 AST 而不是 grep ``activ``：``ui/pages/scholarship_page.py``
       里有 openpyxl 的 ``book.active``，一刀切地搜会误报。
       文档字符串也显式跳过 —— 记录"这里原来是什么、为什么删掉"正是该留下的东西。
+
+    ★ 词根是**子串**匹配，所以另配了一份**整名**白名单
+      :data:`_QT_API_IDENTIFIER_ALLOWLIST`：精确豁免 Qt 公开 API
+      （``QWidget.activateWindow()``）—— 它和激活码毫无关系，
+      却被 ``"activate" in "activatewindow"`` 命中。★ 豁免的是**整名**，
+      词根表一个字没删：``activate_window()`` 照样 FAIL。
     """
     import ast
 
@@ -1099,6 +1125,11 @@ def _removed_gate_report() -> list[str]:
 
             for name in names:
                 lowered = name.lower()
+                # ★ Qt 公开 API 按**整名**精确豁免（见
+                #   _QT_API_IDENTIFIER_ALLOWLIST）—— 必须排在词根（子串）
+                #   匹配**之前**，否则 activateWindow 又会被 activate 命中。
+                if lowered in _QT_API_IDENTIFIER_ALLOWLIST:
+                    continue
                 if any(stem in lowered for stem in _REVIVED_GATE_STEMS):
                     _flag(getattr(node, "lineno", 0), name)
 
@@ -1145,12 +1176,17 @@ def _removed_gate_report() -> list[str]:
 # ★ 开发文档只有一份总纲（docs/DEV_SUMMARY.md）—— 这条闸门守着"别再堆文档"
 # ---------------------------------------------------------------------------
 
-#: ``docs/`` 的**完整白名单**。开发文档只有一份总纲；另外两本是给人看的手册
-#: （辅导员用的更新指南 / 维护者用的发版 SOP），读者不同、不能压进总纲。
+#: ``docs/`` 的**完整白名单**。开发文档只有一份总纲；另外三本是给人看的手册
+#: （辅导员用的更新指南 / 维护者用的发版手册 / 发版时照着做的 SOP），
+#: 读者不同、不能压进总纲。
+#:
+#: 2026-10-11 新增 ``RELEASE_SOP.md``：分片发布的操作步骤以前挤在总纲 §6.4 里，
+#: 与"发布时照着敲一遍"的用途不符 —— 手册可以长，总纲只该有规格。
 DOCS_WHITELIST: tuple[str, ...] = (
     "DEV_SUMMARY.md",
     "UPDATE_GUIDE.md",
     "DISTRIBUTION.md",
+    "RELEASE_SOP.md",
 )
 
 #: 已被合并进总纲并删除的 5 份旧文档。**再被谁提到就是死链接。**
@@ -1173,7 +1209,7 @@ def _docs_gate_report() -> list[str]:
     v1.8 三份 charter、激活码删除记录）合并成了 ``docs/DEV_SUMMARY.md``，
     旧文件已删。三件事，缺一件都不算数：
 
-    1. **白名单** —— ``docs/`` 下只许有 :data:`DOCS_WHITELIST` 那三个文件。
+    1. **白名单** —— ``docs/`` 下只许有 :data:`DOCS_WHITELIST` 那四个文件。
        多一个就是又在堆开发文档 —— 越堆越多、几份说法互相打架，正是这次要治的病。
     2. **真源没被掏空** —— 总纲必须够大，且首尾章节标题都在。
     3. **没有死链接** —— 仓库里任何 ``.py`` / ``.ps1`` / ``.md`` / ``.json``
