@@ -4,12 +4,25 @@
 它是纯 JSON 载荷，落到 :mod:`core.user_store` 的**应用级加密存储**上
 （文件仍然是 ``*.json.enc``）：
 
-===================  ==========================  ==============================
-表                   文件名                      主键
-===================  ==========================  ==============================
-``grade_history``    ``grade_history.json.enc``  (student_id, semester, course_name)
-``student_profiles`` ``student_profiles.json.enc``  student_id
-===================  ==========================  ==============================
+===================  =================================  ==============================
+表                   文件名                             主键
+===================  =================================  ==============================
+``grade_history``    ``grade_history.json.enc``         (student_id, semester, course_name)
+``student_profiles`` ``student_profiles.json.enc``       student_id
+``grade_audit``      ``audit/grade_changes.json.enc``   追加序号（只追加，不改不删）
+===================  =================================  ==============================
+
+★ 审计日志（``grade_audit``）
+-----------------------------
+
+成绩的每一次变动都**自动**留一行：操作时间 / 操作类型（``insert`` /
+``overwrite`` / ``delete``）/ 学生 ID / 学期 / 课程名 / 这一次动了几条。
+
+* ★ **不记分数** —— 它是审计日志，不是第二份成绩库（记上分数就等于把成绩
+  又多抄了一份到磁盘上）。
+* ★ 日志写不进去 / 读不出来**都不许把主流程搞崩**：写失败降级成一条警告
+  （成绩本身已经存好了），读失败当作"没有日志"返回空列表。
+* ★ 清空成绩库**不删审计日志** —— 删了就等于给"删数据"这件事销赃。
 
 ★ 为什么是应用级加密，而不是 SQLite 明文库
 -------------------------------------------
@@ -47,25 +60,44 @@ pytest 可以直接 import、直接用，不需要 ``QT_QPA_PLATFORM=offscreen``
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable
 
 from core.crypto_store import CryptoError, CryptoStore, StoreCorruptError
 from core.archival import semester_rank
-from core.user_store import load_user_json, save_user_json
+from core.user_store import list_user_json, load_user_json, save_user_json, user_file
+
+#: 审计日志写不进去时用它留痕（**不抛**，成绩已经存好了）
+_LOGGER = logging.getLogger(__name__)
 
 __all__ = [
+    "ARCHIVE_PAYLOAD_FILE",
+    "AUDIT_DIR",
+    "AUDIT_FILE",
+    "AUDIT_MAX_ENTRIES",
+    "AUDIT_OPERATIONS",
+    "CLEAR_KEEP_FILES",
+    "CLEAR_NEVER_TOUCH_SUFFIXES",
     "GRADE_HISTORY_FILE",
     "GRADE_HISTORY_FIELDS",
     "GRADE_HISTORY_PK",
+    "LEGACY_GRADE_FILES",
+    "OP_DELETE",
+    "OP_INSERT",
+    "OP_OVERWRITE",
     "PROFILE_FILE",
+    "TABLE_GRADE_AUDIT",
     "TABLE_GRADE_HISTORY",
     "TABLE_STUDENT_PROFILES",
     "USE_OVERWRITE",
     "USE_SKIP",
     "ConflictChooser",
     "ConflictQuestion",
+    "GradeAuditLog",
     "GradeHistoryDB",
     "ProfileStore",
+    "clear_library",
+    "library_inventory",
     "resolve_uid",
 ]
 
@@ -81,6 +113,22 @@ TABLE_STUDENT_PROFILES = "student_profiles"
 #: 落盘文件名（**必须以 ``.enc`` 结尾**，否则 save_encrypted 拒绝）
 GRADE_HISTORY_FILE = "grade_history.json.enc"
 PROFILE_FILE = "student_profiles.json.enc"
+
+#: 审计日志表名
+TABLE_GRADE_AUDIT = "grade_audit"
+#: 审计日志所在子目录（相对用户目录）
+AUDIT_DIR = "audit"
+#: 审计日志文件名 —— **带子目录**：``<user_dir>/audit/grade_changes.json.enc``
+AUDIT_FILE = f"{AUDIT_DIR}/grade_changes.json.enc"
+#: 每个用户最多留多少条（超了从**最旧的**开始丢，日志不能无限长大）
+AUDIT_MAX_ENTRIES = 2000
+
+#: 审计日志的操作类型（任务书：新增 insert / 覆盖 overwrite / 删除 delete）
+OP_INSERT = "insert"
+OP_OVERWRITE = "overwrite"
+OP_DELETE = "delete"
+#: 允许出现在日志里的操作类型（别的一律丢弃，防日志被写脏）
+AUDIT_OPERATIONS = (OP_INSERT, OP_OVERWRITE, OP_DELETE)
 
 #: grade_history 的字段（顺序即落盘顺序，方便人肉看密文结构）
 GRADE_HISTORY_FIELDS = (
@@ -171,6 +219,15 @@ def _rest_key(row: dict[str, Any]) -> tuple[str, str, str]:
         _clean_text(row.get("semester")),
         _clean_text(row.get("course_name")),
     )
+
+
+def _count_of(value: Any) -> int:
+    """日志里的"动了几条"：读不出来就是 **1**（一次操作至少动一条），绝不给 0/负数。"""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 1
+    return number if number > 0 else 1
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +323,22 @@ class GradeHistoryDB:
         found = {row["student_id"] for row in self.rows() if row["semester"] == want_term}
         return sorted(found)
 
+    def count(self) -> int:
+        """表里有几行（**只数不排序**）。
+
+        ★ 「清空成绩库」的探测就走它 —— 判据是**表里真有没有记录**，
+          不是"磁盘上有没有那个文件"（空表也会留下一个 0 行的 ``.enc``）。
+        """
+        stored = self._payload().get("rows")
+        if not isinstance(stored, list):
+            return 0
+        return sum(1 for row in stored
+                   if isinstance(row, dict) and all(_rest_key(row)))
+
+    def is_empty(self) -> bool:
+        """这张表是不是空的（等价于 ``count() == 0``）。"""
+        return self.count() == 0
+
     # -- 写 -----------------------------------------------------------------
     def apply(self, records: list[dict[str, Any]], *, semester: str,
               batch_id: str, policy: str = USE_OVERWRITE,
@@ -355,6 +428,9 @@ class GradeHistoryDB:
         inserted = 0
         skipped = 0
         removed: set[int] = set()
+        #: 逐学生的计数 —— 审计日志要按「学生 + 学期」记，而不是只记一个总数
+        per_overwritten: dict[str, int] = {}
+        per_inserted: dict[str, int] = {}
 
         def drop(key: tuple[str, str, str]) -> bool:
             """把同键的旧行标记为**删掉**（覆盖时才用）—— 删旧写新。"""
@@ -384,9 +460,11 @@ class GradeHistoryDB:
                 for record in per_student[sid]:
                     if drop((sid, term, record["course_name"])):
                         overwritten += 1
+                        per_overwritten[sid] = per_overwritten.get(sid, 0) + 1
                 for record in per_student[sid]:
                     rows.append(dict(record))
                     inserted += 1
+                    per_inserted[sid] = per_inserted.get(sid, 0) + 1
             else:
                 # ★ 跳过 = "保留旧记录、该行不导入"。作用范围是**这一行（键）**，
                 #   不是"这个学生整批作废"：同一批里**没有旧记录的新课**照常写进去，
@@ -397,16 +475,110 @@ class GradeHistoryDB:
                     else:
                         rows.append(dict(record))
                         inserted += 1
+                        per_inserted[sid] = per_inserted.get(sid, 0) + 1
 
         kept = rows if not removed else [row for row in rows if id(row) not in removed]
         # 写盘失败（没登录 / 库坏了）时**绝不能撒谎说写成功了**：
         # 让 CryptoError 如实抛给调用方，界面那边只记日志、不打断用户看成绩。
         self._write(kept)
+        # ★ 成绩**先落地**，再记日志：写盘抛了就不该留下"我改过"的记录。
+        self._log_changes(order, term, per_overwritten, per_inserted)
         return {"overwritten": overwritten, "inserted": inserted, "skipped": skipped}
 
-    def clear(self) -> None:
-        """清空这张表（'''只动 grade_history'''，班级快照 / 归档一个字不碰）。"""
+    def clear(self) -> int:
+        """清空这张表（**只动 grade_history**，班级快照 / 归档一个字不碰）。
+
+        Returns:
+            删掉的行数（本来空着就是 ``0`` —— 界面靠它区分"清完了"和"本来就是空的"）。
+        """
+        removed = self.count()
         self._write([])
+        if removed:
+            self._audit_record(OP_DELETE, count=removed)
+        return removed
+
+    def delete_record(self, student_id: str, semester: str, course_name: str) -> int:
+        """删掉**一条**成绩（主键三元组）。
+
+        Returns:
+            真删掉的行数（``0`` = 本来就没有这一条，不算错）。
+        """
+        sid = _clean_text(student_id)
+        term = _clean_text(semester)
+        course = _clean_text(course_name)
+        if not (sid and term and course):
+            raise ValueError("student_id / semester / course_name 都不能为空")
+        rows = self._raw_rows()
+        kept = [row for row in rows if _rest_key(row) != (sid, term, course)]
+        removed = len(rows) - len(kept)
+        if removed:
+            self._write(kept)
+            self._audit_record(OP_DELETE, student_id=sid, semester=term,
+                               course_name=course, count=removed)
+        return removed
+
+    def delete_semester(self, student_id: str, semester: str) -> int:
+        """删掉一个学生**一个学期**的全部记录（别的学期一条不动）。
+
+        Returns:
+            真删掉的行数（``0`` = 本来就没有，不算错）。
+        """
+        sid = _clean_text(student_id)
+        term = _clean_text(semester)
+        if not (sid and term):
+            raise ValueError("student_id / semester 都不能为空")
+        rows = self._raw_rows()
+        kept = [row for row in rows
+                if not (_rest_key(row)[0] == sid and _rest_key(row)[1] == term)]
+        removed = len(rows) - len(kept)
+        if removed:
+            self._write(kept)
+            self._audit_record(OP_DELETE, student_id=sid, semester=term, count=removed)
+        return removed
+
+    # -- 审计日志 -----------------------------------------------------------
+    def audit(self) -> "GradeAuditLog":
+        """这张表的审计日志（同一个用户）。只读查询走它。"""
+        return GradeAuditLog(username=self._username, uid=self._uid, store=self._store)
+
+    def changes(self, student_id: str | None = None, semester: str | None = None,
+                limit: int | None = None) -> list[dict[str, Any]]:
+        """审计日志的只读查询（等价于 ``self.audit().changes(...)``）。"""
+        return self.audit().changes(student_id=student_id, semester=semester, limit=limit)
+
+    def _audit_record(self, operation: str, *, student_id: str = "", semester: str = "",
+                      course_name: str = "", count: int = 1) -> None:
+        """记一条变更日志（**失败只警告，绝不把写入带崩**）。"""
+        self.audit().record(operation, student_id=student_id, semester=semester,
+                            course_name=course_name, count=count)
+
+    def _log_changes(self, order: list[str], term: str,
+                     per_overwritten: dict[str, int],
+                     per_inserted: dict[str, int]) -> None:
+        """把这一批的动向按学生记成日志（**一次写盘**，不按学生反复读写）。"""
+        entries: list[dict[str, Any]] = []
+        for sid in order:
+            over = per_overwritten.get(sid, 0)
+            new = per_inserted.get(sid, 0)
+            if over:
+                entries.append({"operation": OP_OVERWRITE, "student_id": sid,
+                                "semester": term, "count": over})
+            if new:
+                entries.append({"operation": OP_INSERT, "student_id": sid,
+                                "semester": term, "count": new})
+        if entries:
+            self.audit().record_many(entries)
+
+    def _raw_rows(self) -> list[dict[str, Any]]:
+        """磁盘上那份原始行（**不做键校验、不排序**）。
+
+        ★ 删除必须基于原始行：一行如果键不全（脏数据），``rows()`` 会把它藏起来，
+          但删的时候要是看不见它，就会"删了 3 条、磁盘上还剩 1 条"。
+        """
+        stored = self._payload().get("rows")
+        if not isinstance(stored, list):
+            return []
+        return [row for row in stored if isinstance(row, dict)]
 
     # -- 内部 ---------------------------------------------------------------
     def _clean_records(self, records: list[dict[str, Any]], term: str,
@@ -480,6 +652,177 @@ class GradeHistoryDB:
 
 
 # ---------------------------------------------------------------------------
+# 成绩变更审计日志
+# ---------------------------------------------------------------------------
+
+
+class GradeAuditLog:
+    """``grade_audit`` 表：一行 = 一次成绩变动（**只追加**）。
+
+    落盘位置：``<user_dir>/audit/grade_changes.json.enc``（应用级加密）。
+
+    ★ **只记变动本身，不记分数**：操作时间 / 操作类型 / 学生 ID / 学期 /
+      课程名 / 动了几个。分数一概不写 —— 审计日志不是第二份成绩库。
+
+    ★ **日志坏了不许拦住主流程**：
+
+    * 写不进去（没登录 / 库坏了 / 文件权限）→ 记一条 :mod:`logging` 警告，
+      ``record()`` 返回 ``None``，**不抛**（成绩本身已经存好了，
+      为了记日志把用户那次导入整批作废才是真的坏事）；
+    * 读不出来（文件损坏 / 解不开）→ :meth:`changes` 返回空列表，**不抛**。
+    """
+
+    #: 表名
+    table = TABLE_GRADE_AUDIT
+    #: 载荷文件名（带子目录）
+    filename = AUDIT_FILE
+
+    def __init__(self, *, username: str | None = None, uid: str | None = None,
+                 store: CryptoStore | None = None) -> None:
+        self._store = store if store is not None else CryptoStore()
+        self._username = username or current_username()
+        self._uid = uid if uid is not None else resolve_uid(self._store, self._username)
+        #: 最近一次失败的原因（"降级成警告"之后，排查时还看得到）
+        self._last_error = ""
+
+    # -- 身份 ---------------------------------------------------------------
+    @property
+    def store(self) -> CryptoStore:
+        return self._store
+
+    @property
+    def username(self) -> str:
+        return self._username
+
+    @property
+    def uid(self) -> str | None:
+        return self._uid
+
+    @property
+    def last_error(self) -> str:
+        """最近一次写盘失败的原因（成功过就是空串）。"""
+        return self._last_error
+
+    # -- 写 -----------------------------------------------------------------
+    def record(self, operation: str, *, student_id: str = "", semester: str = "",
+               course_name: str = "", count: int = 1) -> dict[str, Any] | None:
+        """记一条。返回真正写进去的那一条；写不进去返回 ``None``（**不抛**）。"""
+        written = self.record_many([{
+            "operation": operation,
+            "student_id": student_id,
+            "semester": semester,
+            "course_name": course_name,
+            "count": count,
+        }])
+        return written[0] if written else None
+
+    def record_many(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """一次写盘记多条（一批导入几百个学生时别反复读写同一个文件）。
+
+        非法条目（操作类型不认识）**直接丢掉**，其余照记。
+        """
+        rows: list[dict[str, Any]] = []
+        for entry in entries or ():
+            if not isinstance(entry, dict):
+                continue
+            operation = _clean_text(entry.get("operation"))
+            if operation not in AUDIT_OPERATIONS:
+                continue
+            rows.append({
+                "at": _clean_text(entry.get("at")) or _now(),
+                "operation": operation,
+                "student_id": _clean_text(entry.get("student_id")),
+                "semester": _clean_text(entry.get("semester")),
+                "course_name": _clean_text(entry.get("course_name")),
+                "count": _count_of(entry.get("count")),
+            })
+        if not rows:
+            return []
+        try:
+            stored = self._stored_rows()
+            stored.extend(rows)
+            if len(stored) > AUDIT_MAX_ENTRIES:
+                # 只丢最旧的，绝不因为"太长了"整份丢掉
+                stored = stored[-AUDIT_MAX_ENTRIES:]
+            self._write(stored)
+        except Exception as exc:  # noqa: BLE001 - 日志失败不许影响成绩写入
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            _LOGGER.warning("成绩审计日志没写进去（已忽略）：%s", self._last_error)
+            return []
+        self._last_error = ""
+        return rows
+
+    # -- 读 -----------------------------------------------------------------
+    def changes(self, student_id: str | None = None, semester: str | None = None,
+                limit: int | None = None) -> list[dict[str, Any]]:
+        """只读查询，**最新的在前**。
+
+        Args:
+            student_id: 只看这个学生（``sid:<学号>``）；``None`` = 不过滤
+            semester: 只看这个学期；``None`` = 不过滤
+            limit: 最多返回几条；``None`` = 全部
+
+        ★ 日志文件损坏 / 读不到 → 返回 ``[]``（不抛）—— 界面上"没有日志"和
+          "日志坏了"都不该把成绩页带崩。
+        """
+        rows = self._stored_rows()
+        want_id = None if student_id is None else _clean_text(student_id)
+        want_term = None if semester is None else _clean_text(semester)
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            if want_id is not None and row["student_id"] != want_id:
+                continue
+            if want_term is not None and row["semester"] != want_term:
+                continue
+            out.append(row)
+        out.reverse()                       # 追加序 → 最新在前
+        if limit is not None:
+            try:
+                cap = int(limit)
+            except (TypeError, ValueError):
+                cap = 0
+            out = out[:max(0, cap)]
+        return out
+
+    def count(self) -> int:
+        """日志有几条（读不到就是 0）。"""
+        return len(self._stored_rows())
+
+    # -- 内部 ---------------------------------------------------------------
+    def _stored_rows(self) -> list[dict[str, Any]]:
+        """磁盘上那份原始行（**坏的条目跳过**，读不到就是空列表）。"""
+        payload = load_user_json(self._store, self._username, self.filename, None)
+        if not isinstance(payload, dict):
+            return []
+        stored = payload.get("rows")
+        if not isinstance(stored, list):
+            return []
+        rows: list[dict[str, Any]] = []
+        for entry in stored:
+            if not isinstance(entry, dict):
+                continue
+            operation = _clean_text(entry.get("operation"))
+            if operation not in AUDIT_OPERATIONS:
+                continue
+            rows.append({
+                "at": _clean_text(entry.get("at")),
+                "operation": operation,
+                "student_id": _clean_text(entry.get("student_id")),
+                "semester": _clean_text(entry.get("semester")),
+                "course_name": _clean_text(entry.get("course_name")),
+                "count": _count_of(entry.get("count")),
+            })
+        return rows
+
+    def _write(self, rows: list[dict[str, Any]]) -> None:
+        save_user_json(self._store, self._username, self.filename, {
+            "table": self.table,
+            "version": 1,
+            "rows": rows,
+        })
+
+
+# ---------------------------------------------------------------------------
 # 个人档案表（AI 侧写正文）
 # ---------------------------------------------------------------------------
 
@@ -528,13 +871,21 @@ class ProfileStore:
         """整张表的副本（改它不会影响库里的内容）。"""
         return {sid: dict(row) for sid, row in self._cache.items() if isinstance(row, dict)}
 
+    def count(self) -> int:
+        """表里有几行（**侧写正文为空的也算一行** —— 磁盘上确实有这条学生记录）。"""
+        return len(self._cache)
+
+    def has_any(self) -> bool:
+        """这张表里有没有学生（等价于 ``count() > 0``）。"""
+        return bool(self._cache)
+
     # -- 写 -----------------------------------------------------------------
     def save_side_text(self, student_id: str, text: str) -> None:
         """写一个学生的侧写正文（**先写盘、成功了才更新内存**，避免假成功）。"""
         sid = _clean_text(student_id)
         if not sid:
             raise ValueError("student_id 不能为空")
-        rows = {key: dict(row) for key, row in self._cache.items() if isinstance(row, dict)}
+        rows = self._rows_copy()
         row = rows.get(sid) or {}
         row.update({
             "student_id": sid,
@@ -542,6 +893,45 @@ class ProfileStore:
             "updated_at": _now(),
         })
         rows[sid] = row
+        self._write(rows)
+
+    def clear_side_text(self, student_id: str) -> bool:
+        """抹掉一个学生的侧写正文，**保留这一行**（他在档案里仍然存在）。
+
+        Returns:
+            ``True`` 表示真抹掉了非空正文；``False`` 表示本来就没有正文可抹。
+        """
+        sid = _clean_text(student_id)
+        if not sid:
+            raise ValueError("student_id 不能为空")
+        row = self._cache.get(sid)
+        if not isinstance(row, dict) or not str(row.get("side_text") or ""):
+            return False
+        rows = self._rows_copy()
+        row = dict(rows[sid])
+        row["side_text"] = ""
+        row["updated_at"] = _now()
+        rows[sid] = row
+        self._write(rows)
+        return True
+
+    def clear_all(self) -> int:
+        """清空整张表（**这是"删除成绩库"里那个可选勾选的落点** —— 删用户数据必须由用户点过）。
+
+        Returns:
+            抹掉了几个学生（``0`` = 本来就没有侧写数据）。
+        """
+        removed = len(self._cache)
+        if removed:
+            self._write({})
+        return removed
+
+    # -- 内部 ---------------------------------------------------------------
+    def _rows_copy(self) -> dict[str, dict[str, Any]]:
+        """内存表的可写副本（写盘前在这里改，成功了才换上去）。"""
+        return {key: dict(row) for key, row in self._cache.items() if isinstance(row, dict)}
+
+    def _write(self, rows: dict[str, dict[str, Any]]) -> None:
         save_user_json(self._store, self._username, self.filename, {
             "table": self.table,
             "version": 1,
@@ -549,7 +939,6 @@ class ProfileStore:
         })
         self._cache = rows
 
-    # -- 内部 ---------------------------------------------------------------
     def _load(self) -> dict[str, dict[str, Any]]:
         payload = load_user_json(self._store, self._username, self.filename, None)
         if not isinstance(payload, dict):
@@ -558,6 +947,196 @@ class ProfileStore:
         if not isinstance(stored, dict):
             return {}
         return {str(sid): dict(row) for sid, row in stored.items() if isinstance(row, dict)}
+
+
+# ---------------------------------------------------------------------------
+# 「删除成绩库」：先盘点，再清（数据层）
+# ---------------------------------------------------------------------------
+
+#: 归档快照的文件名。★ 真源是 ``ui.pages.analysis_page.ARCHIVE_FILE`` ——
+#: 但 core **不许 import ui**（依赖方向反了），所以这里只能是同一个字符串。
+#: 两个地方一起改；``tests/test_grade_delete.py`` 里有一条断言盯着它俩相等。
+ARCHIVE_PAYLOAD_FILE = "archive.json.enc"
+
+#: v1.9 之前的**密码级**成绩载荷：现在的成绩已经进了
+#: :class:`GradeHistoryDB`（``grade_history.json.enc``），这两个只剩老库残留要清。
+LEGACY_GRADE_FILES = ("grades.enc", "tags.json.enc")
+
+#: 清库时**故意留下**的文件。
+#:
+#: ``sessions.json.enc`` 是"记住我"的会话令牌 —— v1.9 之前那个实现会顺手把它删掉，
+#: 于是"清空成绩库"的副作用是**把用户踢下线**。清成绩不该动登录态，所以留下它。
+CLEAR_KEEP_FILES = ("sessions.json.enc",)
+
+#: 侧写/生成物里**不属于成绩库**、清库时绝不碰的：
+#: 德育分和名额是用户自己一条条录进去的（不是导入成绩的附带产物），
+#: 审计日志更是**这次删除的记录本身**，删掉它等于毁尸灭迹。
+CLEAR_NEVER_TOUCH_SUFFIXES = ("_moral.json.enc", "_quota.json.enc", "grade_changes.json.enc")
+
+
+def _class_payload_names(store: CryptoStore, username: str) -> list[str]:
+    """用户目录下的班级快照文件名。
+
+    ★ 排除规则是 AGENTS §15 点名的那条：``_moral`` / ``_quota`` **不是班级文件**
+      （班级号只允许字母数字和短横线，所以"以 ``_moral`` 结尾"不会误伤真班级）。
+    """
+    return [
+        name
+        for name in list_user_json(store, username)
+        if name.startswith("class_")
+        and name.endswith(".json.enc")
+        and not name.endswith("_moral.json.enc")
+        and not name.endswith("_quota.json.enc")
+    ]
+
+
+def library_inventory(store: CryptoStore | None = None, username: str = "") -> dict[str, Any]:
+    """**只读**盘点：这个账户的"成绩库"里到底有些什么。
+
+    ★ 这是"删除成绩库"那个按钮误报 bug 的正解 —— 判据必须是
+      :class:`GradeHistoryDB` **表里真有没有记录**（``grade_rows``），
+      而不是"磁盘上有没有某个文件名"：v1.9 起成绩在
+      ``grade_history.json.enc`` 里，旧实现只查 ``grades.enc``/``tags.json.enc``，
+      所以导入完成绩照样报"库里本来就是空的"。
+
+    Returns:
+        ``{"account", "grade_rows", "profile_rows", "legacy_files",
+        "class_files", "archive", "audit_rows", "files", "has_data"}``
+
+        * ``account``：账户在不在（不在时其余全是 0 / 空）
+        * ``files``：清库时会删掉的文件名（按顺序、去重）
+        * ``has_data``：**有没有可删的东西** —— 界面判"没有成绩库"就看它
+        * ``audit_rows``：只报数，**永远不删**
+    """
+    vault = store if store is not None else CryptoStore()
+    empty: dict[str, Any] = {
+        "account": False,
+        "grade_rows": 0,
+        "profile_rows": 0,
+        "legacy_files": [],
+        "class_files": [],
+        "archive": False,
+        "audit_rows": 0,
+        "files": [],
+        "has_data": False,
+    }
+    if not username:
+        return empty
+
+    db = GradeHistoryDB(username=username, store=vault)
+    try:
+        grade_rows = db.count()
+    except Exception as exc:  # noqa: BLE001 - 盘点失败当作 0，不能把按钮打崩
+        _LOGGER.warning("盘点成绩库失败（按 0 算）：%s: %s", type(exc).__name__, exc)
+        grade_rows = 0
+    profiles = ProfileStore(username=username, store=vault)
+    profile_rows = profiles.count()
+    audit_rows = db.audit().count()
+
+    def present(name: str) -> bool:
+        path = user_file(vault, username, name)
+        return bool(path is not None and path.exists())
+
+    legacy = [name for name in LEGACY_GRADE_FILES if present(name)]
+    classes = [name for name in _class_payload_names(vault, username) if present(name)]
+    archive = present(ARCHIVE_PAYLOAD_FILE)
+
+    # ★ 这里**只列真要 unlink 的文件**：``grade_history.json.enc`` /
+    #   ``student_profiles.json.enc`` 是"把表清空"而不是"删文件"（清完文件还在、
+    #   只是 0 行），把它们列进来会让"下次进来还有数据"永远成立 ——
+    #   那正是这次要修的那类 bug（拿文件在不在当判据）。
+    files: list[str] = []
+    if archive:
+        files.append(ARCHIVE_PAYLOAD_FILE)
+    files.extend(name for name in classes if name not in files)
+    files.extend(name for name in legacy if name not in files)
+
+    return {
+        "account": vault.load_users().find(username) is not None,
+        "grade_rows": grade_rows,
+        "profile_rows": profile_rows,
+        "legacy_files": legacy,
+        "class_files": classes,
+        "archive": archive,
+        "audit_rows": audit_rows,
+        "files": files,
+        # ★ "有没有成绩库" = 表里有记录 / 有侧写 / 有生成物与老库残留。
+        #   注意**不算 audit_rows**：审计日志自己不是成绩库，否则删干净之后
+        #   下一次进来又会说"还有数据"。
+        "has_data": bool(grade_rows or profile_rows or files),
+    }
+
+
+def clear_library(store: CryptoStore | None = None, username: str = "",
+                  *, with_profiles: bool = True,
+                  with_generated: bool = True) -> dict[str, Any]:
+    """清掉这个账户的**成绩库**（数据层）。
+
+    ★ 界面负责"问过用户了"；这个函数只管删，而且**返回删了什么**。
+
+    删除范围：
+
+    * ``grade_history`` 全部记录（:meth:`GradeHistoryDB.clear`，会落审计日志）
+    * ``student_profiles`` 侧写（``with_profiles=True`` 时；这是一个**勾选项**）
+    * ``archive.json.enc`` 归档快照 + ``class_*.json.enc`` 班级快照
+      （``with_generated=True`` 时）—— 它们是导入成绩的**生成物**，
+      不删的话档案页 / 智育页会继续显示一份"已经删掉的成绩"
+    * 老库残留 ``grades.enc`` / ``tags.json.enc``
+
+    **不动**：德育分、名额配置（用户自己录的）、``sessions.json.enc``（登录态）、
+    以及 ``audit/grade_changes.json.enc``（这次删除的记录本身）。
+
+    Returns:
+        ``{"found", "grade_rows", "profile_rows", "files", "failed", "inventory"}``
+
+        * ``found``：清之前**有没有**数据 —— ``False`` 表示"本无数据"、
+          什么都没删（界面靠它区分"清完了"和"本来就没有"）
+        * ``failed``：没删掉的（``"文件名（原因）"``），一个都没失败就是空列表
+    """
+    vault = store if store is not None else CryptoStore()
+    before = library_inventory(vault, username)
+    report: dict[str, Any] = {
+        "found": before["has_data"],
+        "grade_rows": 0,
+        "profile_rows": 0,
+        "files": [],
+        "failed": [],
+        "inventory": before,
+    }
+    if not before["account"] or not before["has_data"]:
+        return report                       # 本无数据：一个字节都不动
+
+    db = GradeHistoryDB(username=username, store=vault)
+    report["grade_rows"] = db.clear()       # ★ 表里真有的记录（含审计日志）
+
+    if with_profiles:
+        report["profile_rows"] = ProfileStore(username=username, store=vault).clear_all()
+
+    targets: list[str] = []
+    for name in before["files"]:
+        if name in (GRADE_HISTORY_FILE, PROFILE_FILE):
+            continue                        # 上面已经按表清过了（清在表上，不在文件上）
+        if name == ARCHIVE_PAYLOAD_FILE or name.startswith("class_"):
+            if not with_generated:
+                continue
+        targets.append(name)
+
+    for name in targets:
+        path = user_file(vault, username, name)
+        if path is None or not path.exists():
+            continue
+        try:
+            path.unlink()
+            report["files"].append(name)
+        except OSError as exc:
+            report["failed"].append(f"{name}（{exc}）")
+
+    # 审计：有成绩行时 clear() 自己已经记过一条；这里补齐"没有成绩行、
+    # 但确实删掉了侧写 / 生成物 / 老库残留"的情况 —— 一次真删除不该在日志里失踪。
+    if report["grade_rows"] == 0 and (report["profile_rows"] or report["files"]):
+        db.audit().record(OP_DELETE,
+                          count=report["profile_rows"] + len(report["files"]))
+    return report
 
 
 # ---------------------------------------------------------------------------

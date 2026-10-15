@@ -1,15 +1,20 @@
-"""⚙️ 设置页 —— 导出 / 清库 / AI 开关 / 更新检查。
+"""⚙️ 设置页 —— 导出 / 删除成绩库 / GPA 规则 / AI 开关 / 更新检查。
 
-四件事都**真的接通了 core**，不是死按钮：
+五件事都**真的接通了 core**，不是死按钮：
 
-* 导出   → :mod:`core.exporter`（明文版 / 脱敏版两个按钮）
-* 清库   → 删掉本用户的 ``.enc`` 载荷，**二次确认**
-* AI     → 只有开关和占位，**一个网络请求都没有**（charter 七节）
-* 更新   → :mod:`core.updater`，**只在点按钮时**联网一次，不自动下载
+* 导出     → :mod:`core.exporter`（明文版 / 脱敏版两个按钮）
+* 删除成绩库 → :func:`core.database.clear_library`，**先盘点 → 二次确认 → 才删**
+  （v1.9.1 修掉了"导入完成绩还说没有成绩库"那个误报：判据从"文件在不在"改成
+  "``grade_history`` 表里真有没有记录 / 侧写 / 快照"）
+* GPA 规则 → :mod:`core.gpa`（方案 1 标准 4.0；方案 2/3/4 列出来但禁用）
+* AI       → 只有开关和占位，**一个网络请求都没有**（charter 七节）
+* 更新     → :mod:`core.updater`，**只在点按钮时**联网一次，不自动下载
 
 ★ **本页没有激活码卡片**（v1.8 已删除整套激活码系统）。见
   `docs/DEV_SUMMARY.md` §16.1。
   注册登录即全部功能可用，本页不再有、也不许再加任何形式的「解锁」输入框。
+
+★ 界面文案一律纯文本：**不出现 Markdown 记号**（AGENTS §24，运行时闸门会扫）。
 """
 
 from __future__ import annotations
@@ -17,11 +22,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -39,9 +45,11 @@ from PySide6.QtWidgets import (
 from core.ai.local_assistant import PLACEHOLDER as LOCAL_PLACEHOLDER
 from core.ai.local_assistant import MODEL_LOADED_PLACEHOLDER
 from core.ai.model_downloader import ModelDownloader, model_dir
-from core.crypto_store import CryptoStore, PAYLOAD_FILES
+from core.crypto_store import CryptoStore
+from core.database import clear_library, library_inventory
 from core.exporter import export_anonymized_xlsx, export_plain_xlsx
 from core import update_apply
+from core.gpa import DEFAULT_SCHEME, load_scheme, save_scheme, scheme_options
 from core.updater import (
     CURRENT_VERSION,
     GITEE_RELEASES_PAGE,
@@ -59,10 +67,66 @@ from ui.update_dialog import (
 )
 from ui.workers import run_async
 
-__all__ = ["AI_SETTINGS_FILE", "SettingsPage"]
+__all__ = ["AI_SETTINGS_FILE", "SettingsPage", "clear_confirm_text", "clear_summary_text"]
 
 #: AI 设置在加密库里的文件名
 AI_SETTINGS_FILE = "ai_settings.json.enc"
+
+
+# ---------------------------------------------------------------------------
+# 清库的两段界面文案（**纯函数**，pytest 直接可测，不碰 Qt）
+# ---------------------------------------------------------------------------
+
+
+def clear_confirm_text(inventory: dict[str, Any]) -> str:
+    """「删除成绩库」的确认文案 —— **把要删的东西一条条写出来**。
+
+    ★ 不许只说"清空成绩库"就开删：成绩、侧写、归档快照是三类不同的数据，
+      用户点确认之前必须看得见自己将失去什么（AGENTS §30 第 4 条同源：
+      删用户数据必须是用户主动、且知道自己在删什么）。
+    """
+    lines: list[str] = []
+    rows = int(inventory.get("grade_rows") or 0)
+    profiles = int(inventory.get("profile_rows") or 0)
+    files = list(inventory.get("files") or [])
+    if rows:
+        lines.append(f"· 成绩记录 {rows} 条（grade_history）")
+    if profiles:
+        lines.append(f"· 学生侧写 {profiles} 份（student_profiles）")
+    if inventory.get("archive"):
+        lines.append("· 成长档案快照 1 份（archive.json.enc）")
+    classes = list(inventory.get("class_files") or [])
+    if classes:
+        lines.append(f"· 班级成绩快照 {len(classes)} 份（{classes[0]} 等）")
+    legacy = list(inventory.get("legacy_files") or [])
+    if legacy:
+        lines.append("· 旧版本残留的加密文件 " + "、".join(legacy))
+    if rows or profiles:
+        lines.append("· 已保存的 AI 侧写正文（如果勾选了上面的选项）")
+    if files:
+        lines.append("· 磁盘上的加密文件 " + str(len(files)) + " 个")
+    if not lines:
+        return "没有找到可删除的数据。"
+    return "将删除本账户的下列数据：\n" + "\n".join(dict.fromkeys(lines))
+
+
+def clear_summary_text(report: dict[str, Any]) -> str:
+    """清完之后的回执（**写清删了多少**，不要只说"已清空"）。"""
+    rows = int(report.get("grade_rows") or 0)
+    profiles = int(report.get("profile_rows") or 0)
+    files = len(list(report.get("files") or []))
+    parts: list[str] = []
+    if rows:
+        parts.append(f"成绩记录 {rows} 条")
+    if profiles:
+        parts.append(f"侧写 {profiles} 份")
+    if files:
+        parts.append(f"加密文件 {files} 个")
+    failed = list(report.get("failed") or [])
+    text = "已删除：" + "、".join(parts) + "。" if parts else "没有任何数据被删除。"
+    if failed:
+        text += "\n没删掉的：" + "；".join(failed)
+    return text
 
 
 class SettingsPage(QWidget):
@@ -72,6 +136,12 @@ class SettingsPage(QWidget):
         store: 加密存储（用来定位本用户的载荷文件）。
         root: 数据根目录；``None`` = 默认 AppData。
     """
+
+    #: 「删除成绩库」真的删完之后的广播：``(成绩条数, 侧写份数, 删掉的加密文件数)``。
+    #:
+    #: ★ 档案页 / 智育分析页接到它就该 ``reload()`` —— 数据层已经干净了，
+    #:   界面不刷新会继续显示一份"已经删掉的成绩"（AGENTS §18：一处真源 + 信号刷新）。
+    library_cleared = Signal(int, int, int)
 
     def __init__(
         self,
@@ -94,6 +164,7 @@ class SettingsPage(QWidget):
     # ---------------------------------------------------------------- 外部
     def set_user(self, username: str) -> None:
         self._username = username or ""
+        self._load_gpa_scheme()
 
     def set_export_provider(self, provider: Callable[[], list[dict[str, Any]]]) -> None:
         self._export_provider = provider
@@ -170,25 +241,34 @@ class SettingsPage(QWidget):
         exp.addWidget(self._exp_status)
         box.addWidget(exp_card)
 
-        # --- 清库 ---
+        # --- 删除成绩库 ---
         clr_card = make_card()
         clr = QVBoxLayout(clr_card)
         clr.setContentsMargins(24, 20, 24, 20)
         clr.setSpacing(10)
 
-        clr_title = QLabel("清空成绩库")
+        clr_title = QLabel("删除成绩库")
         clr_title.setObjectName("H2")
         clr.addWidget(clr_title)
 
         clr_note = QLabel(
-            "删掉本账户在磁盘上的加密成绩文件。账户和密码本身不受影响。\n"
-            "这一步不可撤销 —— 删掉之后只能用原始成绩表重新导入。"
+            "删掉本账户的全部成绩记录、学生侧写和相关快照。账户和密码本身不受影响。\n"
+            "删除前会先问一次，并把要删的东西一条条列出来；这一步不可撤销 —— "
+            "删掉之后只能用原始成绩表重新导入。"
         )
         clr_note.setObjectName("Muted")
         clr_note.setWordWrap(True)
         clr.addWidget(clr_note)
 
-        clear_btn = QPushButton("清空成绩库")
+        #: 侧写 / 生成物跟着成绩一起清（**默认勾选**，用户可以取消）
+        self._clear_profiles_box = QCheckBox("同时清除 AI 侧写正文和归档、班级快照")
+        self._clear_profiles_box.setChecked(True)
+        self._clear_profiles_box.setToolTip(
+            "不勾选的话只清成绩记录，侧写正文和成长档案快照会留下（它们就对不上了）"
+        )
+        clr.addWidget(self._clear_profiles_box)
+
+        clear_btn = QPushButton("删除成绩库")
         clear_btn.setObjectName("Danger")
         clear_btn.setMinimumHeight(38)
         clear_btn.clicked.connect(self._do_clear)
@@ -200,11 +280,129 @@ class SettingsPage(QWidget):
         clr.addWidget(self._clr_status)
         box.addWidget(clr_card)
 
+        box.addWidget(self._build_gpa_card())
+
         box.addWidget(self._build_ai_card())
 
         box.addWidget(self._build_update_card())
 
         box.addStretch(1)
+
+    # ---------------------------------------------------------------- GPA 规则
+    def _build_gpa_card(self) -> QFrame:
+        """「GPA 换算规则」下拉框（v1.9.1 新增）。
+
+        ★ 换算表**一行都不在界面里**：真源是 :data:`core.gpa.SCHEMES`
+          （方案 1 标准 4.0 已实现，方案 2/3/4 是预留位，列出来但**禁用**）。
+        ★ 选择存**应用级**加密设置（``gpa_settings.json.enc``）——
+          自动登录（没有密码）时也读得回来，和班级快照同一层。
+        ★ 界面上不出现 Markdown 记号（AGENTS §24）：说明文字里的 ``**`` 会原样显示。
+        """
+        card = make_card()
+        box = QVBoxLayout(card)
+        box.setContentsMargins(24, 20, 24, 20)
+        box.setSpacing(10)
+
+        title = QLabel("GPA 换算规则")
+        title.setObjectName("H2")
+        box.addWidget(title)
+
+        note = QLabel(
+            "GPA = Σ(绩点 × 学分) ÷ Σ学分。没有成绩的课不进分母；"
+            "缺考记 0 分，学分进分母、绩点按 0 算。"
+        )
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        box.addWidget(note)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("换算方案"))
+        row.addSpacing(8)
+
+        self._gpa_combo = QComboBox()
+        self._gpa_combo.setMinimumHeight(34)
+        self._gpa_combo.setMinimumWidth(240)
+        for item in scheme_options():
+            self._gpa_combo.addItem(str(item.get("label") or item.get("id")), item.get("id"))
+            index = self._gpa_combo.count() - 1
+            tip = str(item.get("note") or "")
+            if not item.get("available"):
+                # ★ "待定"的方案**整项禁用**：不只是不选中 —— 用户看得见它、
+                #   点不动它，就不会以为"是不是我选错了才没反应"。
+                holder = self._gpa_combo.model().item(index)
+                if holder is not None:
+                    holder.setEnabled(False)
+                tip = f"{tip}（待定：换算表没定，暂不可选）"
+            self._gpa_combo.setItemData(index, tip, Qt.ItemDataRole.ToolTipRole)
+        self._gpa_combo.currentIndexChanged.connect(self._on_gpa_scheme_changed)
+        row.addWidget(self._gpa_combo)
+        row.addStretch(1)
+        box.addLayout(row)
+
+        self._gpa_status = QLabel("")
+        self._gpa_status.setObjectName("Muted")
+        self._gpa_status.setWordWrap(True)
+        box.addWidget(self._gpa_status)
+
+        self._apply_scheme_to_combo(DEFAULT_SCHEME)
+        return card
+
+    def _scheme_note(self, scheme: Any) -> str:
+        for item in scheme_options():
+            if str(item.get("id")) == str(scheme):
+                return str(item.get("note") or "")
+        return ""
+
+    def _apply_scheme_to_combo(self, scheme: Any) -> None:
+        """把下拉框拨到某个方案上（**不触发保存** —— 回填不是用户操作）。"""
+        combo = getattr(self, "_gpa_combo", None)
+        if combo is None:
+            return
+        target = combo.findData(str(scheme))
+        if target < 0:
+            target = combo.findData(DEFAULT_SCHEME)
+        blocked = combo.blockSignals(True)
+        try:
+            if target >= 0:
+                combo.setCurrentIndex(target)
+        finally:
+            combo.blockSignals(blocked)
+        self._gpa_status.setText("当前方案：" + self._scheme_note(scheme))
+
+    def _load_gpa_scheme(self) -> None:
+        """跟着 ``set_user()`` 把这个人上次选的方案拨回来（读不到就是方案 1）。"""
+        if not self._username:
+            self._apply_scheme_to_combo(DEFAULT_SCHEME)
+            return
+        try:
+            scheme = load_scheme(self._store, self._username)
+        except Exception:  # noqa: BLE001 - 读不出来就用默认方案，不弹窗
+            scheme = DEFAULT_SCHEME
+        self._apply_scheme_to_combo(scheme)
+
+    def _on_gpa_scheme_changed(self, _index: int) -> None:
+        combo = self._gpa_combo
+        scheme = combo.currentData()
+        if not scheme:
+            return
+        note = self._scheme_note(scheme)
+        try:
+            save_scheme(self._store, self._username, scheme)
+        except Exception as exc:  # noqa: BLE001 - 存不上要说出来，但不打断
+            self._gpa_status.setText(
+                f"当前选择没有存上（{type(exc).__name__}），本次仍然按它算。"
+            )
+            return
+        self._gpa_status.setText("当前方案：" + note)
+
+    def load_gpa_scheme(self) -> str:
+        """读回这个人选的方案 id（自检 / 其它页面用；读不到就是方案 1）。"""
+        if not self._username:
+            return DEFAULT_SCHEME
+        try:
+            return load_scheme(self._store, self._username)
+        except Exception:  # noqa: BLE001
+            return DEFAULT_SCHEME
 
     # ---------------------------------------------------------------- AI 助手
     def _build_ai_card(self) -> QFrame:
@@ -834,36 +1032,50 @@ class SettingsPage(QWidget):
         self._exp_status.setText(f"已导出 {result.rows} 行 → {result.path}")
         QMessageBox.information(self, "导出完成", f"已写到：\n{result.path}")
 
-    # ---------------------------------------------------------------- 清库
+    # ---------------------------------------------------------------- 删除成绩库
     def _do_clear(self) -> None:
+        """「删除成绩库」—— **先盘点、再问、最后才删**。
+
+        ★ v1.9.1 修的就是这里：原来的判据是"磁盘上有没有 ``grades.enc`` /
+          ``tags.json.enc``"，而 v1.9 起成绩进了
+          :class:`core.database.GradeHistoryDB`（``grade_history.json.enc``）——
+          于是导入完成绩点这个按钮，界面说"库里本来就是空的"，
+          而成长档案页明明有一整份名单。
+
+        ★ 现在的判据只有一条：:func:`core.database.library_inventory` 里
+          ``has_data``（表里真有没有记录 / 侧写 / 生成物）。
+
+        ★ 删除动作全在 :func:`core.database.clear_library` 里（数据层，可单测），
+          这里只做三件事：问用户、调它、报结果。
+        """
         if not self._username:
             QMessageBox.warning(self, "还不知道是谁", "请先登录。")
             return
-        record = self._store.load_users().find(self._username)
-        if record is None:
+
+        inventory = library_inventory(self._store, self._username)
+        if not inventory.get("account"):
             QMessageBox.warning(self, "找不到账户", f"本机没有「{self._username}」。")
             return
-
-        existing = [
-            name
-            for name in PAYLOAD_FILES
-            if self._store.payload_path(record.uid, name).exists()
-        ]
-        if not existing:
-            self._clr_status.setText("库里本来就是空的，没有可删的东西。")
-            QMessageBox.information(self, "不用清", "库里本来就是空的。")
+        if not inventory.get("has_data"):
+            # 到这里才是真的"没有成绩库"：表里 0 条、侧写 0 份、没有任何快照。
+            self._clr_status.setText("没有成绩库：本账户还没有导入过成绩。")
+            QMessageBox.information(
+                self, "没有成绩库",
+                "本账户还没有导入过成绩，没有可删除的数据。",
+            )
             return
 
+        with_profiles = self._clear_profiles_box.isChecked()
         first = QMessageBox.question(
             self,
-            "确认要清空吗",
-            f"将删除本账户的 {len(existing)} 个加密文件：\n"
-            + "\n".join(f"· {name}" for name in existing)
+            "确认要删除吗",
+            clear_confirm_text(inventory)
             + "\n\n删除后无法恢复，只能用原始成绩表重新导入。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if first != QMessageBox.StandardButton.Yes:
+            self._clr_status.setText("已取消，什么都没删。")
             return
 
         second = QMessageBox.warning(
@@ -877,20 +1089,29 @@ class SettingsPage(QWidget):
             self._clr_status.setText("已取消，什么都没删。")
             return
 
-        removed, failed = [], []
-        for name in existing:
-            path = self._store.payload_path(record.uid, name)
-            try:
-                path.unlink()
-                removed.append(name)
-            except OSError as exc:
-                failed.append(f"{name}（{exc}）")
+        try:
+            report = clear_library(
+                self._store,
+                self._username,
+                with_profiles=with_profiles,
+                with_generated=with_profiles,
+            )
+        except Exception as exc:  # noqa: BLE001 - 删失败要说清楚，不许静默
+            QMessageBox.critical(self, "删除失败", f"{type(exc).__name__}: {exc}")
+            self._clr_status.setText(f"删除失败：{exc}")
+            return
 
-        text = f"已删除 {len(removed)} 个文件。"
-        if failed:
-            text += "失败的：" + "；".join(failed)
-        self._clr_status.setText(text)
-        if failed:
+        text = clear_summary_text(report)
+        self._clr_status.setText(
+            text + "　相关页面（成长档案 / 智育分析）会重新读一次库。"
+        )
+        if report.get("failed"):
             QMessageBox.warning(self, "部分文件没删掉", text)
         else:
-            QMessageBox.information(self, "已清空", text)
+            QMessageBox.information(self, "已删除", text)
+        # ★ 数据层已经干净了，广播出去让别的页面 reload()（AGENTS §18）
+        self.library_cleared.emit(
+            int(report.get("grade_rows") or 0),
+            int(report.get("profile_rows") or 0),
+            len(list(report.get("files") or [])),
+        )

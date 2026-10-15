@@ -845,13 +845,39 @@ class CryptoStore:
         removed = self.delete_payloads(record.uid)
         directory = self.user_dir(record.uid)
         if directory.exists():
-            # 目录里可能还有不认识的东西，一并如实报出来
-            for leftover in sorted(directory.iterdir()):
-                if leftover.is_file():
-                    leftover.unlink()
-                    removed.append(str(leftover))
-            directory.rmdir()
-            removed.append(str(directory))
+            # ★ v1.9.1 修的就是这里：``u_xxxxxxxx/`` 下面**现在真的会有子目录** ——
+            #   v1.9 起审计日志落在 ``audit/grade_changes.json.enc``
+            #   （见 ``core/database.py`` 的 ``GradeAuditLog``）。
+            #   旧写法只删**顶层文件**、随后直接 ``directory.rmdir()``，
+            #   多一个子目录就抛 ``OSError: [WinError 145] 目录不是空的``；
+            #   而那个异常发生在 ``save_users()`` **之前** —— 结果是
+            #   "载荷删了、账户记录还在"，用户下次登录看到一个打不开的账户。
+            #   所以改成：**先把整棵子树清掉，再自底向上删目录**，
+            #   每一步都如实记进 ``removed``。
+            #
+            # ★ 顺序必须是"深的先删"（``len(parts)`` 降序）：父目录非空时
+            #   ``rmdir()`` 一定失败。删不掉的（占用 / 只读 / 权限）**跳过**，
+            #   绝不把没删掉的东西报成删掉了 —— 界面照着这个列表说人话。
+            for leftover in sorted(
+                directory.rglob("*"), key=lambda path: len(path.parts), reverse=True
+            ):
+                try:
+                    if leftover.is_dir() and not leftover.is_symlink():
+                        leftover.rmdir()
+                    else:
+                        leftover.unlink()
+                except OSError:
+                    continue
+                removed.append(str(leftover))
+            try:
+                directory.rmdir()
+            except OSError:
+                # 还是非空（有删不掉的东西）→ 目录留着。
+                # ★ 这里**不当成失败**：账户记录照样要移除，否则用户会
+                #   卡在一个"半存在"的账户上（登录得进、载荷全空）。
+                pass
+            else:
+                removed.append(str(directory))
         self.save_users(index.without_user(record.uid))
         removed.append(f"{self.users_path}（仅移除该用户的记录，文件本身保留）")
         return removed
