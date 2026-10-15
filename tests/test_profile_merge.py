@@ -467,10 +467,12 @@ def test_side_text_prompt_warns_when_the_key_is_a_bare_name() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_profile_page_has_two_document_tabs(page: ProfilePage) -> None:
-    assert page._tabs.count() == 2
+def test_profile_page_has_three_document_tabs(page: ProfilePage) -> None:
+    """v1.9.1 起是**三个**标签页：成绩明细 / 总评与侧写 / AI 辅导（任务书 2）。"""
+    assert page._tabs.count() == 3
     assert page._tabs.tabText(0) == "成绩明细"
     assert page._tabs.tabText(1) == "总评与侧写"
+    assert page._tabs.tabText(2) == "AI 辅导"
 
 
 def test_grades_tree_groups_by_term_and_leaves_blank_cells_empty(
@@ -553,11 +555,17 @@ def test_generate_without_a_student_asks_to_pick_one(
     assert seen == ["先在左边点一名学生。"]
 
 
-def test_generate_without_the_assistant_reports_it_in_chinese(
+def test_generate_without_a_model_reports_it_in_chinese(
     page: ProfilePage, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """聊天助手拿不到时：一句中文提示，**不抛异常、不静默**。"""
+    """本机没有可用的模型 / 引擎时：状态行给一句中文原因，**不抛异常、不静默**。
+
+    ★ v1.9.1 起侧写不再经「AI 谈话助手」对话框（那条路是弹窗），改成页内
+      直接调本机引擎 —— 拿不到引擎时走的是**状态行**，也不再弹模态框。
+    """
     archive = build_archive(_parsed([MATH], [76.0]), TERM_A)
+    page.set_chat_models([])                       # 本机一个模型都没有
+    monkeypatch.setattr("ui.pages.profile_page.engine_available", lambda: (True, ""))
     page.show_student(_payload(_student_of(archive)))
 
     seen: list[str] = []
@@ -565,34 +573,56 @@ def test_generate_without_the_assistant_reports_it_in_chinese(
         QMessageBox, "information",
         lambda *args, **kwargs: seen.append(args[2] if len(args) > 2 else ""),
     )
-    monkeypatch.setattr(ProfilePage, "_chat_opener", staticmethod(lambda: None))
 
     page._generate_side_text()
-    assert seen == ["AI 谈话助手暂不可用"]
+
+    assert seen == []                              # 不弹模态框，走状态行
+    assert page._side_status.text() == "生成失败：请先在模型中心下载模型"
     assert page._side_text.toPlainText() == ""
+    assert page._side_text.isReadOnly() is False   # 失败之后文本框照样能用
+    assert page._ai_btn.isEnabled() is True        # 按钮恢复，可以再试
 
 
 def test_generate_hands_the_prompt_over_and_stores_what_comes_back(
     vault: CryptoStore, page: ProfilePage, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """点「点击生成」的完整一条链：拼提示词 → 交给助手 → 正文落加密库。"""
+    """点「点击生成」的完整一条链：拼提示词 → 本机引擎流式出稿 → 改 → 「保存」落库。
+
+    ★ 引擎是**假的**（一个真模型都不加载）；``_start_worker`` 换成"就地跑"，
+      于是信号同步派发，不需要事件循环。
+    ★ 生成完**不自动落库**（任务书 5：正文先给辅导员改，点「保存」才写）。
+    """
     archive = build_archive(_parsed([MATH, ENG], [76.0, 91.0]), TERM_A)
     page.show_student(_payload(_student_of(archive)))
 
-    calls: list[dict[str, Any]] = []
+    prompts: list[str] = []
 
-    def _opener(parent: Any, **kwargs: Any) -> dict[str, str]:
-        calls.append(kwargs)
-        return {"side_text": SIDE_TEXT}
+    class _Engine:
+        def load(self) -> None:
+            pass
 
-    monkeypatch.setattr(ProfilePage, "_chat_opener", staticmethod(lambda: _opener))
+        def stream(self, prompt: str, *args: Any, **kwargs: Any):
+            prompts.append(prompt)
+            yield SIDE_TEXT
+
+    page.set_chat_engine(_Engine())
+    monkeypatch.setattr("ui.pages.profile_page.engine_available", lambda: (True, ""))
+    monkeypatch.setattr(
+        ProfilePage, "_start_worker", staticmethod(lambda worker: worker.run())
+    )
 
     page._generate_side_text()
 
-    assert len(calls) == 1
-    assert "不要编造没有出现的数字" in calls[0]["initial_prompt"]
-    assert f"学生：{STUDENT}" in calls[0]["initial_prompt"]
-    assert "辅导员" in calls[0]["system_prompt"]
+    assert len(prompts) == 1
+    assert "不要编造没有出现的数字" in prompts[0]
+    assert f"学生：{STUDENT}" in prompts[0]
     assert page._side_text.toPlainText() == SIDE_TEXT
+    assert page._side_save.isEnabled() is True     # 有改动 → 「保存」亮着
+    # 还没点「保存」→ 加密库里仍然是空的
+    assert ProfileStore(store=vault, username=USER).side_text(KEY) == ""
+
+    page._on_side_save_clicked()
+
+    assert ProfileStore(store=vault, username=USER).side_text(KEY) == SIDE_TEXT
     assert page._ai_btn.text() == "重新生成"
     assert ProfileStore(store=vault, username=USER).side_text(KEY) == SIDE_TEXT

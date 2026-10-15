@@ -241,9 +241,14 @@ class MainWindow(QMainWindow):
     def _build_topbar(self) -> WindowTitleBar:
         """顶栏 = 自定义标题栏。
 
-        左边是用户名 + 「AI 谈话助手」入口，右边是当前页名；
+        左边是用户名，右边是当前页名；
         中间 ``addStretch(1)`` 顶开。
         三个窗口按钮由 :class:`ui.frameless.WindowTitleBar` 自己加。
+
+        ★ v1.9.1 起**不再有**「AI 谈话助手」入口（Owner 决定）：全局入口删掉，
+          谈话能力收进成长档案页的「AI 辅导」标签页（见
+          :mod:`ui.pages.profile_page`）。:class:`ui.chat_dialog.ChatDialog`
+          本身保留 —— 它的 ``open_chat`` 是 §34 的冻结接口。
         """
         strip = QWidget()
         box = QHBoxLayout(strip)
@@ -253,14 +258,6 @@ class MainWindow(QMainWindow):
         self._user_label = QLabel("（未登录）")
         self._user_label.setObjectName("TopUser")
         box.addWidget(self._user_label)
-
-        # ★ v1.9：AI 谈话助手入口。**只加这一个按钮**，主窗其余部分不动。
-        #   点开的是非模态对话框，主窗照常能用；引擎没装也照样打得开。
-        self._chat_button = QPushButton("AI 谈话助手")
-        self._chat_button.setObjectName("Ghost")
-        self._chat_button.setMinimumHeight(26)
-        self._chat_button.setToolTip("打开本地 AI 谈话助手（离线运行，不联网）")
-        box.addWidget(self._chat_button)
 
         box.addStretch(1)
 
@@ -296,27 +293,10 @@ class MainWindow(QMainWindow):
         self.settings_page.set_export_provider(self.analysis_page.export_records)
         # ★ 导入完一个班 → 成长档案 / 奖学金两页立刻能选到它，不用切页重进
         self.analysis_page.class_saved.connect(self._on_class_saved)
-        # AI 谈话助手（本地离线推理）
-        self._chat_button.clicked.connect(self._open_chat_assistant)
-
-    def _open_chat_assistant(self) -> None:
-        """打开「AI 谈话助手」（**非模态**，本地离线推理）。
-
-        ★ 引擎没装 / 模型没下载时**照样打开**：对话框里给一行中文说明、
-          输入区禁用，不在这里弹一串模态框。
-
-        ★ ``ui.chat_dialog`` 是 **lazy import**：不点这个按钮就不进内存，
-          启动期一点开销都不加（对话记录从本用户的加密库里读）。
-        """
-        try:
-            from ui.chat_dialog import open_chat
-        except Exception:  # noqa: BLE001 - 打不开也要给人话，不能白点一下
-            traceback.print_exc()
-            self._chat_button.setToolTip(
-                "AI 谈话助手暂时打不开：界面模块没装上，请看日志。"
-            )
-            return
-        open_chat(self)
+        # ★ v1.9.1：设置页删完成绩库 → 别的页面读的是**同一个库**，
+        #   不刷新就会继续显示已经删掉的学生（AGENTS §18：一处真源 + 信号刷新）。
+        #   ★ 这条信号原先**没有接收方**（第一波只把发射端做出来了）。
+        self.settings_page.library_cleared.connect(self._on_library_cleared)
 
     # ---------------------------------------------------------------- 对外
     def set_user(self, username: str) -> None:
@@ -346,6 +326,40 @@ class MainWindow(QMainWindow):
             self.archive_page.reload()
         except Exception:  # noqa: BLE001
             traceback.print_exc()
+
+    def _on_library_cleared(self, grade_rows: int, profile_rows: int, files: int) -> None:
+        """设置页「删除成绩库」之后的广播（接 ``SettingsPage.library_cleared``）。
+
+        ★ v1.9.1 接的线：这条信号原先**没有接收方** —— 删完之后成长档案页还在
+          列着已经删掉的学生（名单是智育分析页推进内存的，见 §18）。
+        ★ 刷新失败**只打日志、不弹窗**：删除本身已经成功了，某一页没刷新出来
+          是显示问题，不该打断用户。
+        ★ 一律 ``getattr`` 探一下再调：各页方法名不一样，缺一个不该让整条
+          刷新链断在半路上。
+
+        Args:
+            grade_rows: 删掉了几条成绩记录。
+            profile_rows: 删掉了几份侧写。
+            files: 删掉了几个文件。
+        """
+        for target, method in (
+            # 名单在内存里，**必须**显式清空，reload 也救不回来
+            (self.profile_page, "show_no_data"),
+            # 这两个是"重新从库里读一遍"，清库之后读出来自然是空的
+            (self.archive_page, "reload"),
+            (self.scholarship_page, "reload_classes"),
+        ):
+            refresh = getattr(target, method, None)
+            if not callable(refresh):
+                continue
+            try:
+                refresh()
+            except Exception:  # noqa: BLE001 - 刷新失败只打日志（§18）
+                traceback.print_exc()
+        print(
+            f"[MainWindow] 成绩库已清空（成绩 {grade_rows} 条 / 侧写 {profile_rows} 份 / "
+            f"文件 {files} 个），相关页面已重新读库。"
+        )
 
     def goto(self, index: int) -> None:
         """切到第 ``index`` 页（带动画）。"""

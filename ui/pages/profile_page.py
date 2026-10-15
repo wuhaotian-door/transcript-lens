@@ -3,25 +3,35 @@
 ★ 文件名说明：Spec 五/六 把这一页定名为 ``profile_page.py``（"侧写"），
   所以**个人中心**那一页在 :mod:`ui.pages.account_page`，别走错。
 
-布局（v1.9 第二阶段改成"左侧保留 + 右侧两个标签页"）::
+布局（v1.9.1 起"左侧保留 + 右侧**三个**标签页"）::
 
     +------------------+---------------------------------------+
     | 学生名单          |  【张三（2023001）】                   |
-    | 🔍 [搜索姓名/学号] |  [ 成绩明细 | 总评与侧写 ]  ← QTabWidget|
-    | 张三（2023001）   |   按学期分组的课程树 / 肖像 + AI 侧写   |
+    | 🔍 [搜索姓名/学号] |  [ 成绩明细 | 总评与侧写 | AI 辅导 ]    |
+    | 张三（2023001）   |   课程树 / 肖像 + 侧写 / 与学生谈话     |
     | 李四（2023002）   |  -------------------------------------|
     |                  |  发展意愿       |  辅导提纲             |
     +------------------+---------------------------------------+
 
-标签页 1「成绩明细」：按**学期**分组的 课程 / 成绩 / 学分 树（可展开折叠）。
+标签页 1「成绩明细」：按**学期**分组的 课程 / 成绩 / 学分 / 操作 树（可展开折叠）。
 学期顺序**只认** :data:`core.archival.SEMESTER_ORDER`（经
 ``sorted_records`` / ``semester_rank``），本页不另抄一份表 —— 抄了就会漂移，
 症状是"大二下排在大一上前头"。
 ★ **空 ≠ 0**（红线 2）：没选 / 没考的课，成绩列显示**空白**，绝不显示 0。
+★ 「操作」列是**委托画出来的**一个「删除」小按钮（不是 ``setCellWidget``）：
+  只有真正点到那片矩形才触发删除，见 :meth:`ProfilePage.on_grade_action`。
 
 标签页 2「总评与侧写」：学业肖像（均分 / 三档口径加权 / 趋势 / 短板 / 可抢救项）
-+ **AI 侧写正文**（``core.database.ProfileStore.side_text``，读不到就给
-「点击生成」按钮）。
++ **AI 侧写正文**（``core.database.ProfileStore.side_text``）：没有就点
+「点击生成」→ 生成期间按钮置灰、状态行给中文提示 → 正文落进**可编辑**的
+文本框 → 点「保存」才写回 ``ProfileStore``。
+
+标签页 3「AI 辅导」（任务书 2）：学生信息卡 + 只读谈话记录 + 一行输入框。
+系统提示词里**逐字**塞进这名学生的数据 JSON（成绩 / 德育分 / 已有侧写），
+推理走 :class:`core.ai.inference.LocalModelEngine` 的 ``stream()``，
+**在后台线程里跑**（AGENTS §5b / §21a：主线程直接推理会卡死窗口）。
+引擎 / 模型缺失时**明确降级**（中文说明 + 跳「模型中心」），绝不静默失败、
+绝不走云端。
 
 ★ 关于"不重新算"
 ----------------
@@ -43,11 +53,13 @@ Spec 说「数据来源：student dict 里已有的字段，不重新算」。�
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
-from typing import Any, Callable
+import re
+from typing import Any, Callable, Sequence
 
-from PySide6.QtCore import QRect, QSize, Qt
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter
+from PySide6.QtCore import QRect, QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -73,15 +85,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from core.ai.inference import InferenceUnavailable, friendly_error
 from core.archival import SEMESTER_ORDER, merge_records, partition, semester_rank, trend
 from core.calculator import CalculationScope, weighted_average
 from core.crypto_store import CryptoError, CryptoStore
 from core.database import GradeHistoryDB, ProfileStore
-from core.scholarship import list_classes, load_moral
+from core.scholarship import list_classes, load_moral, save_moral
 from ui.anim import make_card
 from ui.intentions import (
     INTENTION_OPTIONS,
     KEY_PREFIX_NAME,
+    KEY_PREFIX_SID,
     load_intentions,
     save_intention,
     student_key,
@@ -93,20 +107,33 @@ from ui.intentions import (
 from ui.pages.analysis_page import scope_breakdown
 
 __all__ = [
+    "ACTION_TEXT",
+    "CHAT_HISTORY_DIR",
+    "CHAT_HISTORY_PREFIX",
+    "CHAT_HISTORY_SUFFIX",
+    "CHAT_SYSTEM_PROMPT_TEMPLATE",
+    "DELETE_CONFIRM_TEXT",
+    "DELETE_TERM_PROMPT_TEXT",
     "GRADE_TREE_COLUMNS",
     "ITEM_HEIGHT",
     "LIST_WIDTH",
     "RESCUE_TARGET",
+    "RowActionDelegate",
     "SIDE_TEXT_EMPTY_HINT",
     "StudentItemDelegate",
     "ProfilePage",
+    "build_chat_prompt",
+    "build_chat_system_prompt",
     "build_side_text_prompt",
+    "build_student_json",
     "format_credit",
     "format_score",
     "grade_rows_from_records",
     "group_grades_by_term",
     "moral_of",
+    "moral_text",
     "read_side_text",
+    "safe_student_file",
     "term_of_archive",
     # 下面这几个是给成长档案页复用的（同一个"学生名单"长相同一份实现，
     # 不复制第二遍 —— 复制出来的那份迟早会和这份长得不一样）
@@ -138,11 +165,67 @@ ITEM_HEIGHT = 54
 #: 头像圆的直径
 _AVATAR = 34
 
-#: 右侧第 1 个标签页的表头（三列：课程 / 成绩 / 学分）
-GRADE_TREE_COLUMNS = ("课程", "成绩", "学分")
+#: 右侧第 1 个标签页的表头（四列：课程 / 成绩 / 学分 / 操作）
+#: ★ 第 4 列是「操作」：里面那个「删除」是 :class:`RowActionDelegate` 画出来的，
+#:   不是 `setCellWidget` —— 委托画的按钮才能跟着滚动走、也不吃内存。
+GRADE_TREE_COLUMNS = ("课程", "成绩", "学分", "操作")
+
+#: 「操作」列里那个小按钮的文字。**纯文字，不许用 emoji**（§4l：emoji 是启动开销）
+ACTION_TEXT = "删除"
 
 #: 没有侧写正文时显示的那句话（判据：`test_profile_merge.py` 认这一串）
 SIDE_TEXT_EMPTY_HINT = "还没有侧写。点右上角的「AI 侧写」生成。"
+
+#: 单条删除的确认框正文。**逐字**照任务书，一个字都不许改。
+DELETE_CONFIRM_TEXT = "确定删除此条记录？此操作不可恢复。"
+
+#: 删掉某学期最后一条成绩之后的追加提示（任务书 3）。
+DELETE_TERM_PROMPT_TEXT = "该学期已无成绩，是否同时删除学期记录？"
+
+#: 学生数据缺失时的占位文字（写进提示词的 JSON 里）。
+NO_MORAL_TEXT = "未录入"
+
+#: AI 辅导页的系统提示词模板。``{学生JSON}`` 由
+#: :func:`build_student_json` 的结果逐字替换进去 —— **一个字都不许改**。
+CHAT_SYSTEM_PROMPT_TEMPLATE = (
+    "你是一名高校辅导员助理，正在协助辅导员与一名学生进行谈话。"
+    "以下是该学生的数据：{学生JSON}。"
+    "请根据这些数据提供谈话建议、侧写分析或评语润色。"
+)
+
+#: 谈话记录落在用户目录下的哪个子目录（任务书 2 指定的
+#: ``u_<uid>\cache\chat_history_<学号>.json.enc``）。目录不用自己建 ——
+#: ``core.crypto_store._atomic_write_bytes`` 落盘前会 ``mkdir(parents=True)``。
+CHAT_HISTORY_DIR = "cache/"
+
+#: 谈话记录落盘的文件名前缀 / 后缀。★ **只收 ``.enc``**：
+#: ``save_user_json`` 见到 ``.json`` 会当场拒绝（AGENTS §32 踩过），
+#: 而且磁盘上绝不许出现明文谈话记录（红线 3）。
+CHAT_HISTORY_PREFIX = "chat_history_"
+CHAT_HISTORY_SUFFIX = ".json.enc"
+
+#: 谈话记录载荷的结构版本（将来改结构靠它迁移）。
+CHAT_HISTORY_SCHEMA = 1
+
+#: 谈话记录里两种角色的**存储**键（英文，结构稳定；显示才翻成中文）。
+CHAT_ROLE_USER = "user"
+CHAT_ROLE_ASSISTANT = "assistant"
+
+#: 拼提示词时最多带最近多少轮（多了会撑爆 n_ctx=2048 的上下文窗口）。
+CHAT_CONTEXT_TURNS = 12
+
+#: 提示词的字符上限（双保险：一轮很长时按字符再裁一次）。
+CHAT_MAX_PROMPT_CHARS = 4000
+
+#: 生成时的停止串：模型一旦开始"扮演辅导员"就停。
+CHAT_STOP_WORDS = ("\n辅导员：", "辅导员：")
+
+#: 文件名里不允许出现的字符（学号里的 ``:`` / 空格 / 引号都换掉）。
+_UNSAFE_FILENAME = re.compile(r"[^0-9A-Za-z_-]+")
+
+#: 线程还在跑、但页面已经不要它了时，**必须**留个引用 ——
+#: 一个还在运行的 ``QThread`` 被 Python 回收会让进程直接消失（AGENTS §4k 同族）。
+_LIVE_WORKERS: set = set()
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +233,119 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # 成绩明细 / 侧写：**纯逻辑**（零 Qt，pytest 直接测）
 # ---------------------------------------------------------------------------
+
+
+def safe_student_file(key: str) -> str:
+    """把 ``sid:2023001`` 这种键变成安全的文件名片段。
+
+    ★ 谈话记录按学生分开存（``cache/chat_history_<学号>.json.enc``），而键里带
+      ``sid:`` 前缀 —— 冒号在 Windows 上根本不是合法文件名字符。没有学号时
+      退回"整个键的清洗结果"，**绝不返回空串**（空串会拼出
+      ``chat_history_.json.enc``，两个没学号的学生就共用一份记录了）。
+    """
+    text = str(key or "").strip()
+    for prefix in ("sid:", "name:"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    safe = _UNSAFE_FILENAME.sub("_", text).strip("_")
+    if not safe:
+        safe = "unknown"
+    return safe[:64]
+
+
+def moral_text(value: Any) -> str:
+    """德育分那一行的文字。**没录 ≠ 0 分**（AGENTS §14）：没录就写"未录入"。"""
+    if value is None:
+        return NO_MORAL_TEXT
+    if isinstance(value, bool):          # True/False 不该被当成 1/0
+        return NO_MORAL_TEXT
+    if isinstance(value, (int, float)):
+        return f"{value:g}"
+    text = str(value).strip()
+    return text or NO_MORAL_TEXT
+
+
+def build_student_json(student_id: Any, name: Any, class_name: Any, grades: Any,
+                       moral: Any, side_text: Any) -> str:
+    """把一名学生的数据拼成**一段 JSON**（喂给提示词的 ``{学生JSON}``）。
+
+    ★ 必须是**合法 JSON**：模型看到的是它，测试也解析它（``json.loads``）。
+    ★ 只用这名学生**自己的**数据 —— 姓名 / 学号确实在提示词里，但那是
+      本机离线推理的输入（红线 3 管的是"落盘"和"上传"），不是发给谁。
+    """
+    courses: list[dict[str, Any]] = []
+    for row in grades or ():
+        if not isinstance(row, dict):
+            continue
+        courses.append({
+            "semester": str(row.get("term") or row.get("semester") or ""),
+            "course": str(row.get("course") or row.get("course_name") or ""),
+            # 空 ≠ 0：没考的课留在 JSON 里是 null，不是 0
+            "score": row.get("score"),
+            "credit": row.get("credit"),
+        })
+    payload = {
+        "学号": str(student_id or ""),
+        "姓名": str(name or ""),
+        "班级": str(class_name or ""),
+        "德育分": None if moral is None else moral,
+        "成绩": courses,
+        "已有侧写": str(side_text or ""),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def build_chat_system_prompt(student_json: str) -> str:
+    """把学生 JSON 逐字塞进系统提示词模板。"""
+    return CHAT_SYSTEM_PROMPT_TEMPLATE.replace("{学生JSON}", student_json)
+
+
+def store_archive(store: Any, username: str, archive: Any) -> bool:
+    """把归档写回**应用级**加密库（``archive.json.enc``）。
+
+    ★ 归档走应用级（AGENTS §16 / §20c）：自动登录时没有密码，库密钥解不开；
+      成绩绝不许往应用级里塞，但归档是"导入时算过一遍"的派生数据，属于允许的一侧。
+    Returns:
+        True 表示真的写下去了；False 表示这次没写（**不抛**）。
+    """
+    if archive is None or not username:
+        return False
+    try:
+        from core.user_store import save_user_json
+
+        payload = archive.as_dict() if hasattr(archive, "as_dict") else archive
+        save_user_json(store, username, "archive.json.enc", payload)
+    except Exception:  # noqa: BLE001 - 存不下只记日志，界面那一份还在
+        logger.exception("写归档失败")
+        return False
+    return True
+
+
+def build_chat_prompt(system_prompt: str, turns: Any) -> str:
+    """系统提示词 + 最近若干轮 → 一段纯文本提示词。
+
+    写法照 ``ui/chat_dialog.py`` 的 ``_build_prompt``（那边是冻结的参考实现）：
+    最后一轮一定是"辅导员刚说的话"，模型接着往下答。
+    """
+    items = [turn for turn in (turns or ()) if isinstance(turn, dict)]
+    recent = items[-(CHAT_CONTEXT_TURNS + 1): -1] if items else []
+    lines = [system_prompt, "", "下面是谈话记录（辅导员 = 用户，你 = 助手）："]
+    body: list[str] = []
+    for turn in recent:
+        speaker = "辅导员" if turn.get("role") == CHAT_ROLE_USER else "你"
+        body.append(f"{speaker}：{turn.get('text', '')}")
+    if items:
+        body.append(f"辅导员：{items[-1].get('text', '')}")
+    blob = "\n".join(body)
+    if len(blob) > CHAT_MAX_PROMPT_CHARS:
+        blob = blob[-CHAT_MAX_PROMPT_CHARS:]
+        blob = blob.split("\n", 1)[-1]
+    lines.append(blob)
+    lines.append("")
+    lines.append("请用中文、分点回答，不要输出 Markdown 记号。")
+    lines.append("你：")
+    return "\n".join(lines)
 
 
 def format_score(score: Any) -> str:
@@ -183,6 +379,27 @@ def term_of_archive(archive: Any) -> str:
     """
     records = _ordered_records(archive)
     return str(getattr(records[-1], "term", "") or "") if records else ""
+
+
+def student_archive_of(archive: Any, key: str) -> Any:
+    """从"可能是整份归档、也可能就是这一名学生自己的归档"里取出这一名学生的归档。
+
+    ★ 两种形状都要认：主窗给的是 ``Archive``（要按 ``key`` 取），而档案页 /
+      测试给的常常就是 :class:`core.archival.StudentArchive` 本身。只认一种的
+      症状是 ``AttributeError: 'StudentArchive' object has no attribute 'get'``。
+    """
+    if archive is None:
+        return None
+    if hasattr(archive, "records"):
+        return archive
+    getter = getattr(archive, "get", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter(key)
+    except Exception:  # noqa: BLE001 - 取不出来就当这名学生没有归档
+        logger.exception("从归档里取学生失败：%s", key)
+        return None
 
 
 def _ordered_records(archive: Any) -> list[Any]:
@@ -531,10 +748,265 @@ def _fmt(value: float | None, digits: int = 2) -> str:
     return "—" if value is None else f"{value:.{digits}f}"
 
 
+#: 「操作」列那个小按钮的配色（照 ``ui/styles.qss`` 的 ``QPushButton#RowAction``）。
+_ACTION_BG = "#EFF6FF"
+_ACTION_BG_HOVER = "#DBEAFE"
+_ACTION_BG_PRESSED = "#BFDBFE"
+_ACTION_BORDER = "#BFDBFE"
+
+#: 小按钮的尺寸与内边距（``paint`` 与 ``on_grade_action`` 的命中判定共用一份，
+#: 免得"画在哪儿"和"点哪儿算数"两份数字漂移）。
+_ACTION_SIZE = QSize(58, 24)
+_ACTION_PAD = 4
+
+#: 文本框光标移到末尾（模块级常量：不用每次去 ``textCursor()`` 上取枚举）
+_CURSOR_END = QTextCursor.MoveOperation.End
+
+
+class RowActionDelegate(QStyledItemDelegate):
+    """在表格/树的一列里画一个**纯文字**的小按钮（「删除」）。
+
+    ★ 为什么不用 ``setCellWidget``：一个学期八行、一名学生八学期，控件数量
+      立刻上百；而且真表里 ``setCellWidget`` 放进去的东西
+      ``QHeaderView.ResizeToContents`` 是不算的（AGENTS §4c 第 2 条），
+      列宽会跳。委托只画像素，滚动/重建都不留控件。
+
+    ★ 点击**不由本类处理**：``cell_rect()`` 把按钮矩形算出来，
+      ``ProfilePage._on_grade_clicked`` 拿它做命中判定 —— 命中才删，
+      点这一列的其他地方什么都不做。
+    """
+
+    def __init__(self, text: str = ACTION_TEXT, parent: Any = None) -> None:
+        super().__init__(parent)
+        self._text = text
+
+    # -- 几何（画与点共用） --------------------------------------------------
+    def cell_rect(self, rect: QRect) -> QRect:
+        """给定单元格矩形，算出里面那个按钮的位置（**不依赖任何控件状态**）。"""
+        width = min(_ACTION_SIZE.width(), max(0, rect.width() - _ACTION_PAD * 2))
+        height = min(_ACTION_SIZE.height(), max(0, rect.height() - _ACTION_PAD * 2))
+        left = rect.left() + max(0, (rect.width() - width) // 2)
+        top = rect.top() + max(0, (rect.height() - height) // 2)
+        return QRect(left, top, width, height)
+
+    # --- 画 -----------------------------------------------------------------
+    def paint(self, painter: QPainter, option: Any, index: Any) -> None:
+        super().paint(painter, option, index)
+        rect = QRect(option.rect)
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+        area = self.cell_rect(rect)
+        if area.width() <= 0 or area.height() <= 0:
+            return
+
+        state = option.state
+        pressed = bool(state & QStyle.StateFlag.State_Sunken)
+        hovered = bool(state & QStyle.StateFlag.State_MouseOver)
+        background = _ACTION_BG_PRESSED if pressed else (
+            _ACTION_BG_HOVER if hovered else _ACTION_BG
+        )
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(QColor(background))
+        painter.setPen(QColor(_ACTION_BORDER))
+        painter.drawRoundedRect(area, 6, 6)
+
+        font = QFont(option.font)
+        font.setPointSizeF(max(7.5, font.pointSizeF() - 1.0))
+        painter.setFont(font)
+        painter.setPen(QColor(_ACCENT))
+        painter.drawText(area, int(Qt.AlignmentFlag.AlignCenter), self._text)
+        painter.restore()
+
+    def sizeHint(self, option: Any, index: Any) -> QSize:  # noqa: N802 - Qt 命名
+        hint = super().sizeHint(option, index)
+        return QSize(max(hint.width(), _ACTION_SIZE.width()),
+                     max(hint.height(), _ACTION_SIZE.height() + _ACTION_PAD * 2))
+
+
+# ---------------------------------------------------------------------------
+# 推理接线：**只有这里碰 core.ai**（零 HTTP，import 期绝不 import llama_cpp）
+# ---------------------------------------------------------------------------
+
+
+def engine_available() -> tuple[bool, str]:
+    """本机推理引擎装没装（``(可用, 中文原因)``）。
+
+    ★ 真源是 :func:`core.ai.inference.engine_available`（零 HTTP，
+      只用 ``importlib.util.find_spec`` 探一探、**不 import** llama_cpp）。
+      本函数只是一层"探不动也别炸"的包装：core 那边万一有问题，这里给中文原因，
+      页面照样开得起来。
+    """
+    from core.ai import inference
+
+    return inference.engine_available()
+
+
+def list_local_models() -> list[Any]:
+    """列出本机**装好了**的模型（``%LOCALAPPDATA%\\SGMS\\models``）。"""
+    from core.ai import inference
+
+    return list(inference.list_local_models())
+
+
+def _load_chat_worker() -> Any:
+    """拿到 ``ui.chat_dialog`` 模块（里面有 ``_ChatWorker`` / ``LocalModelEngine``）。
+
+    ★ 懒 import：不点「发送」就不进内存（AGENTS §34 的写法）；拿不到就抛
+      :class:`InferenceUnavailable` —— 让**调用方**去说中文人话，不在这里静默。
+    """
+    try:
+        from ui import chat_dialog
+    except Exception as exc:  # noqa: BLE001 - 界面模块缺失 / 语法错 / 缺依赖
+        logger.exception("加载 ui.chat_dialog 失败")
+        raise InferenceUnavailable(f"谈话界面模块没装上：{exc}") from exc
+    return chat_dialog
+
+
+def _clock_now() -> str:
+    """谈话记录上那个时间戳（只要"几点几分"，不要日期 —— 记录本身按天开）。"""
+    from datetime import datetime
+
+    return datetime.now().strftime("%H:%M")
+
+
+class _SideWorker(QThread):
+    """后台生成侧写正文（AGENTS §5b / §21a：主线程里跑推理会冻住窗口）。
+
+    ★ 判据不认线程：真跑时用 ``start()``；测试把
+      :meth:`ProfilePage._start_worker` 换掉就**同步跑**（进程里没有真线程，
+      也就不会有"跑完的 QThread 被回收"那类事故 —— §4k 同族）。
+    """
+
+    chunk = Signal(str)
+    failed = Signal(str)
+    done = Signal()
+
+    def __init__(self, engine: Any, prompt: str, *, max_tokens: int = 512,
+                 parent: Any = None) -> None:
+        super().__init__(parent)
+        self._engine = engine
+        self._prompt = prompt
+        self._max_tokens = max_tokens
+        self._cancelled = False
+        self.answer = ""
+
+    def cancel(self) -> None:
+        """请求停止（下一块就不再追加；不等它 —— 等的是收尾回调）。"""
+        self._cancelled = True
+
+    def run(self) -> None:  # noqa: D102 - QThread 约定
+        """跑完（无论成败）都要发一次 :attr:`done`。
+
+        ★ **不能只连 ``QThread.finished``**：测试把 :meth:`ProfilePage._start_worker`
+          换成"就地调 ``run()``"时进程里没有线程、``finished`` 根本不会发，
+          收尾回调永远不执行（症状是状态行一直停在"正在生成…"、按钮永远灰着）。
+          自己发一次才是"判据不认线程"（同 :class:`ui.chat_dialog._ChatWorker`
+          那边的 ``QThread.finished`` 约定：真线程里它由 Qt 发）。
+        """
+        try:
+            load = getattr(self._engine, "load", None)
+            if callable(load):
+                load()
+            for piece in self._engine.stream(self._prompt, max_tokens=self._max_tokens):
+                if self._cancelled:
+                    break
+                if not piece:
+                    continue
+                self.answer += piece
+                self.chunk.emit(piece)
+        except InferenceUnavailable as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:  # noqa: BLE001 - 一律翻成人话，绝不留英文堆栈
+            logger.exception("侧写生成失败")
+            self.failed.emit(friendly_error(exc))
+        finally:
+            self.done.emit()
+
+
+_CHAT_WORKER: Any = None
+
+
+class _PageChatWorker(QThread):
+    """谈话页自己的谈话线程：**契约照抄** ``ui.chat_dialog._ChatWorker``（冻结文件）。
+
+    ``chunk`` / ``failed`` 两个信号与 ``answer`` / ``cancel()`` 与它逐字同形，
+    另外补一个 ``done``。**不继承它**是因为 ``ui/chat_dialog`` 只能懒 import
+    （它自己带 Qt 依赖，缺了不该让整页打不开），而继承关系必须写死在定义期
+    —— 于是复制契约比制造耦合更安全（那个文件的 ``open_chat`` 是 §34 冻结接口，
+    本来也不许改）。
+
+    ★ ``done`` 为什么非有不可：收尾回调原来连的是 ``QThread.finished`` —— 测试把
+      :meth:`ProfilePage._start_worker` 换成"就地调 ``run()``"时进程里没有线程，
+      ``finished`` **永远不会发**，于是"回答写盘 / 恢复输入区"整段不执行
+      （症状：状态行一直卡在"正在生成…"、输入框永远灰着）。自己发一次才是
+      "判据不认线程"。
+    """
+
+    chunk = Signal(str)
+    failed = Signal(str)
+    done = Signal()
+
+    def __init__(self, engine: Any, prompt: str, *, max_tokens: int = 512,
+                 temperature: float = 0.7,
+                 stop: Sequence[str] | None = None, **kwargs: Any) -> None:
+        parent = kwargs.pop("parent", None)
+        super().__init__(parent)
+        self._engine = engine
+        self._prompt = prompt
+        self._max_tokens = max_tokens
+        self._temperature = temperature
+        self._stop = stop
+        self._cancelled = False
+        self.answer = ""
+
+    def cancel(self) -> None:
+        """请求停止（下一块就不再追加；不等它 —— 等的是收尾回调）。"""
+        self._cancelled = True
+        self.requestInterruption()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def run(self) -> None:  # noqa: D102 - QThread 约定
+        try:
+            load = getattr(self._engine, "load", None)
+            if callable(load):
+                load()
+            for piece in self._engine.stream(
+                self._prompt, self._max_tokens, self._temperature,
+                stop=self._stop or None,
+            ):
+                if self._cancelled:
+                    break
+                if not piece:
+                    continue
+                self.answer += piece
+                self.chunk.emit(piece)
+        except InferenceUnavailable as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:  # noqa: BLE001 - 一律翻成人话，绝不留英文堆栈
+            logger.exception("谈话生成失败")
+            self.failed.emit(friendly_error(exc))
+        finally:
+            self.done.emit()
+
+
 class ProfilePage(QWidget):
     """侧写辅导页：左名单 + 右详情。"""
 
-    def __init__(self, store: CryptoStore | None = None, parent: QWidget | None = None) -> None:
+    def __init__(self, store: CryptoStore | None = None, parent: QWidget | None = None, *,
+                 chat_models: list[Any] | None = None,
+                 chat_engine: Any = None) -> None:
+        """``chat_models`` / ``chat_engine`` 是**测试注入点**（照
+        :class:`ui.chat_dialog.ChatDialog` 的写法）：给了就绝不扫磁盘、
+        绝不真的去加载模型。
+
+        ★ ``chat_models`` 缺省是 ``None``（= 去扫磁盘），**不是** ``[]`` ——
+          空列表是测试在说"本机一个模型都没有"。
+        """
         super().__init__(parent)
         self._store = store if store is not None else CryptoStore()
         self._username = ""
@@ -556,6 +1028,45 @@ class ProfilePage(QWidget):
         self._tag_pool: dict[str, list[QLabel]] = {}
         #: 当前标签页下标（只用来记住位置，切页不做重新计算）
         self._active_tab = 0
+
+        # --- 单条删除（任务书 3）---
+        #: 成绩明细里"这条是成绩历史表的第几行"（按学期分组前记下的）
+        self._grade_payloads: dict[int, dict[str, Any]] = {}
+        #: 被"同时删除学期记录"删掉的学期（本页不再显示，直到换一名学生）
+        self._hidden_terms: set[str] = set()
+
+        # --- AI 辅导（任务书 2）---
+        #: 注入的假引擎（给了它就不加载真模型）
+        self._chat_engine = chat_engine
+        self._chat_models_given = chat_models is not None
+        self._chat_models: list[Any] = list(chat_models) if chat_models is not None else []
+        #: 当前的会话键 / 学号（换人时聊天记录跟着换）
+        self._chat_key: str = ""
+        #: 学号 —— 谈话记录的文件名用它（``chat_history_<学号>.json.enc``，AGENTS §9）
+        self._chat_student_id: str = ""
+        self._chat_history: list[dict[str, str]] = []
+        #: 后台生成线程（同一时刻最多一个）
+        self._chat_worker: Any = None
+        self._chat_answer = ""
+        #: 正在流式追加回答（第一块才写说话人）
+        self._chat_open = False
+        #: 上一次失败的**中文原因**（收尾时重新贴到状态行，别被"可以开始"抹掉）
+        self._chat_error = ""
+        #: 引擎自己失败的原因（判据要它逐字出现）
+        self._chat_engine_reason = ""
+        #: 当前选中的本地模型（``None`` = 本机一个能用的都没有）
+        self._chat_model: Any = None
+        #: 这名学生的系统提示词（含数据 JSON）/ 那段 JSON 本身
+        self._chat_system_prompt = ""
+        self._chat_student_json = ""
+        self._side_key: str = ""
+        #: 正在生成侧写（生成期间按钮置灰、文本框只读）
+        self._side_busy = False
+        self._side_worker: Any = None
+        #: 侧写生成失败的中文原因（收尾时贴到状态行）
+        self._side_error = ""
+        #: 回填正文时压住 ``textChanged``（免得"没改过"也把「保存」点亮）
+        self._side_text_guard = False
         self._build()
 
     # ---------------------------------------------------------------- 外部
@@ -573,6 +1084,14 @@ class ProfilePage(QWidget):
         self._profile_store = None
         self._grade_db = None
         self._moral_cache = None
+        # ★ 上一个人的谈话记录**一个字都不许留**：聊天键、记录、正在跑的生成
+        #   全清掉（跟清 ``_profile_store`` 是同一条道理，串号了还不报错）。
+        self._stop_chat_worker()
+        self._chat_key = ""
+        self._chat_student_id = ""
+        self._chat_history = []
+        self._chat_engine_reason = ""
+        self._hidden_terms = set()
         if self._payload is not None:
             self._render()
 
@@ -591,6 +1110,25 @@ class ProfilePage(QWidget):
         self._fill_list()
         if self._payload is not None:
             self._select_key(self._payload.get("key", ""))
+
+    def show_no_data(self) -> None:
+        """成绩库被清空之后调用（主窗接 ``SettingsPage.library_cleared``，AGENTS §18）。
+
+        ★ 为什么需要这个钩子：左栏名单是智育分析页推过来的（:meth:`set_roster`），
+          清库**不会**自动把那份内存名单收回去 —— 继续列着已经删掉的学生，
+          用户会以为"删除没生效"。
+        ★ 只动显示状态，**不碰** AI 辅导 / 侧写的既有逻辑：这里清掉的
+          "上一位学生的谈话上下文"正是 :meth:`set_user` 已经在做的事。
+        """
+        self._roster = []
+        self._payload = None
+        self._stop_chat_worker()
+        self._chat_key = ""
+        self._chat_student_id = ""
+        self._chat_history = []
+        self._fill_list()
+        self._list_note.setText("暂无数据：成绩库已清空，先在「📊 智育分析」导入成绩表。")
+        self._render()
 
     def show_student(self, payload: dict[str, Any]) -> None:
         """接住智育分析页传来的学生包，并在名单里把他选中。"""
@@ -758,6 +1296,7 @@ class ProfilePage(QWidget):
         self._tabs.setObjectName("ProfileTabs")
         self._tabs.addTab(self._build_grades_pane(), "成绩明细")
         self._tabs.addTab(self._build_review_pane(), "总评与侧写")
+        self._tabs.addTab(self._build_chat_pane(), "AI 辅导")
         self._tabs.currentChanged.connect(self._on_tab_changed)
         body_box.addWidget(self._tabs, 1)
 
@@ -796,19 +1335,145 @@ class ProfilePage(QWidget):
         self._grade_tree.setRootIsDecorated(True)
         self._grade_tree.setUniformRowHeights(True)
         self._grade_tree.setAlternatingRowColors(False)
-        self._grade_tree.setSelectionMode(QTreeWidget.SelectionMode.NoSelection)
+        # ★ 从 v1.9.1 起**不再是 NoSelection**：第 4 列那个「删除」按钮要收到
+        #   点击事件（选中态只是副作用，真正判命中用 :meth:`on_grade_action` 里的
+        #   按钮矩形）。鼠标跟踪打开，悬停时按钮才变色。
+        self._grade_tree.setSelectionMode(QTreeWidget.SelectionMode.SingleSelection)
         self._grade_tree.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._grade_tree.setMouseTracking(True)
         # ★ 列宽写死 + Fixed：`ResizeToContents` 不把"展开出来的子行"算进来，
         #   点开一个学期之后列宽会跳（AGENTS §4c 第 2 条）。
         header = self._grade_tree.header()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
         header.setStretchLastSection(False)
         self._grade_tree.setColumnWidth(1, 88)
         self._grade_tree.setColumnWidth(2, 88)
+        # 「操作」列必须写死宽度（§4c 第 2 条：放进去的控件不参与 ResizeToContents）
+        self._grade_tree.setColumnWidth(3, 88)
+        self._grade_action_column = len(GRADE_TREE_COLUMNS) - 1
+        self._grade_delegate = RowActionDelegate()
+        self._grade_tree.setItemDelegateForColumn(
+            self._grade_action_column, self._grade_delegate
+        )
+        self._grade_tree.itemClicked.connect(self._on_grade_clicked)
         box.addWidget(self._grade_tree, 1)
+
+        box.addWidget(self._build_moral_card())
         return pane
+
+    # --- 标签页 1 的副卡：德育分（一行 = 一条，右侧「删除」）---
+    def _build_moral_card(self) -> QFrame:
+        card = make_card()
+        box = QHBoxLayout(card)
+        box.setContentsMargins(16, 10, 16, 10)
+        box.setSpacing(10)
+
+        title = QLabel("德育分")
+        title.setObjectName("H3")
+        box.addWidget(title)
+
+        self._moral_row = QLabel(moral_text(None))
+        self._moral_row.setObjectName("Muted")
+        box.addWidget(self._moral_row, 1)
+
+        self._moral_delete = QPushButton(ACTION_TEXT)
+        self._moral_delete.setObjectName("RowAction")
+        self._moral_delete.setToolTip("删除这名学生的德育分记录")
+        self._moral_delete.setMaximumWidth(84)
+        self._moral_delete.setMinimumHeight(26)
+        self._moral_delete.clicked.connect(self._delete_moral_row)
+        box.addWidget(self._moral_delete)
+        return card
+
+    # --- 标签页 3：AI 辅导（任务书 2）---
+    def _build_chat_pane(self) -> QWidget:
+        """学生信息卡 + 只读谈话记录 + 一行输入框。
+
+        ★ 容器上**绝不挂任何 QGraphicsEffect**（AGENTS §17：挂了整页可能画成
+          空白，静态断言查不出来）。本函数里一个 ``setGraphicsEffect`` 都没有。
+        """
+        pane = QWidget()
+        box = QVBoxLayout(pane)
+        box.setContentsMargins(0, 10, 0, 0)
+        box.setSpacing(10)
+
+        box.addWidget(self._build_student_card())
+
+        self._chat_status = QLabel("")
+        self._chat_status.setObjectName("Muted")
+        self._chat_status.setWordWrap(True)
+        self._chat_status.setMinimumWidth(320)
+        box.addWidget(self._chat_status)
+
+        # 缺模型时的兜底入口（懒 import + try/except，见 _open_model_center）
+        self._model_center_btn = QPushButton("打开模型中心")
+        self._model_center_btn.setObjectName("Ghost")
+        self._model_center_btn.setMinimumHeight(32)
+        self._model_center_btn.setMaximumWidth(160)
+        self._model_center_btn.clicked.connect(self._open_model_center)
+        self._model_center_btn.hide()
+        box.addWidget(self._model_center_btn)
+
+        self._chat_view = QTextEdit()
+        self._chat_view.setObjectName("Outline")
+        self._chat_view.setReadOnly(True)
+        self._chat_view.setPlaceholderText("这里显示这名学生的谈话记录。")
+        box.addWidget(self._chat_view, 1)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self._chat_input = QLineEdit()
+        self._chat_input.setPlaceholderText("说点什么…（回车发送）")
+        self._chat_input.returnPressed.connect(self._on_chat_send_clicked)
+        row.addWidget(self._chat_input, 1)
+        self._chat_send = QPushButton("发送")
+        self._chat_send.setObjectName("Primary")
+        self._chat_send.setMinimumHeight(34)
+        self._chat_send.setMaximumWidth(120)
+        self._chat_send.clicked.connect(self._on_chat_send_clicked)
+        row.addWidget(self._chat_send)
+        box.addLayout(row)
+
+        # ★ 建页面时还没选学生：输入区先关上、状态行给出怎么开始
+        #   （不这么写的话，窗口一打开输入框就能打字，发出去才发现没人可谈）
+        self._chat_status.setText("先在左边点一名学生，再开始谈话。")
+        self._chat_input.setEnabled(False)
+        self._chat_send.setEnabled(False)
+        return pane
+
+    def _build_student_card(self) -> QFrame:
+        """当前学生的基本信息卡片（姓名 / 学号 / 班级）。"""
+        card = make_card()
+        box = QHBoxLayout(card)
+        box.setContentsMargins(16, 12, 16, 12)
+        box.setSpacing(14)
+
+        self._chat_avatar = QLabel("—")
+        self._chat_avatar.setObjectName("H2")
+        self._chat_avatar.setFixedWidth(40)
+        box.addWidget(self._chat_avatar)
+
+        info = QVBoxLayout()
+        info.setSpacing(2)
+        self._chat_name = QLabel("（还没选学生）")
+        self._chat_name.setObjectName("H3")
+        info.addWidget(self._chat_name)
+        self._chat_meta = QLabel("")
+        self._chat_meta.setObjectName("Muted")
+        self._chat_meta.setWordWrap(True)
+        self._chat_meta.setMinimumWidth(240)
+        info.addWidget(self._chat_meta)
+        box.addLayout(info, 1)
+
+        note = QLabel("本机离线推理，谈话记录加密存在本机")
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        note.setFixedWidth(220)
+        box.addWidget(note)
+        return card
 
     # --- 标签页 2：总评与侧写 ---
     def _build_review_pane(self) -> QWidget:
@@ -903,7 +1568,7 @@ class ProfilePage(QWidget):
         title = QLabel("AI 侧写")
         title.setObjectName("H2")
         head.addWidget(title)
-        note = QLabel("把已有成绩与德育分拼成提示词，交给 AI 谈话助手")
+        note = QLabel("把已有成绩与德育分拼成提示词，交给本机 AI 引擎生成")
         note.setObjectName("Muted")
         head.addWidget(note)
         head.addStretch(1)
@@ -914,6 +1579,24 @@ class ProfilePage(QWidget):
         self._ai_btn.setToolTip("生成的内容会存进本地加密文件")
         self._ai_btn.clicked.connect(self._generate_side_text)
         head.addWidget(self._ai_btn)
+
+        # 生成完之后正文是**可编辑**的，改完点这里才写回加密库。
+        self._side_save = QPushButton("保存")
+        self._side_save.setObjectName("Primary")
+        self._side_save.setMinimumHeight(36)
+        self._side_save.setToolTip("把文本框里的内容存进本地加密文件")
+        self._side_save.clicked.connect(self._on_side_save_clicked)
+        head.addWidget(self._side_save)
+
+        # 侧写记录的「删除」＝把这个学生的 side_text 清空（任务书 3 的第三类）。
+        # ★ 纯文字，不许 emoji（AGENTS §4l）。
+        self._side_delete = QPushButton(ACTION_TEXT)
+        self._side_delete.setObjectName("RowAction")
+        self._side_delete.setMinimumHeight(36)
+        self._side_delete.setMaximumWidth(84)
+        self._side_delete.setToolTip("清空这名学生的侧写记录")
+        self._side_delete.clicked.connect(self._delete_side_text)
+        head.addWidget(self._side_delete)
         box.addLayout(head)
 
         self._side_hint = QLabel(SIDE_TEXT_EMPTY_HINT)
@@ -922,13 +1605,23 @@ class ProfilePage(QWidget):
         self._side_hint.setMinimumWidth(320)
         box.addWidget(self._side_hint)
 
+        # 生成期间的状态行（「正在生成侧写…」/ 失败的中文原因）。
+        self._side_status = QLabel("")
+        self._side_status.setObjectName("Muted")
+        self._side_status.setWordWrap(True)
+        self._side_status.setMinimumWidth(320)
+        box.addWidget(self._side_status)
+
         self._side_text = QTextEdit()
         self._side_text.setObjectName("Outline")
-        self._side_text.setReadOnly(True)
+        # ★ **可编辑**（任务书 5）：生成或读回来的正文都要能让辅导员改，
+        #   改完「保存」才写回 ProfileStore。生成期间临时置只读。
+        self._side_text.setReadOnly(False)
         self._side_text.setMinimumHeight(150)
         self._side_text.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
+        self._side_text.textChanged.connect(self._on_side_text_changed)
         box.addWidget(self._side_text)
         return card
 
@@ -1231,9 +1924,13 @@ class ProfilePage(QWidget):
 
         # --- 标签页 1：成绩明细 ---
         self._render_grades(key, archive)
+        self._render_moral(key)
 
         # --- 标签页 2：AI 侧写正文 ---
         self._render_side_text(key)
+
+        # --- 标签页 3：AI 辅导（换人 = 换一份谈话记录）---
+        self._render_chat(key, student_id, name)
 
     # ------------------------------------------------- 标签页 1（成绩明细）
     def _history(self) -> Any:
@@ -1270,6 +1967,8 @@ class ProfilePage(QWidget):
             return
         tree = self._grade_tree
         tree.clear()
+        #: 行号 → 这一行对应成绩历史表里的哪一行（按学期分组**之前**的原始行号）
+        self._grade_payloads = {}
 
         rows = self._grade_rows(key, archive)
         # 归档记录自己带 term；成绩历史表的行本来就逐行带 semester。
@@ -1282,33 +1981,316 @@ class ProfilePage(QWidget):
         grouped = group_grades_by_term(rows, terminal_terms={default_term} if default_term else None)
 
         for semester, courses in grouped:
-            head = QTreeWidgetItem([semester or "未标注学期", "", ""])
+            # 「同时删除学期记录」删掉的学期不再显示（本页内，换人时清空）
+            if semester and semester in self._hidden_terms:
+                continue
+            head = QTreeWidgetItem([semester or "未标注学期", "", "", ""])
             font = head.font(0)
             font.setBold(True)
             head.setFont(0, font)
             head.setFirstColumnSpanned(True)
             tree.addTopLevelItem(head)
             for row in courses:
-                child = QTreeWidgetItem([
+                item = QTreeWidgetItem([
                     row["course"],
                     format_score(row["score"]),
                     format_credit(row["credit"]),
+                    "",                     # 「操作」列由委托画按钮
                 ])
-                child.setTextAlignment(1, int(Qt.AlignmentFlag.AlignRight
-                                              | Qt.AlignmentFlag.AlignVCenter))
-                child.setTextAlignment(2, int(Qt.AlignmentFlag.AlignRight
-                                              | Qt.AlignmentFlag.AlignVCenter))
-                head.addChild(child)
+                item.setTextAlignment(1, int(Qt.AlignmentFlag.AlignRight
+                                             | Qt.AlignmentFlag.AlignVCenter))
+                item.setTextAlignment(2, int(Qt.AlignmentFlag.AlignRight
+                                             | Qt.AlignmentFlag.AlignVCenter))
+                self._grade_payloads[id(item)] = {
+                    "term": str(semester or ""),
+                    "row": row,
+                }
+                head.addChild(item)
         tree.expandAll()
 
-        if not grouped:
+        visible_terms = [term for term, _courses in grouped if term not in self._hidden_terms]
+        if not visible_terms:
             note = "还没有这名学生的成绩明细。先在「📊 智育分析」导入他的成绩表。"
+            if grouped:
+                note += "（本页显示的学期已被「同时删除学期记录」移除）"
         else:
-            course_count = sum(len(courses) for _term, courses in grouped)
-            note = (f"{len(grouped)} 个学期，共 {course_count} 门课。"
+            course_count = sum(
+                len(courses) for term, courses in grouped if term not in self._hidden_terms
+            )
+            note = (f"{len(visible_terms)} 个学期，共 {course_count} 门课。"
                     "空白＝没选或没考（不是 0 分）。")
         if hasattr(self, "_grades_note"):
             self._grades_note.setText(note)
+
+    # ------------------------------------------------- 标签页 1（单条删除）
+    def on_grade_action(self, item: Any) -> bool:
+        """点「操作」列里那个「删除」：确认后删掉这一条成绩。
+
+        Args:
+            item: 被点的 ``QTreeWidgetItem``（学期分组头传进来直接忽略）。
+
+        Returns:
+            True 表示**真的删掉了一条**（取消 / 点空 / 没这一行都是 False）。
+        """
+        info = self._grade_payloads.get(id(item)) if item is not None else None
+        if not info:
+            return False
+        row = info.get("row") or {}
+        if not self._confirm_delete():
+            return False
+
+        term = str(info.get("term") or "")
+        removed = self._remove_grade_row(row, term)
+        if not removed:
+            QMessageBox.information(self, "删除成绩", "这条成绩没有删掉，请稍后再试。")
+            return False
+
+        self._save_archive()
+        # ★ 删的是这个学期最后一条 → 追加问一次"要不要连学期分组一起删掉"
+        payload = self._payload or {}
+        key = payload.get("key") or student_key(
+            str(payload.get("student_id") or "").strip(),
+            str(payload.get("student") or ""),
+        )
+        if term and not self._term_has_grades(key, term):
+            answer = QMessageBox.question(
+                self, "删除学期记录", DELETE_TERM_PROMPT_TEXT,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._hidden_terms.add(term)
+                self._delete_history_term(term)
+
+        self._render()
+        return True
+
+    def _on_grade_clicked(self, item: Any, column: int) -> None:
+        """树上的点击：**只有落在「删除」按钮那片矩形里**才算数。
+
+        ★ 命中判定用 :meth:`RowActionDelegate.cell_rect` —— 与 ``paint`` 共用
+          同一份几何，不写第二遍（写两遍就会漂移：画在这儿、点在那儿）。
+        """
+        if column != getattr(self, "_grade_action_column", -1) or item is None:
+            return
+        tree = self._grade_tree
+        rect = tree.visualItemRect(item)
+        if rect.isEmpty():
+            return
+        cell = QRect(rect)
+        cell.setLeft(rect.left() + tree.columnViewportPosition(column))
+        cell.setWidth(tree.columnWidth(column))
+        area = self._grade_delegate.cell_rect(cell)
+        position = tree.viewport().mapFromGlobal(tree.cursor().pos())
+        if not area.contains(position):
+            return
+        self.on_grade_action(item)
+
+    def grade_delete_button_rect(self, item: Any) -> QRect:
+        """某个课程行「删除」按钮在视口里的矩形（测试按它模拟点击）。"""
+        tree = self._grade_tree
+        column = getattr(self, "_grade_action_column", -1)
+        rect = tree.visualItemRect(item)
+        cell = QRect(rect)
+        cell.setLeft(rect.left() + tree.columnViewportPosition(column))
+        cell.setWidth(tree.columnWidth(column))
+        return self._grade_delegate.cell_rect(cell)
+
+    def _confirm_delete(self) -> bool:
+        """单条删除的确认框。**文案逐字照任务书**，默认按钮是「否」。"""
+        answer = QMessageBox.question(
+            self, "确认删除", DELETE_CONFIRM_TEXT,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _term_has_grades(self, key: str, term: str) -> bool:
+        """这个学生这个学期**还有没有**成绩（两个数据源都看）。"""
+        if not term:
+            return False
+        if self._history_rows(key, term):
+            return True
+        archive = (self._payload or {}).get("archive")
+        student = student_archive_of(archive, key)
+        records = getattr(student, "records", None) or ()
+        return any(getattr(record, "term", "") == term for record in records)
+
+    def _history_rows(self, key: str, term: str) -> list[dict[str, Any]]:
+        """成绩历史表里这个学生这个学期的行（库不可用时返回空表）。"""
+        payload = self._payload or {}
+        student_id = str(payload.get("student_id") or "").strip()
+        if not student_id or not term:
+            return []
+        history = self._history()
+        if history is None:
+            return []
+        try:
+            return list(history.semester_rows(student_id, term))
+        except Exception:  # noqa: BLE001 - 读不出来就当没有
+            logger.exception("读成绩历史失败（%s / %s）", student_id, term)
+            return []
+
+    def _remove_grade_row(self, row: dict[str, Any], term: str) -> bool:
+        """把一个课程行从**归档**里删掉，并尽力同步成绩历史表。
+
+        ★ 界面上的成绩来自归档；但**持久化**的那一份在成绩历史表里。本方法
+          两条路都走：归档删掉（界面立刻变），历史表**有单条删除 API 才调**
+          （``core/database.py`` 当前还没有 —— 见 ``_delete_history_row``）。
+        """
+        payload = self._payload or {}
+        archive = payload.get("archive")
+        key = payload.get("key") or student_key(
+            str(payload.get("student_id") or "").strip(),
+            str(payload.get("student") or ""),
+        )
+        course = str(row.get("course") or "")
+        score = row.get("score")
+        removed = False
+
+        # ★ 两种形状都要认：主窗给的是**归档**（``Archive``，要按 key 取），
+        #   而档案页/测试给的常常就是**这名学生自己的** ``StudentArchive``
+        #   （症状是 ``'StudentArchive' object has no attribute 'get'``）。
+        student = student_archive_of(archive, key)
+        records = list(getattr(student, "records", None) or ())
+        for record in records:
+            if getattr(record, "term", "") != term:
+                continue
+            courses = list(getattr(record, "courses", None) or ())
+            for index, course_item in enumerate(courses):
+                if getattr(course_item, "name", "") != course:
+                    continue
+                # 同名的课可能不止一条（重复导入）→ 用分数再对一次，仍对不上就取第一条
+                if score is not None and getattr(course_item, "score", None) != score:
+                    continue
+                courses.pop(index)
+                record.courses = courses
+                removed = True
+                break
+            if removed:
+                if not courses:
+                    # 这个学期的课全删光了：记录自己也一并去掉（学期分组随之消失）
+                    student.records = [item for item in records if item is not record]
+                break
+        if removed:
+            self._save_archive()
+        if self._delete_history_row(payload, term, course, score):
+            removed = True
+        return removed
+
+    def _delete_history_row(self, payload: dict[str, Any], term: str, course: str,
+                            score: Any) -> bool:
+        """从 ``grade_history`` 表删掉这一条（主键三元组）。
+
+        ★ v1.9.1 拿到数据层写的单条删除 API 了（另一个代理的写范围）：
+          :meth:`core.database.GradeHistoryDB.delete_record`
+          ``(student_id, semester, course_name) -> int``（返回真删掉的行数）。
+          本函数把它翻成布尔 —— 调用方只关心"删掉没有"。
+        ★ 没有这个 API 时**不报错、也不静默**：返回 False，界面照样把归档那
+          一份删掉（成绩明细的主源是归档）。
+        """
+        student_id = str(payload.get("student_id") or "").strip()
+        history = self._history()
+        remover = getattr(history, "delete_record", None) if history is not None else None
+        if not student_id or not course or not callable(remover):
+            return False
+        try:
+            return int(remover(student_id, term, course)) > 0
+        except Exception:  # noqa: BLE001 - 删不掉不该把界面带崩
+            logger.exception("从成绩历史表删除失败（%s / %s / %s）",
+                             student_id, term, course)
+            return False
+
+    def _delete_history_term(self, term: str) -> int:
+        """把当前学生这个学期的成绩历史**整学期**删掉（追加提示里点「是」时用）。
+
+        Returns:
+            真删掉的行数（``0`` = 表里本来就没有，或没有这个 API）。
+        """
+        student_id = str((self._payload or {}).get("student_id") or "").strip()
+        history = self._history()
+        remover = getattr(history, "delete_semester", None) if history is not None else None
+        if not student_id or not term or not callable(remover):
+            return 0
+        try:
+            return int(remover(student_id, term))
+        except Exception:  # noqa: BLE001 - 删不掉不该把界面带崩
+            logger.exception("从成绩历史表删除学期失败（%s / %s）", student_id, term)
+            return 0
+
+    def _save_archive(self) -> None:
+        """把改过的归档写回（写不进去只记日志，界面照样刷新）。"""
+        payload = self._payload or {}
+        archive = payload.get("archive")
+        if archive is None or not self._username:
+            return
+        try:
+            store_archive(self._store, self._username, archive)
+        except Exception:  # noqa: BLE001 - 存不下不该把界面带崩
+            logger.exception("保存归档失败（删除之后）")
+
+    # ------------------------------------------------- 标签页 1（德育分一行）
+    def _render_moral(self, key: str) -> None:
+        value = self._student_moral(key) if key else None
+        if hasattr(self, "_moral_row"):
+            self._moral_row.setText(
+                f"当前：{moral_text(value)}" if value is not None
+                else f"{NO_MORAL_TEXT}（没录 ≠ 0 分）"
+            )
+        if hasattr(self, "_moral_delete"):
+            self._moral_delete.setEnabled(value is not None and bool(key))
+
+    def _delete_moral_row(self) -> None:
+        """删掉这名学生的德育分记录（确认框 → 写回德育表）。"""
+        payload = self._payload or {}
+        key = payload.get("key") or ""
+        if not key:
+            return
+        if not self._confirm_delete():
+            return
+        if not self._delete_moral_values(key):
+            QMessageBox.information(self, "删除德育分", "这条德育分没有删掉，请稍后再试。")
+            return
+        self._moral_cache = None            # 下次重新扫班级目录
+        self._render_moral(key)
+
+    def _delete_moral_values(self, key: str) -> bool:
+        """把 ``key`` 从每个录过他的班级德育表里删掉。
+
+        ★ 班级列表照 :meth:`_student_moral` 的办法扫目录（``list_classes`` 是
+          唯一真源，不另存索引）。删法是把该键写成空串再存 —— 读的时候
+          ``load_moral`` 会把空串当成"没录"（AGENTS §14：没录 ≠ 0 分）。
+        """
+        savers: list[Callable[[], None]] = []
+        names: list[str] = []
+        try:
+            names = [row.class_name for row in list_classes(self._store, self._username)]
+        except Exception:  # noqa: BLE001 - 扫不到就是没有班级录过德育分
+            logger.exception("扫班级目录失败（删除德育分降级）")
+            return False
+        for class_name in names:
+            try:
+                table = load_moral(self._store, self._username, class_name)
+            except Exception:  # noqa: BLE001
+                logger.exception("读德育分失败（%s）", class_name)
+                continue
+            if not isinstance(table, dict) or key not in table:
+                continue
+            table = dict(table)
+            table[key] = ""
+            savers.append(
+                (lambda name=class_name, data=table:
+                 save_moral(self._store, self._username, name, data))
+            )
+        if not savers:
+            return False
+        for save in savers:
+            try:
+                save()
+            except Exception:  # noqa: BLE001
+                logger.exception("写德育分失败（删除）")
+                return False
+        return True
 
     # ------------------------------------------------- 标签页 2（AI 侧写）
     def _side_store(self) -> Any:
@@ -1326,14 +2308,27 @@ class ProfilePage(QWidget):
         if not hasattr(self, "_side_text"):
             return
         text = read_side_text(self._side_store(), "", key)
-        self._side_text.setPlainText(text)
+        self._side_text_guard = True
+        try:
+            self._side_text.setPlainText(text)
+        finally:
+            self._side_text_guard = False
+        self._side_key = key or ""
         if text:
             self._side_hint.setText("侧写正文存放在本地加密文件里，只在本机可见。")
             self._ai_btn.setText("重新生成")
         else:
             self._side_hint.setText(SIDE_TEXT_EMPTY_HINT)
             self._ai_btn.setText("点击生成")
-        self._ai_btn.setEnabled(bool(key))
+        self._ai_btn.setEnabled(bool(key) and not self._side_busy)
+        if hasattr(self, "_side_delete"):
+            # 没有侧写记录时没什么可删的 → 按钮置灰（避免"点了没反应"）
+            self._side_delete.setEnabled(bool(key) and bool(text) and not self._side_busy)
+        if hasattr(self, "_side_save"):
+            # 刚读回来的正文还没改过 → 「保存」先不亮（避免"假保存"）
+            self._side_save.setEnabled(False)
+        if hasattr(self, "_side_status") and not self._side_busy:
+            self._side_status.setText("")
 
     def _student_grades(self, key: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
         return self._grade_rows(key, payload.get("archive"))
@@ -1353,11 +2348,12 @@ class ProfilePage(QWidget):
             return None
 
     def _generate_side_text(self) -> None:
-        """「AI 侧写」按钮：拼提示词 → 交给 AI 谈话助手 → 正文落加密库。
+        """「点击生成」：拼提示词 → **本机引擎流式生成** → 正文进可编辑文本框。
 
-        ★ ``ui/chat_dialog.py`` 由 C 任务并行新建：开发期它可能还不存在 /
-          还不完整，所以**必须懒 import + try/except** —— 导入期绝不能崩，
-          失败只弹一句中文提示。
+        ★ 生成走 :class:`_SideWorker`（后台线程，AGENTS §5b / §21a：主线程里
+          跑推理会把窗口冻住）。生成完**不自动落库** —— 正文先给辅导员改，
+          点「保存」才写进 :class:`core.database.ProfileStore`（任务书 5）。
+        ★ 引擎 / 模型缺失时**不静默失败**：状态行给中文原因，按钮恢复可用。
         """
         payload = self._payload
         if not payload:
@@ -1366,40 +2362,138 @@ class ProfilePage(QWidget):
         name = str(payload.get("student") or "")
         student_id = str(payload.get("student_id") or "").strip()
         key = payload.get("key") or student_key(student_id, name)
+        if not key or self._side_busy:
+            return
 
         prompt = build_side_text_prompt(
             name, student_id, key,
             self._student_grades(key, payload),
             self._student_moral(key),
         )
-
-        opener = self._chat_opener()
-        if opener is None:
-            QMessageBox.information(self, "AI 侧写", "AI 谈话助手暂不可用")
-            return
-
-        system_prompt = "你是高校辅导员的学业分析助手，回答用中文，不编造数字。"
         try:
-            result = opener(self, system_prompt=system_prompt, initial_prompt=prompt)
-        except Exception:  # noqa: BLE001 - 助手内部的异常不该把整页带崩
-            logger.exception("调用 AI 谈话助手失败")
-            QMessageBox.information(self, "AI 侧写", "AI 谈话助手暂不可用")
+            engine = self._ensure_engine()
+        except InferenceUnavailable as exc:
+            self._set_side_busy(False, f"生成失败：{exc}")
+            return
+        except Exception as exc:  # noqa: BLE001 - 兜底也要给人话
+            logger.exception("初始化侧写引擎失败")
+            self._set_side_busy(False, f"生成失败：{friendly_error(exc)}")
             return
 
-        # 助手把生成的正文直接回吐（有的实现会返回字符串）→ 立刻回写加密库。
-        text = result.get("side_text") if isinstance(result, dict) else result
-        if isinstance(text, str) and text.strip():
-            self._save_side_text(key, text)
+        self._side_key = key
+        self._set_side_busy(True, "正在生成侧写，请稍候…")
+        worker = _SideWorker(engine, prompt)
+        worker.chunk.connect(self._on_side_chunk)
+        worker.failed.connect(self._on_side_failed)
+        worker.done.connect(self._on_side_finished)
+        self._side_worker = worker
+        self._start_worker(worker)
+
+    def _on_side_text_changed(self) -> None:
+        """正文被改过 → 「保存」按钮亮起来（没改过就不亮，避免假保存）。"""
+        if getattr(self, "_side_text_guard", False) or self._side_busy:
+            return
+        button = getattr(self, "_side_save", None)
+        if button is None:
+            return
+        stored = read_side_text(self._side_store(), "", self._side_key)
+        button.setEnabled(bool(self._side_key) and self._side_text.toPlainText() != stored)
+
+    def _on_side_save_clicked(self) -> None:
+        """「保存」：把文本框里的正文写回 ``ProfileStore``。"""
+        payload = self._payload
+        if not payload:
+            return
+        key = self._side_key or payload.get("key") or ""
+        text = self._side_text.toPlainText()
+        if self._save_side_text(key, text):
+            self._set_side_busy(False, "已保存到本地加密文件。")
+
+    def _delete_side_text(self) -> None:
+        """「删除」：清空这名学生的侧写记录（确认框 → 写空串 → 刷新）。
+
+        ★ 走的是 ``ProfileStore.save_side_text(key, "")`` —— 侧写表里不留
+          "墓碑行"，读回来就是空串（:func:`read_side_text` 的既有语义）。
+        """
+        payload = self._payload or {}
+        key = self._side_key or payload.get("key") or ""
+        if not key:
+            return
+        if not self._confirm_delete():
+            return
+        if not self._save_side_text(key, ""):
+            return
+        self._set_side_busy(False, "侧写记录已删除。")
+
+    def _set_side_busy(self, busy: bool, status: str = "") -> None:
+        """生成期间：按钮置灰 + 状态行给中文提示（失败原因也从这里贴）。"""
+        self._side_busy = bool(busy)
+        has_key = bool(self._side_key or (self._payload or {}).get("key"))
+        if hasattr(self, "_ai_btn"):
+            self._ai_btn.setEnabled(has_key and not busy)
+        if hasattr(self, "_side_text"):
+            self._side_text.setReadOnly(busy)
+        if hasattr(self, "_side_status"):
+            self._side_status.setText(status)
+            self._side_status.setObjectName(
+                "Warn" if status.startswith("生成失败") else "Muted"
+            )
+            self._repolish(self._side_status)
+        if hasattr(self, "_side_save"):
+            if busy:
+                self._side_save.setEnabled(False)
+            else:
+                # 生成结束：正文已经落在框里，但还没被改过 → 走一次同一套判据
+                # （不这么做的话「保存」一直是灰的，用户会以为生成没成功）
+                self._on_side_text_changed()
+        if hasattr(self, "_side_delete"):
+            self._side_delete.setEnabled(
+                bool(has_key) and bool(self._side_text.toPlainText()) and not busy
+            )
+
+    def _on_side_chunk(self, piece: str) -> None:
+        if not piece or not self._side_busy:
+            return
+        self._side_text.moveCursor(_CURSOR_END)
+        self._side_text.insertPlainText(piece)
+        self._side_text.moveCursor(_CURSOR_END)
+
+    def _on_side_failed(self, message: str) -> None:
+        self._side_error = message or "这次生成没有成功，可以再试一次。"
+
+    def _on_side_finished(self) -> None:
+        """生成结束：收文案、把正文交给用户编辑、恢复按钮。"""
+        worker = self.sender()
+        if isinstance(worker, QThread) and worker is not self._side_worker:
+            worker.deleteLater()                 # 迟到的旧线程：什么都别动
+            return
+        self._side_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        error = self._side_error
+        self._side_error = ""
+        self._set_side_busy(False, "")
+        if error:
+            self._set_side_busy(False, f"生成失败：{error}")
+            return
+        self._side_text_guard = True
+        try:
+            self._on_side_text_changed()
+        finally:
+            self._side_text_guard = False
+        self._side_status.setText(
+            "已生成，正文可以修改；点「保存」写进本地加密文件。" if self._side_text.toPlainText()
+            else "这次生成没有拿到内容，可以再试一次。"
+        )
 
     @staticmethod
     def _chat_opener() -> Any:
-        """拿到 ``ui.chat_dialog.open_chat``；拿不到返回 ``None``（**不抛**）。"""
-        try:
-            from ui.chat_dialog import open_chat  # 懒 import：文件可能还没建
-        except Exception:  # noqa: BLE001 - 包括 ImportError / 语法错 / 缺依赖
-            logger.info("ui.chat_dialog 尚不可用，AI 侧写按钮只提示不崩")
-            return None
-        return open_chat if callable(open_chat) else None
+        """兼容层的旧钩子：**v1.9.1 起侧写不再走对话框**（改成本机引擎直出）。
+
+        留着它是为了不删调用方认得的接口（主窗 / 其它页面按名字引用过）；
+        返回值永远是 ``None`` 之外的东西就得真能调 —— 这里直接给 ``None``。
+        """
+        return None
 
     def save_side_text(self, text: str) -> None:
         """把一段侧写正文存给**当前选中的学生**（也给谈话助手回调调用）。"""
@@ -1412,19 +2506,513 @@ class ProfilePage(QWidget):
         )
         self._save_side_text(key, text)
 
-    def _save_side_text(self, key: str, text: str) -> None:
+    def _save_side_text(self, key: str, text: str) -> bool:
+        """写回 ``ProfileStore``。返回"真的存下去了没有"。"""
         store = self._side_store()
         if store is None or not key:
             QMessageBox.information(self, "AI 侧写", "侧写暂时存不进加密库（没登录？）")
-            return
+            return False
         try:
             store.save_side_text(key, text)
         except Exception:  # noqa: BLE001 - 存不进也要让用户看到刚生成的正文
             logger.exception("写侧写正文失败（%s）", key)
-            self._side_text.setPlainText(text)
+            self._side_text_guard = True
+            try:
+                self._side_text.setPlainText(text)
+            finally:
+                self._side_text_guard = False
             QMessageBox.information(self, "AI 侧写", "侧写暂时存不进加密库。")
-            return
+            return False
         self._render_side_text(key)
+        return True
+
+    # ------------------------------------------------- 标签页 3（AI 辅导）
+    def set_chat_engine(self, engine: Any) -> None:
+        """注入一个引擎（**测试用**：给了它就绝不加载真模型）。"""
+        self._chat_engine = engine
+
+    def set_chat_models(self, models: list[Any] | None) -> None:
+        """注入本地模型清单（测试用：``[]`` = 本机一个模型都没有）。
+
+        ★ 顺带把"上一次挑中的那个"清掉：清单换了，之前那个选择不再作数
+          （不清的话 :meth:`_ensure_chat_engine` 会拿着旧模型去建引擎，
+          症状是注入了 ``[]`` 却还是能跑起来）。
+        """
+        self._chat_models_given = models is not None
+        self._chat_models = list(models) if models is not None else []
+        self._chat_model = None
+
+    def _render_chat(self, key: str, student_id: str, name: str) -> None:
+        """换人 = 换一份谈话记录 + 换一份学生数据。"""
+        self._stop_chat_worker()
+        self._chat_student_id = str(student_id or "").strip()
+        if self._chat_key != key:
+            self._chat_key = key
+            self._chat_history = []
+            self._chat_view.clear()
+            self._load_chat_history()
+        self._chat_system_prompt = self._chat_system_for(key, student_id, name)
+        self._render_chat_history()
+        self._refresh_chat_availability()
+        if hasattr(self, "_chat_name"):
+            head = f"{name}（{student_id}）" if student_id else (name or "（还没选学生）")
+            self._chat_name.setText(head)
+            self._chat_avatar.setText(_initial(name) or "—")
+            self._chat_meta.setText(
+                f"学号：{student_id or '（成绩表里没写学号）'}　"
+                f"班级：{self._class_of(student_id)}"
+            )
+        if self._chat_system_prompt and hasattr(self, "_chat_system_label"):
+            self._chat_system_label.setToolTip(self._chat_system_prompt)
+
+    def _class_of(self, student_id: str) -> str:
+        """这名学生的班级号（**真源三级，都没有就写"未标注"**，绝不编一个）。
+
+        ① 成绩历史表里的 ``class_name`` —— ``GRADE_HISTORY_FIELDS`` 里**没有**
+           这一列，所以正常路径上永远落空，留着是为了"将来真加了这列就能用"；
+        ② 这份归档里这名学生自带的班级字段（``class_name`` / ``class_id``
+           / ``class`` —— 智育分析页建档案时可能带上了它）；
+        ③ **班级库**（真源）：``core.scholarship.list_classes`` 扫出来的
+           ``class_<班级号>.json.enc``，名单里有这个学号就是那个班。
+
+        ★ 三级都落空时返回「未标注」而**不是**空串：界面上要看得见"这里没有
+          班级号"，而不是一个看起来像加载失败的空白（AGENTS §4c 的同一条道理）。
+        """
+        if student_id:
+            history = self._history()
+            if history is not None:
+                try:
+                    for row in history.rows():
+                        if row.get("student_id") == student_id and row.get("class_name"):
+                            return str(row["class_name"]).strip() or "未标注"
+                except Exception:  # noqa: BLE001 - 班级只是提示信息，读不到就算了
+                    logger.exception("读班级号失败（%s）", student_id)
+
+        payload = self._payload or {}
+        archive = payload.get("archive")
+        for source in (archive, payload):
+            for name in ("class_name", "class_id", "class"):
+                value = self._class_field(source, name)
+                if value:
+                    return value
+
+        found = self._class_from_library(student_id)
+        return found or "未标注"
+
+    def _class_from_library(self, student_id: str) -> str:
+        """去**班级库**里找这个学号属于哪个班（真源：``class_*.json.enc``）。
+
+        ★ 靠 ``students`` 里的 ``student_id`` 认人（不是姓名，AGENTS §9）；
+          库读不出来就返回空串，绝不猜一个班号。
+        """
+        if not student_id or not self._username:
+            return ""
+        try:
+            records = list(list_classes(self._store, self._username))
+        except Exception:  # noqa: BLE001 - 班级库不可用不该拦住整页
+            logger.exception("读班级库失败（%s）", self._username)
+            return ""
+        wanted = {student_id, f"{KEY_PREFIX_SID}{student_id}"}
+        for record in records:
+            class_name = str(getattr(record, "class_name", "") or "").strip()
+            if not class_name:
+                continue
+            for student in getattr(record, "students", None) or ():
+                if not isinstance(student, dict):
+                    continue
+                values = {
+                    str(student.get("student_id") or "").strip(),
+                    str(student.get("key") or "").strip(),
+                }
+                if values & wanted:
+                    return class_name
+        return ""
+
+    @staticmethod
+    def _class_field(source: Any, name: str) -> str:
+        """从归档 / 快照 / 字典里抠一个班级字段（取不到就是空串）。"""
+        if source is None:
+            return ""
+        if isinstance(source, dict):
+            return str(source.get(name) or "").strip()
+        return str(getattr(source, name, "") or "").strip()
+
+    def _chat_system_for(self, key: str, student_id: str, name: str) -> str:
+        """把这名学生的数据拼成 JSON，逐字塞进系统提示词。"""
+        if not key:
+            return ""
+        payload = self._payload or {}
+        grades = self._grade_rows(key, payload.get("archive"))
+        moral = self._student_moral(key)
+        side = read_side_text(self._side_store(), student_id, key)
+        student_json = build_student_json(
+            student_id, name, self._class_of(student_id), grades, moral, side,
+        )
+        self._chat_student_json = student_json
+        return build_chat_system_prompt(student_json)
+
+    # -- 谈话记录（**只走应用级加密库**，磁盘上只有 .enc）-------------------
+    def _chat_file(self, key: str) -> str:
+        """这名学生的谈话记录文件名（``cache/chat_history_<学号>.json.enc``）。
+
+        ★ 文件名用**学号**（AGENTS §9）：``key`` 是 ``sid:<hash>`` 形状的归档键，
+          拿它当文件名人类认不出来；没有学号（比如只有姓名的老数据）才退回 key。
+        """
+        name = self._chat_student_id or key
+        return (f"{CHAT_HISTORY_DIR}{CHAT_HISTORY_PREFIX}"
+                f"{safe_student_file(name)}{CHAT_HISTORY_SUFFIX}")
+
+    def _load_chat_history(self) -> None:
+        """从加密库读回这名学生的谈话记录（读不到就是空表，不报错）。"""
+        self._chat_history = []
+        if not self._username or not self._chat_key:
+            return
+        try:
+            from core.user_store import load_user_json
+
+            payload = load_user_json(
+                self._store, self._username, self._chat_file(self._chat_key), None
+            )
+        except Exception:  # noqa: BLE001 - 便利数据，读不出来就当没有
+            logger.exception("读谈话记录失败（%s）", self._chat_key)
+            return
+        if not isinstance(payload, dict):
+            return
+        turns = payload.get("turns")
+        if not isinstance(turns, list):
+            return
+        for turn in turns:
+            if not isinstance(turn, dict):
+                continue
+            text = str(turn.get("text") or "").strip()
+            if not text:
+                continue
+            role = (CHAT_ROLE_ASSISTANT if str(turn.get("role") or "") == CHAT_ROLE_ASSISTANT
+                    else CHAT_ROLE_USER)
+            self._chat_history.append({
+                "role": role,
+                "text": text,
+                "time": str(turn.get("time") or ""),
+            })
+
+    def _save_chat_history(self) -> bool:
+        """把谈话记录加密落盘。返回"真的写下去了没有"。"""
+        if not self._username or not self._chat_key:
+            return False
+        try:
+            from core.user_store import save_user_json
+
+            save_user_json(
+                self._store, self._username, self._chat_file(self._chat_key),
+                {"schema": CHAT_HISTORY_SCHEMA, "turns": self._chat_history},
+            )
+        except Exception:  # noqa: BLE001 - 存不下不该打断谈话
+            logger.exception("写谈话记录失败（%s）", self._chat_key)
+            return False
+        return True
+
+    def _remember_chat(self, role: str, text: str) -> None:
+        self._chat_history.append({
+            "role": role,
+            "text": text,
+            "time": _clock_now(),
+        })
+
+    def _render_chat_history(self) -> None:
+        """把记录画进只读框（**纯文本，不带任何 Markdown 记号**）。"""
+        self._chat_view.clear()
+        for turn in self._chat_history:
+            speaker = "辅导员" if turn.get("role") == CHAT_ROLE_USER else "你"
+            clock = turn.get("time") or ""
+            stamp = f"（{clock}）" if clock else ""
+            self._chat_view.append(f"{speaker}{stamp}：{turn.get('text', '')}")
+        self._chat_view.moveCursor(self._chat_view.textCursor().MoveOperation.End)
+
+    def _append_chat_line(self, text: str) -> None:
+        cursor = self._chat_view.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        if not self._chat_view.toPlainText().endswith("\n"):
+            cursor.insertText("\n")
+        cursor.insertText(text)
+        self._chat_view.setTextCursor(cursor)
+        self._chat_view.ensureCursorVisible()
+
+    def _append_chat_chunk(self, piece: str) -> None:
+        """流式：第一块写"你："并换行，后面的**原地续写**（每块都换行会竖成一列）。"""
+        if not piece:
+            return
+        if not self._chat_open:
+            self._chat_open = True
+            self._append_chat_line(f"你：{piece}")
+            return
+        cursor = self._chat_view.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        cursor.insertText(piece)
+        self._chat_view.setTextCursor(cursor)
+        self._chat_view.ensureCursorVisible()
+
+    # -- 可用状态（两级降级，文案都是中文）---------------------------------
+    def _refresh_chat_availability(self) -> None:
+        """刷新状态行 + 输入区状态。**一次都不弹窗。**
+
+        两级降级（任务书 2）：
+        1. ``llama-cpp-python`` 没装 → 贴 :func:`engine_available` 给的中文原因；
+        2. 引擎装好了但本机一个模型都没有 → 「请先在模型中心下载模型」。
+
+        ★ 两级**分开判、分开说** —— 混成一句会让用户去下模型，而下完模型仍然
+          跑不起来（因为引擎根本没装），那是把人往坑里带。
+        """
+        if not self._chat_key:
+            self._chat_status.setText("先在左边点一名学生，再开始谈话。")
+            self._set_chat_enabled(False)
+            return
+
+        # ★ 注入了引擎（``set_chat_engine`` / 构造参数）时**不再要求磁盘上有模型**
+        #   —— 引擎本身就是"能跑"的证明；测试注入的假引擎也没有磁盘模型。
+        injected = self._chat_engine is not None
+        if injected:
+            engine_ready, engine_reason = True, ""
+        else:
+            engine_ready, engine_reason = engine_available()
+            self._chat_engine_reason = engine_reason
+
+        if not injected and not self._chat_models_given:
+            self._scan_chat_models()
+        self._chat_model = self._first_usable_chat_model()
+
+        if engine_ready and (injected or self._chat_model is not None):
+            self._chat_status.setText("可以开始谈话（本机离线推理）。")
+            self._set_chat_enabled(True)
+            return
+
+        reasons: list[str] = []
+        if not engine_ready and engine_reason:
+            reasons.append(engine_reason)
+        if self._chat_model is None:
+            reasons.append("请先在模型中心下载模型")
+        self._chat_status.setText("　".join(reasons) or "本地推理暂时不可用。")
+        self._set_chat_enabled(False)
+
+    def _set_chat_enabled(self, enabled: bool) -> None:
+        busy = bool(self._chat_worker is not None and self._chat_worker.isRunning())
+        usable = bool(enabled) and not busy
+        if hasattr(self, "_chat_input"):
+            self._chat_input.setEnabled(usable)
+        if hasattr(self, "_chat_send"):
+            self._chat_send.setEnabled(usable)
+        missing_model = self._chat_engine is None and self._chat_model is None
+        if hasattr(self, "_model_center_btn"):
+            self._model_center_btn.setVisible(bool(missing_model) and bool(self._chat_key))
+
+    def _scan_chat_models(self) -> None:
+        """扫磁盘上真的装好了的模型（拿不到清单就是空表，不报错）。"""
+        try:
+            self._chat_models = list(list_local_models())
+        except Exception:  # noqa: BLE001 - 清单坏了不该让这一页打不开
+            logger.exception("扫描本地模型失败")
+            self._chat_models = []
+
+    def _first_usable_chat_model(self) -> Any:
+        """挑一个能用的本地模型（先用"轻松/勉强"档的，一个都没有就退回第一个）。"""
+        choices = [model for model in self._chat_models if getattr(model, "usable", True)]
+        if not choices and self._chat_models:
+            choices = list(self._chat_models)
+        return choices[0] if choices else None
+
+    def _ensure_engine(self) -> Any:
+        """「临时要一个引擎」的取法：**注入的优先**，没有才去磁盘找模型 / 建实例。
+
+        ★ 侧写那条链用它，不直接用 :meth:`_ensure_chat_engine`：注入了引擎
+          （测试的假引擎）时不该被"本机一个模型都没下载"卡住 —— 那会让
+          「AI 侧写」在没有模型的机器上永远生不出正文。
+        """
+        if self._chat_engine is not None:
+            return self._chat_engine
+        return self._ensure_chat_engine()
+
+    def _ensure_chat_engine(self) -> Any:
+        """拿到这次要用的引擎（注入的优先，否则按选中的模型建一个常驻实例）。"""
+        if self._chat_engine is not None:
+            return self._chat_engine
+        if self._chat_model is None:
+            if not self._chat_models_given:
+                self._scan_chat_models()
+            self._chat_model = self._first_usable_chat_model()
+            if self._chat_model is None:
+                raise InferenceUnavailable("请先在模型中心下载模型")
+        available, reason = engine_available()
+        if not available:
+            raise InferenceUnavailable(reason)
+        path = getattr(self._chat_model, "path", None)
+        try:
+            module = _load_chat_worker()
+            self._chat_engine = module.LocalModelEngine(path)
+        except InferenceUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 界面模块缺失等
+            logger.exception("初始化本地推理引擎失败")
+            raise InferenceUnavailable(friendly_error(exc)) from exc
+        return self._chat_engine
+
+    # -- 发送 / 流式 ---------------------------------------------------------
+    def _on_chat_send_clicked(self) -> None:
+        text = self._chat_input.text().strip()
+        if not text:
+            return
+        self._chat_input.clear()
+        self.send_chat(text)
+
+    def send_chat(self, text: str) -> bool:
+        """把一段文字当辅导员的话发出去，并在**后台线程**里开始生成。"""
+        text = (text or "").strip()
+        if not text or not self._chat_key:
+            return False
+        if self._chat_worker is not None and self._chat_worker.isRunning():
+            self._chat_status.setText("上一条还在回答，等它写完再来。")
+            return False
+        if not self._chat_input.isEnabled():
+            return False
+        try:
+            engine = self._ensure_engine()
+        except InferenceUnavailable as exc:
+            self._chat_status.setText(str(exc))
+            return False
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("初始化本地推理引擎失败")
+            self._chat_status.setText(friendly_error(exc))
+            return False
+
+        self._remember_chat(CHAT_ROLE_USER, text)
+        self._append_chat_line(f"辅导员：{text}")
+        prompt = build_chat_prompt(
+            self._chat_system_prompt or "", self._chat_history
+        )
+
+        self._chat_answer = ""
+        self._chat_open = False
+        self._chat_error = ""
+        self._chat_status.setText("正在生成，请稍候…")
+        self._set_chat_enabled(False)
+
+        worker = _PageChatWorker(engine, prompt, stop=CHAT_STOP_WORDS)
+        worker.chunk.connect(self._on_chat_chunk)
+        worker.failed.connect(self._on_chat_failed)
+        worker.done.connect(self._on_chat_finished)
+        self._chat_worker = worker
+        self._start_worker(worker)
+        return True
+
+    @staticmethod
+    def _start_worker(worker: Any) -> None:
+        """启动后台线程。
+
+        ★ 测试把它换掉就**同步跑**（不发线程、不加载模型、不碰事件循环）——
+          进程里没有真线程，就不会有"跑完的 QThread 被回收"那类事故（§4k）。
+        """
+        worker.start()
+
+    def _on_chat_chunk(self, piece: str) -> None:
+        if self._chat_worker is None:
+            return
+        self._chat_answer += piece
+        self._append_chat_chunk(piece)
+
+    def _on_chat_failed(self, message: str) -> None:
+        # ★ 中文人话由 ``_ChatWorker`` 翻好（它已经过了 ``friendly_error``）
+        self._chat_error = message or "这次生成没有成功，可以再试一次。"
+
+    def _on_chat_finished(self) -> None:
+        """生成结束：记下回答、写盘、恢复输入区。"""
+        sent = self.sender()
+        if sent is not None and sent is not self._chat_worker:
+            if isinstance(sent, QThread):
+                sent.deleteLater()               # 上一轮迟到的收尾回调
+            return
+        current = self._chat_worker
+        self._chat_worker = None
+        if current is not None:
+            # 线程自己攒的那一份最完整（排队的 chunk 信号可能还没派发到主线程）
+            answer = str(getattr(current, "answer", "") or "").strip()
+            if not answer:
+                answer = self._chat_answer.strip()
+            if answer:
+                self._remember_chat(CHAT_ROLE_ASSISTANT, answer)
+            current.deleteLater()
+
+        self._chat_answer = ""
+        self._save_chat_history()
+        # ★ 先刷新可用性（把输入区按引擎/模型现状摆正），**再**贴失败原因 ——
+        #   反过来的话"可以开始谈话"会把刚写上去的中文原因当场抹掉（症状：
+        #   引擎明明报了错，状态行却是一片祥和）。
+        self._refresh_chat_availability()
+        if self._chat_error:
+            self._chat_status.setText(self._chat_error)
+            self._chat_error = ""
+        if self._chat_input.isEnabled():
+            self._chat_input.setFocus()
+
+    def _stop_chat_worker(self, wait_ms: int = 3000) -> None:
+        """停掉还在跑的生成。
+
+        ★ 等不到**也不许销毁它** —— 一个还在运行的 ``QThread`` 被回收会让进程
+          直接消失（AGENTS §4k 同族）：交给模块级集合留着，跑完自动移除。
+        """
+        worker = self._chat_worker
+        self._chat_worker = None
+        if worker is None:
+            return
+        cancel = getattr(worker, "cancel", None)
+        if callable(cancel):
+            cancel()
+        if not worker.isRunning() or worker.wait(wait_ms):
+            worker.deleteLater()
+            return
+        _LIVE_WORKERS.add(worker)
+
+        def _drop() -> None:
+            _LIVE_WORKERS.discard(worker)
+
+        worker.finished.connect(_drop)
+
+    # -- 模型中心（懒 import + try/except）----------------------------------
+    def _open_model_center(self) -> None:
+        """打开模型中心。拿不到就用中文提示兜底，**绝不抛异常**。
+
+        ★ 懒 import 用的是 ``import ui.model_center_dialog as module`` 再取属性
+          （不是 ``from ... import open_model_center``）：这样测试能把
+          ``module.open_model_center`` 换成桩，**不必真的开模态窗**
+          —— 无头环境里一个真模态窗会把测试挂死（AGENTS §32 的教训）。
+        """
+        try:
+            from ui import model_center_dialog as module
+        except Exception:  # noqa: BLE001 - 包括 ImportError / 语法错 / 缺依赖
+            logger.exception("加载模型中心失败")
+            self._chat_status.setText("模型中心暂时打不开，请看日志。")
+            return
+        try:
+            module.open_model_center(self)
+        except Exception:  # noqa: BLE001 - 中心自己的异常不该把这一页带崩
+            logger.exception("打开模型中心失败")
+            self._chat_status.setText("模型中心暂时打不开，请看日志。")
+            return
+        # 回来之后重新扫一遍本地模型（用户可能刚下好一个）
+        if not self._chat_models_given:
+            self._scan_chat_models()
+        self._chat_model = None
+        self._refresh_chat_availability()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        """关页：停掉还在跑的生成、放开引擎占的内存（1~3 GB）。"""
+        self._stop_chat_worker()
+        engine = self._chat_engine
+        self._chat_engine = None
+        unload = getattr(engine, "unload", None)
+        if callable(unload):
+            try:
+                unload()
+            except Exception:  # noqa: BLE001 - 释放失败不该拦住关窗
+                logger.exception("释放本地推理引擎失败")
+        super().closeEvent(event)
 
     def _compute_rescues(self, payload: dict[str, Any]) -> list[tuple[str, float, float, float]]:
         """算出"提至 85 能拉多少"。
