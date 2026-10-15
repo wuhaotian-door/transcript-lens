@@ -1,25 +1,26 @@
-"""「模型中心」对话框 —— 一个窗口看全清单、勾选、串行下载。
+"""「模型中心」对话框 —— 卡片流：一个窗口看全清单、点选、按顺序下载。
 
 这个对话框回答四个问题：
 
 1. **有哪些模型能用** —— 从 Gitee 上的清单（``update/ai_models.json``）取，
    再补上"本机已经有、清单里没写"的那些；
 2. **哪些这台机器跑得动** —— 两套判据，**别搞混**（``AGENTS.md`` 第 31 节）：
-   内存闸门（只看 ``minRamGb``）不够的行没有 ``ItemIsEnabled``、整行不可选；
-   负载指示（内存 + 显存，三档「轻松 / 勉强 / 困难」）只决定默认勾不勾、
-   以及「困难」时下载按钮是否置灰；
+   内存闸门（只看 ``minRamGb``）不够的卡片**点不动**；
+   负载指示（内存 + 显存，三档「轻松 / 勉强 / 困难」）决定初始选中谁、
+   以及卡片右下角那个彩色圆点的颜色；「困难」的卡片同样**点不动**
+   （见下面 ★ 「困难」卡片不响应选中 那一段）；
 3. **下到哪儿、下完算不算数** —— 落到 ``models/<id>/<文件>.gguf``，
    下完校大小和 SHA256，过了才记账；
-4. **怎么把它弄走** —— 已装的行有「卸载」按钮（删目录 + 记账），
-   下载两条命都失败的行有「复制链接」兜底。
+4. **怎么把它弄走** —— 已装的卡片右下角有「卸载」小按钮（删目录 + 记账），
+   下载两条命都失败的那张卡片有一个「复制链接」兜底。
 
 ★ 绝不自动下载
 ============
 
 ``AGENTS.md`` 的规矩：任何一次下载都必须由用户**明确点过**。
 所以这里没有"打开就开始下"的路径 —— 打开对话框只读一个几 KB 的清单
-（只读 GET，不碰模型文件），真正下载要用户先勾、再点「下载选中」、
-再在确认框里点"是"。三道手，缺一不可。
+（只读 GET，不碰模型文件），真正下载要用户先点卡片选中、再点底部的
+「下载选中（N）」、再在确认框里点"是"。三道手，缺一不可。
 
 ★ 为什么下载在后台线程里
 ======================
@@ -30,21 +31,46 @@
 进度通过 :class:`_ProgressRelay` 的信号回到主线程，
 校验（要读完整个文件算哈希）同样不在主线程做。
 
-★ 失败之后怎么办（B5）
-===================
+★ v1.9.1：六列表格 → 卡片流
+==========================
 
-自动**重试 1 次**（``download_exe`` 的 ``resume=True`` 会接着 ``.part``
-往下下，不会从头再来）→ 还是失败就把那一行标红、写明原因，
-并在该行的操作列放一个「复制链接」：把直链送进剪贴板，提示用户
-"请浏览器下载后放入 models/ 目录"。网络的事谁也说不准，
-但至少别让人卡在一个只能重试的按钮上。
+排版：``QScrollArea`` + 一个 ``QGridLayout`` 容器，卡片按**固定列数**排
+（:data:`GRID_COLUMNS`），每张卡片的宽度由视线宽度平均分。**没有引入任何新库**
+（不用 QML / QtQuick，纯 PySide6 控件）。
+
+**选中**是卡片级的：点一下卡片切换选中，选中的卡片边框变成 2px 的
+:data:`SELECTED_BORDER_COLOR`；卡片**内部没有下载按钮**，下载统一走底部那个
+「下载选中（N）」—— N 就是当前选中的张数，按**卡片在界面上的顺序**依次下。
+
+★★ 一个 widget 只有一个 ``graphicsEffect``（``AGENTS.md`` 4a / 4b）
+=================================================================
+
+卡片挂了阴影（:class:`QGraphicsDropShadowEffect`）之后**绝不能再挂**
+``QGraphicsOpacityEffect`` —— 两个效果抢的是同一个槽位，后挂的那个会把阴影顶掉；
+更糟的是 ``QGraphicsOpacityEffect`` 会缓存源 pixmap，之后卡片内部增删控件
+（下载完重画、状态文案变化）就会画出一块空白。
+
+所以「困难」卡片要的"整体透明度降低"**不用效果实现**，改用
+**调色板 + 样式表**（:meth:`ModelCard._refresh_visuals`：字号照旧、
+文字与背景一起淡化）。这条有 :func:`_assert_no_opacity_effect` 兜底 ——
+它是个**运行时**闸门，不是只写在注释里的约定。
+
+★ 「困难」卡片**不响应选中**（v1.9.1 施工单）
+==========================================
+
+``ModelChoice.runnable`` 在数据层写的是"困难只是不预勾、下载按钮置灰"，
+v1.9.1 的施工单把界面这一侧收得更紧：**困难卡片点了也不选中**
+（:meth:`ModelCard.can_select` 里那一条 ``not self._hard()``），
+底部「下载选中（N）」自然也就数不到它，鼠标悬浮给一句
+:data:`HARD_LOAD_TOOLTIP`。这条是**界面的**决定，数据层一个字没改。
 
 ★ 界面文案一律纯文本（B4）
 ========================
 
-负载那一列是**彩色圆点 + 中文**（``●`` 字符 + ``color``，圆点用 QSS 的
-``border-radius``）—— **不用 emoji**（``AGENTS.md`` 4l：开屏标题里一个
-emoji 值 241.7ms；而且 emoji 在不同机器上字形差别很大）。
+负载那一格是**彩色圆点 + 中文**（圆点用 QSS 的 ``border-radius`` 磨圆）
+—— **不用 emoji**（``AGENTS.md`` 4l：开屏标题里一个 emoji 值 241.7ms；
+而且 emoji 在不同机器上字形差别很大）。颜色与文案的唯一真源是
+:data:`core.ai.model_registry.LOAD_COLORS` / ``LOAD_LABELS``，这里只取用、不另抄。
 所有 ``QLabel`` / tooltip 里不许出现 ``**`` / ``__`` / 反引号（铁律 9）。
 """
 
@@ -53,25 +79,29 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtGui import QBrush, QCloseEvent, QColor
+from PySide6.QtCore import QEvent, QObject, Qt, Signal
+from PySide6.QtGui import QCloseEvent, QColor, QKeyEvent, QMouseEvent
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
+    QFrame,
+    QGraphicsDropShadowEffect,
+    QGraphicsOpacityEffect,
+    QGridLayout,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QTreeWidget,
-    QTreeWidgetItem,
+    QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
 from core.ai.model_downloader import MIN_MODEL_BYTES, delete_model, model_dir
 from core.ai.model_registry import (
+    GITEE_RAW_MODELS,
     LOAD_COLORS,
     LOAD_HARD,
     SIZE_TOLERANCE,
@@ -90,7 +120,7 @@ from core.ai.model_registry import (
 from core.updater import DownloadCancelled, download_exe, verify_checksum
 from ui.workers import run_async
 
-__all__ = ["ModelCenterDialog", "ModelVerifyError", "open_model_center"]
+__all__ = ["ModelCenterDialog", "ModelCard", "ModelVerifyError", "open_model_center"]
 
 #: 对话框标题。
 DIALOG_TITLE = "模型中心"
@@ -99,15 +129,22 @@ DIALOG_TITLE = "模型中心"
 INTRO_TEXT = (
     "模型都在这台电脑上跑，下载完就不需要联网了。"
     "下载地址来自 Gitee 上的模型清单，支持断点续传，下完会按清单里的 "
-    "SHA256 校验一遍。负载那一列是按这台电脑的内存和显存算的："
+    "SHA256 校验一遍。负载是按这台电脑的内存和显存算的："
     "轻松 = 够用，勉强 = 能跑但会慢，困难 = 可能带不动。"
+    "点一下卡片选中它，再点底部的「下载选中」。"
 )
 
-#: 失败行标红用的颜色（和分析页的警示色保持一致）。
+#: 失败卡片标红用的颜色（和分析页的警示色保持一致）。
 DANGER_COLOR = "#DC2626"
 
-#: 「困难」那一行置灰用的颜色（比正文浅一档，但仍看得清字）。
+#: 「困难」卡片置灰用的颜色（比正文浅一档，但仍看得清字）。
 MUTED_COLOR = "#9CA3AF"
+
+#: 视觉降级时卡片背景用的淡灰（**不是**透明度效果，见模块头 4a 那一段）。
+MUTED_BG_COLOR = "#F1F5F9"
+
+#: 选中卡片的高亮边框色（施工单指定）。
+SELECTED_BORDER_COLOR = "#0078D4"
 
 #: 一个模型最多尝试几次（首次 + 自动重试 1 次）。
 MAX_ATTEMPTS = 2
@@ -115,30 +152,161 @@ MAX_ATTEMPTS = 2
 #: ★ 卸载确认框的文案 —— **一个字都不许改**（施工单逐字指定）。
 UNINSTALL_CONFIRM_TEXT = "卸载后将无法使用 AI 功能，确定？"
 
-#: 「困难」那一行的下载按钮气泡。
+#: 「困难」卡片的悬浮气泡。
 HARD_LOAD_TOOLTIP = "当前电脑配置可能无法流畅运行此模型"
 
 #: 复制链接成功的提示（B5 的兜底路径就靠这一句告诉用户把文件放哪）。
 COPY_LINK_HINT = "已复制到剪贴板，请浏览器下载后放入 models/ 目录。"
 
-#: 操作列里两个按钮的宽度（``setCellWidget`` 放进去的控件**不参与**
-#: ``ResizeToContents`` —— 所以这一列必须写死宽度，``AGENTS.md`` 4c 第 2 条）。
-COPY_BUTTON_WIDTH = 88
-UNINSTALL_BUTTON_WIDTH = 72
-ACTION_COLUMN_WIDTH = 182
+#: 卡片上「复制链接」按钮的气泡（不下载任何东西，只是把直链放进剪贴板）。
+COPY_LINK_TIP = "把这个模型的下载地址复制到剪贴板，用浏览器下好以后放进 models/ 目录。"
 
-#: 表格的六个列（顺序即列下标，别手写元组 —— ``AGENTS.md`` 第 9 节第 3 条）。
-COLUMN_TITLES: tuple[str, ...] = ("名称", "大小", "适配场景", "负载", "状态", "操作")
-COLUMN_NAME = 0
-COLUMN_SIZE = 1
-COLUMN_SCENE = 2
-COLUMN_LOAD = 3
-COLUMN_STATUS = 4
-COLUMN_ACTION = 5
+#: 清单读不到时，教用户自己把这份清单下下来（界面照开，只是没有条目）。
+MANIFEST_FALLBACK_HINT = "清单读不到。可以先点「复制链接」把清单地址复制下来，用浏览器打开：" + GITEE_RAW_MODELS
+
+# ---------------------------------------------------------------------------
+# 卡片流的排版参数
+# ---------------------------------------------------------------------------
+
+#: 卡片最小宽度（比它更窄就没法读说明文字了）。
+CARD_MIN_WIDTH = 280
+
+#: 卡片最小高度。
+CARD_MIN_HEIGHT = 200
+
+#: 一行放几张卡片（施工单要的"固定列数，按宽度算"）。
+GRID_COLUMNS = 3
+
+#: 卡片之间的间距。
+CARD_SPACING = 12
+
+#: 卡片外那一圈（阴影和选中边框都在这里画）。
+CARD_FRAME_MARGIN = 6
+
+#: 卡片内容默认的内边距。
+CARD_PADDING = 12
+
+#: 悬浮时内容整体上移的像素数（施工单指定 2px）。
+HOVER_LIFT_PX = 2
+
+#: 卡片圆角。
+CARD_RADIUS = 10
+
+#: 「已安装」徽章的绿色（和 QSS 的 TagGreen 同一套语感）。
+BADGE_BG_COLOR = "#DCFCE7"
+
+#: 「已安装」徽章的文字色。
+BADGE_TEXT_COLOR = "#15803D"
+
+# 阴影三档：常态 / 悬浮（阴影"加深"）/ 视觉降级（仍然只挂阴影，绝不换效果）
+SHADOW_BLUR_IDLE = 14
+SHADOW_BLUR_HOVER = 26
+SHADOW_OFFSET_IDLE = 2
+SHADOW_OFFSET_HOVER = 6
+SHADOW_ALPHA_IDLE = 26
+SHADOW_ALPHA_HOVER = 54
+
+#: 卡片本体的样式（用内联样式表是因为 ``ui/styles.qss`` 不在本模块的写范围内，
+#: 而卡片的高亮边框要跟着选中状态来回变 —— 内联样式表改起来是一处真源）。
+#:
+#: ★ 边框宽度**只由选中状态决定**（1px ↔ 2px）：Qt 的 QSS ``border`` 不参与
+#:   布局几何计算，所以切边框不会让卡片跳位，也不会把内容顶歪。
+CARD_STYLE = f"""
+QFrame#ModelCard {{
+    background: #FFFFFF;
+    border: 1px solid #E2E8F0;
+    border-radius: {CARD_RADIUS}px;
+}}
+QFrame#ModelCard[tlSelected="true"] {{
+    border: 2px solid {SELECTED_BORDER_COLOR};
+}}
+QFrame#ModelCard[tlVisualState="muted"] {{
+    background: {MUTED_BG_COLOR};
+}}
+QLabel {{
+    background: transparent;
+    border: none;
+}}
+"""
+
+#: 「已安装」绿色徽章。
+BADGE_STYLE = (
+    f"background-color: {BADGE_BG_COLOR}; color: {BADGE_TEXT_COLOR};"
+    "border-radius: 9px; padding: 2px 10px; font-size: 12px; font-weight: 700;"
+)
+
+#: 「卸载」小按钮（文本是 ×，**不用 emoji**）。
+UNINSTALL_STYLE = (
+    "QPushButton {"
+    "background: #FFFFFF; color: #64748B;"
+    "border: 1px solid #E2E8F0; border-radius: 6px;"
+    "font-size: 13px; font-weight: 700; padding: 0;"
+    "}"
+    "QPushButton:hover { background: #FEF2F2; color: #EF4444;"
+    " border: 1px solid #FCA5A5; }"
+    "QPushButton:disabled { color: #CBD5E1; border: 1px solid #E2E8F0; }"
+)
+
+#: 卡片上那个「复制链接」兜底按钮（只在前两次下载都失败时出现）。
+COPY_LINK_STYLE = (
+    "QPushButton {"
+    "background: #FFFFFF; color: #2563EB;"
+    "border: 1px solid #BFDBFE; border-radius: 6px;"
+    "font-size: 12px; padding: 1px 10px;"
+    "}"
+    "QPushButton:hover { background: #EFF6FF; }"
+    "QPushButton:disabled { color: #CBD5E1; border: 1px solid #E2E8F0; }"
+)
 
 
 class ModelVerifyError(RuntimeError):
     """下回来的东西没通过校验（大小对不上 / SHA256 不对）。"""
+
+
+def has_opacity_effect(widget: QWidget) -> bool:
+    """``widget`` 自己身上挂着 ``QGraphicsOpacityEffect`` 吗。
+
+    只查它**自己** —— 阴影挂在卡片自己的槽位上，所以卡片有阴影**不算**冲突；
+    这条判据要抓的是"给挂了阴影的卡片又叠一层透明度"。
+    """
+    return isinstance(widget.graphicsEffect(), QGraphicsOpacityEffect)
+
+
+def _assert_no_opacity_effect(widget: QWidget) -> None:
+    """★★ 运行时闸门：挂了阴影的卡片（或它的任何子控件）**绝不许**再挂透明度效果。
+
+    ``AGENTS.md`` 4a / 4b：一个 widget 只有一个 ``graphicsEffect``；
+    阴影被透明度顶掉只是不好看，真正致命的是 ``QGraphicsOpacityEffect``
+    会缓存源 pixmap —— 卡片内部一增删控件就是一块空白（静态断言查不出来）。
+
+    所以这条不是注释里的君子协定，是**每次显示卡片时都要走一遍**的检查。
+    """
+    if has_opacity_effect(widget):
+        raise RuntimeError(
+            "模型卡片不许挂 QGraphicsOpacityEffect：一个 widget 只能有一个 "
+            "graphicsEffect，卡片已经挂了阴影（见 AGENTS.md 4a / 4b）。"
+            "需要视觉降级请走样式表 / 调色板。"
+        )
+    for child in widget.findChildren(QWidget):
+        if has_opacity_effect(child):
+            raise RuntimeError(
+                "模型卡片的子控件不许挂 QGraphicsOpacityEffect —— "
+                "会缓存源 pixmap，卡片一变就是一整块空白（AGENTS.md 4b）。"
+            )
+
+
+def make_shadow(**overrides: Any) -> QGraphicsDropShadowEffect:
+    """造一层卡片阴影。参数只为测试与悬浮态微调留口子。"""
+    blur = int(overrides.get("blur", SHADOW_BLUR_IDLE))
+    offset = int(overrides.get("offset", SHADOW_OFFSET_IDLE))
+    alpha = int(overrides.get("alpha", SHADOW_ALPHA_IDLE))
+    effect = QGraphicsDropShadowEffect()
+    effect.setBlurRadius(blur)
+    effect.setOffset(0, offset)
+    tint = QColor("#0F172A")
+    tint.setAlpha(alpha)
+    effect.setColor(tint)
+    return effect
 
 
 class _ProgressRelay(QObject):
@@ -165,14 +333,19 @@ def _size_close(actual: int, expected: int) -> bool:
     return abs(actual - expected) <= max(4096, int(expected * SIZE_TOLERANCE))
 
 
-def _target_path(model: RemoteModel) -> Path:
+def _target_path(model: RemoteModel, folder: Path | None = None) -> Path:
     """这个模型该落到哪儿：``models/<清洗过的 id>/<文件名>``。
 
     ★ 文件名必须以 ``.gguf`` 结尾 —— ``installed_models()`` 只认这个后缀，
       下回来一个 ``xxx.bin`` 在界面上等于"没装"。
       清单里的 ``file`` 来自网络，所以先取 ``Path(...).name`` 掐掉任何路径。
+
+    Args:
+        folder: 目标目录（测试注入临时目录用）；``None`` = 走
+            :func:`core.ai.model_downloader.model_dir` 的默认位置。
     """
-    folder = model_dir(model.id)
+    if folder is None:
+        folder = model_dir(model.id)
     name = Path(model.file or "").name
     if not name.lower().endswith(".gguf"):
         stem = "".join(
@@ -224,8 +397,423 @@ def _verify(model: RemoteModel, path: Path) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# 卡片
+# ---------------------------------------------------------------------------
+
+
+class ModelCard(QFrame):
+    """一张模型卡片。
+
+    结构（从外到内）::
+
+        ModelCard（QFrame：挂阴影 + 画边框，**唯一的 graphicsEffect 槽位**）
+        └── self.content（QWidget：承载全部内容；悬浮时改它的
+                           contentsMargins 把内容整体上移 2px）
+
+    ★ 为什么上移要改 ``content`` 的边距、而不是 ``move()`` 整个卡片：
+      ``move()`` 改的是卡片在**父容器**里的位置，会让 QGridLayout 里的卡片
+      跳一下（施工单点名不许跳位）；改内层容器的上边距只动**卡片内部**的几何，
+      卡片自己的位置和尺寸一个像素都不变。上下边距一减一加，总和不变，
+      所以 ``sizeHint()`` 也不变 —— 连"卡片被自己的 hover 撑高"都不会发生。
+    """
+
+    def __init__(self, dialog: "ModelCenterDialog", choice: ModelChoice) -> None:
+        super().__init__(dialog)
+        self._dialog = dialog
+        self._choice = choice
+
+        self.setObjectName("ModelCard")
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setMinimumSize(CARD_MIN_WIDTH, CARD_MIN_HEIGHT)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setStyleSheet(CARD_STYLE)
+        # ★ 动态属性一律带 tl 前缀（AGENTS.md 4f）：``selected`` / ``visualState``
+        #   这种名字有和 QWidget 自带可读属性撞车的风险 —— 撞上了 setProperty
+        #   会**静默失败**（不抛异常、返回 False），QSS 里那条 [xxx="true"]
+        #   选择器就永远匹配不上：样式没生效，日志干净。写进去之后一律读回来确认。
+        self.setProperty("tlSelected", "false")
+        self.setProperty("tlVisualState", "normal")
+
+        self._selected = False
+        self._built_installed = False
+
+        # ★ 唯一的 graphicsEffect：阴影。全程只有这一个效果，
+        #   绝不在这里 setGraphicsEffect(QGraphicsOpacityEffect())。
+        self.shadow = make_shadow()
+        self.setGraphicsEffect(self.shadow)
+
+        outer = QVBoxLayout(self)
+        # 边框画在卡片自己身上，这圈边距是留给阴影和 2px 高亮边框的。
+        outer.setContentsMargins(
+            CARD_FRAME_MARGIN, CARD_FRAME_MARGIN, CARD_FRAME_MARGIN, CARD_FRAME_MARGIN
+        )
+        outer.setSpacing(0)
+
+        self.content = QWidget(self)
+        self.content.setObjectName("ModelCardContent")
+        self.content.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        outer.addWidget(self.content)
+
+        self._build_content()
+        # 常态：内容不偏移（悬浮时才上移 HOVER_LIFT_PX）
+        self._set_content_margin(0)
+
+    # ------------------------------------------------------------------
+    # 内容
+    # ------------------------------------------------------------------
+
+    def _build_content(self) -> None:
+        model = self._choice.model
+
+        layout = QGridLayout(self.content)
+        layout.setContentsMargins(CARD_PADDING, CARD_PADDING, CARD_PADDING, CARD_PADDING)
+        layout.setVerticalSpacing(6)
+        layout.setHorizontalSpacing(8)
+        layout.setColumnStretch(0, 1)
+
+        # 第一行：模型名称（大号粗体）。换行的 label 必须给宽度约束，
+        # 否则它会把窗口越撑越宽（AGENTS.md 4c 第 1 条）。
+        self.name_label = QLabel(model.display, self.content)
+        self.name_label.setWordWrap(True)
+        self.name_label.setMinimumWidth(160)
+        self.name_label.setStyleSheet("font-size: 15px; font-weight: 700; color: #1F2430;")
+        layout.addWidget(self.name_label, 0, 0, 1, 2)
+
+        # 第二行：大小 + 负载指示
+        size_label = QLabel(model.size_text or "未知大小", self.content)
+        size_label.setObjectName("Muted")
+        layout.addWidget(size_label, 1, 0)
+
+        load_holder = QWidget(self.content)
+        load_layout = QHBoxLayout(load_holder)
+        load_layout.setContentsMargins(0, 0, 0, 0)
+        load_layout.setSpacing(6)
+        # ★ 颜色与文案都取 ModelChoice 上的那三个 property（它们的真源是
+        #   core.ai.model_registry 的 LOAD_COLORS / LOAD_LABELS），
+        #   这里**不自己抄一份表**、也不自己判等级。
+        color = self._choice.load_color
+        # ★ 彩色圆点：一个 10x10 的小方块 + border-radius 磨成圆。
+        #   不用 "●" 字符、更不用 emoji（4l：一个 emoji 值 241.7ms）。
+        self.load_dot = QLabel("", load_holder)
+        self.load_dot.setFixedSize(10, 10)
+        self.load_dot.setStyleSheet(
+            f"background-color: {color}; border-radius: 5px; border: none;"
+        )
+        # ★ 文案取 LOAD_LABELS（唯一真源），不在这里手写「轻松 / 勉强 / 困难」。
+        self.load_text = QLabel(self._choice.load_text, load_holder)
+        self.load_text.setStyleSheet(f"color: {color}; border: none;")
+        load_layout.addWidget(self.load_dot)
+        load_layout.addWidget(self.load_text)
+        load_layout.addStretch(1)
+        load_holder.setToolTip(self._load_tooltip())
+        self.load_holder = load_holder
+        # 整张卡片都能悬浮出气泡（施工单：困难卡片要"鼠标悬浮气泡"）
+        self.setToolTip(self._card_tooltip())
+        layout.addWidget(load_holder, 1, 1)
+
+        # 第三行：清单里的 note（推荐信息）
+        note = QLabel(model.note or "清单里没有写这条的说明。", self.content)
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        note.setMinimumWidth(160)
+        note.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        layout.addWidget(note, 2, 0, 1, 2)
+        self.note_label = note
+
+        # 第四行：状态 + 已安装徽章 + 卸载小按钮
+        self.status_label = QLabel("", self.content)
+        self.status_label.setWordWrap(True)
+        self.status_label.setMinimumWidth(80)
+        layout.addWidget(self.status_label, 3, 0)
+
+        bottom = QWidget(self.content)
+        bottom_layout = QHBoxLayout(bottom)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.setSpacing(6)
+
+        self.badge = QLabel("已安装", bottom)
+        self.badge.setStyleSheet(BADGE_STYLE)
+        self.badge.setToolTip("这个模型的 .gguf 文件已经在硬盘上了。")
+        bottom_layout.addWidget(self.badge)
+
+        # 「复制链接」是**失败兜底**，只在下载两次都没成的那张卡片上出现
+        # （施工单 B5：重试 1 次仍失败 → 复制链接）。卡片内部只有这一个按钮
+        # 跟下载有关，而且它不下载任何东西 —— 只是把直链放进剪贴板。
+        self.copy_btn = QPushButton("复制链接", bottom)
+        self.copy_btn.setMinimumHeight(22)
+        self.copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.copy_btn.setStyleSheet(COPY_LINK_STYLE)
+        self.copy_btn.setToolTip(COPY_LINK_TIP)
+        self.copy_btn.clicked.connect(
+            lambda _checked=False: self._dialog._on_copy_link(self._choice.model.id)
+        )
+        bottom_layout.addWidget(self.copy_btn)
+
+        self.uninstall_btn = QPushButton("×", bottom)
+        self.uninstall_btn.setFixedSize(22, 22)
+        self.uninstall_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.uninstall_btn.setStyleSheet(UNINSTALL_STYLE)
+        self.uninstall_btn.setToolTip(
+            "把已经下好的模型文件从硬盘上删掉，需要时可以重新下载。"
+        )
+        self.uninstall_btn.clicked.connect(
+            lambda _checked=False: self._dialog._on_uninstall(self._choice.model.id)
+        )
+        bottom_layout.addWidget(self.uninstall_btn)
+        layout.addWidget(bottom, 3, 1)
+
+        layout.setRowStretch(2, 1)
+
+    def _set_content_margin(self, lift: int) -> None:
+        """设置内容容器的内边距（悬浮上移就靠它）。
+
+        ★ 上下边距**一减一加**（上 -2 / 下 +2），总和恒定 —— 卡片的
+          ``sizeHint()`` 因此不变，QGridLayout 不会重排、卡片不会跳位。
+        ★ 改的是 ``content`` 这个**内层容器**的边距，不是卡片的 ``move()``：
+          移动卡片会改变它在父布局里的位置（施工单点名不许跳位）。
+        """
+        base = CARD_PADDING - CARD_FRAME_MARGIN
+        self.content.setContentsMargins(
+            CARD_PADDING, base - lift, CARD_PADDING, base + lift
+        )
+
+    # ------------------------------------------------------------------
+    # 气泡文案
+    # ------------------------------------------------------------------
+
+    def _load_tooltip(self) -> str:
+        note = self._choice.load_note or ""
+        text = self._choice.load_text
+        return f"{text}：{note}" if note else text
+
+    def _card_tooltip(self) -> str:
+        """整张卡片的气泡：清单说明 +（困难时）那句"可能带不动"。
+
+        ★ 「困难」的那一句必须是 :data:`HARD_LOAD_TOOLTIP` 原文 ——
+          施工单要求鼠标悬浮就看见它（测试按原文断言）。清单里的说明
+          拼在它前面，不替换它。
+        """
+        parts = [self._choice.model.note] if self._choice.model.note else []
+        if self._hard():
+            parts.append(HARD_LOAD_TOOLTIP)
+        return "；".join(parts)
+
+    # ------------------------------------------------------------------
+    # 状态
+    # ------------------------------------------------------------------
+
+    @property
+    def model_id(self) -> str:
+        return self._choice.model.id
+
+    @property
+    def choice(self) -> ModelChoice:
+        return self._choice
+
+    @property
+    def selected(self) -> bool:
+        return self._selected
+
+    def _hard(self) -> bool:
+        """负载判成「困难」：**不响应选中**（施工单 LOAD_HARD 那一条）。"""
+        return self._choice.load_level == LOAD_HARD
+
+    def can_select(self) -> bool:
+        """这张卡片能不能被选中。
+
+        三个条件：内存闸门过了（``selectable``）、有下载地址、负载不是「困难」。
+        ★ 内存闸门不过的卡片仍然显示（用户得知道有这个东西、为什么不能用），
+          只是点不动 —— 和表格版的行没有 ``ItemIsEnabled`` 是同一个语义。
+        """
+        return bool(
+            self._choice.selectable
+            and self._choice.model.url
+            and not self._hard()
+        )
+
+    def _is_installed(self) -> bool:
+        return self._choice.state == STATE_INSTALLED
+
+    def set_selected(self, selected: bool) -> bool:
+        """切换选中态。不可选的卡片**拒绝**（返回 ``False``，状态不变）。"""
+        want = bool(selected) and self.can_select()
+        if want == self._selected:
+            self._refresh_style()
+            return self._selected
+        self._selected = want
+        self._refresh_style()
+        return self._selected
+
+    def toggle_selected(self) -> bool:
+        return self.set_selected(not self._selected)
+
+    def refresh(self) -> None:
+        """按当前 :class:`ModelChoice` 重画这一张卡片（不改选中态）。"""
+        self._refresh_installed()
+        self._refresh_visuals()
+        self._refresh_status()
+
+    def _refresh_installed(self) -> None:
+        installed = self._is_installed()
+        self._built_installed = installed
+        self.badge.setVisible(installed)
+        self.uninstall_btn.setVisible(installed)
+        self.uninstall_btn.setEnabled(installed and not self._dialog._busy)
+
+    def _refresh_visuals(self) -> None:
+        """视觉降级：用**样式表 / 调色板**，绝不用 ``QGraphicsOpacityEffect``。
+
+        「困难」和「内存不够」的卡片整体淡化一档：背景转成淡灰、名称与说明
+        转成 :data:`MUTED_COLOR`（状态那一行本来就是浅灰）。字都还在、
+        位置也没变，只是"看起来用不了"。
+
+        ★ 负载圆点与中文**不跟着变灰** —— 那一格说的就是"为什么用不了"，
+          把它一起淡化会让用户看不出原因（红点 / 琥珀点留着更有信息量）。
+        """
+        muted = self._hard() or not self._choice.selectable
+        if muted:
+            self.name_label.setStyleSheet(
+                f"font-size: 15px; font-weight: 700; color: {MUTED_COLOR};"
+            )
+            self.note_label.setStyleSheet(f"color: {MUTED_COLOR};")
+            self.content.setStyleSheet(f"background: {MUTED_BG_COLOR};")
+        else:
+            self.name_label.setStyleSheet(
+                "font-size: 15px; font-weight: 700; color: #1F2430;"
+            )
+            self.note_label.setStyleSheet("")
+            self.content.setStyleSheet("")
+        self.setProperty("tlVisualState", "muted" if muted else "normal")
+        self._refresh_style()
+
+    def _refresh_status(self) -> None:
+        """状态那一行：失败原因优先（标红），否则显示安装状态。
+
+        ★ 「复制链接」按钮的去留**和这一行同源**：只有下载失败的那张卡片
+          才长出它（施工单 B5 的兜底路径）。没地址的条目不给 —— 复制一个
+          空串没有任何意义。
+        """
+        reason = self._dialog._failure_reason(self.model_id)
+        if reason:
+            self.status_label.setText(f"下载失败：{reason}")
+            self.status_label.setStyleSheet(
+                f"color: {DANGER_COLOR}; font-size: 12px;"
+            )
+            self.status_label.setToolTip(reason)
+            self.copy_btn.setVisible(bool(self._choice.model.url))
+            return
+        text = self._choice.status_text or ""
+        if text == STATE_INSTALLED:
+            # 安装状态由右下角的徽章说，状态行不必重复一遍。
+            text = ""
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(
+            f"color: {MUTED_COLOR}; font-size: 12px;"
+        )
+        self.status_label.setToolTip(text)
+        self.copy_btn.setVisible(False)
+
+    def _refresh_style(self) -> None:
+        """把动态属性落成样式表。
+
+        ★ Qt 的 QSS 属性选择器（``[tlSelected="true"]``）**不会**因为
+          ``setProperty`` 自动重新求值 —— 必须 ``style().unpolish/polish``
+          走一遍，否则改了属性界面纹丝不动（``AGENTS.md`` 4f 的同一类坑）。
+        ★ 属性名带 ``tl`` 前缀、写完读回来确认，并且先用 ``indexOfProperty``
+          确认这个名字**不是** Qt 已经声明过的静态属性 —— 那种情况
+          ``setProperty`` 是**静默失败**（不抛异常、不生效），
+          指望它生效等于把"边框不会高亮"这种事留给截图去发现（§4f）。
+          ⚠️ 判据不能看 ``setProperty()`` 的返回值：Qt 官方写明它
+          "returns false if the property is not declared as a Q_PROPERTY and
+          is not a dynamic property" —— **全新**的动态属性第一次写也返回
+          False，拿它当失败信号会把每一张卡片都误杀。
+        """
+        name = "tlSelected"
+        want = "true" if self._selected else "false"
+        if self.metaObject().indexOfProperty(name) >= 0:
+            raise RuntimeError(  # pragma: no cover - 名字撞车才会走到
+                f"ModelCard: 动态属性名 {name} 和 Qt 自带的静态属性撞车了 —— "
+                "换一个名字，否则样式表选择器永远匹配不上"
+            )
+        self.setProperty(name, want)
+        current = self.property(name)
+        if current != want:  # pragma: no cover - 只有撞车才会走到
+            raise RuntimeError(
+                f"ModelCard: 动态属性 {name} 写进去又读不回来（读到 {current!r}）"
+            )
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    # ------------------------------------------------------------------
+    # 悬浮
+    # ------------------------------------------------------------------
+
+    def enterEvent(self, event: QEvent) -> None:  # noqa: N802 - Qt 命名
+        """进入：内容上移 :data:`HOVER_LIFT_PX`，阴影加深。**不动卡片几何。**"""
+        self._set_hover(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event: QEvent) -> None:  # noqa: N802 - Qt 命名
+        self._set_hover(False)
+        super().leaveEvent(event)
+
+    def _set_hover(self, hover: bool) -> None:
+        self._set_content_margin(HOVER_LIFT_PX if hover else 0)
+        self.shadow.setBlurRadius(
+            SHADOW_BLUR_HOVER if hover else SHADOW_BLUR_IDLE
+        )
+        self.shadow.setOffset(
+            0, SHADOW_OFFSET_HOVER if hover else SHADOW_OFFSET_IDLE
+        )
+        tint = QColor("#0F172A")
+        tint.setAlpha(SHADOW_ALPHA_HOVER if hover else SHADOW_ALPHA_IDLE)
+        self.shadow.setColor(tint)
+
+    # ------------------------------------------------------------------
+    # 点击
+    # ------------------------------------------------------------------
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt 命名
+        """单击切换选中。
+
+        ★ 事件过滤器（:meth:`ModelCenterDialog.eventFilter`）把**子控件**上的
+          点击也转发到这里 —— 不然点在名称 / 说明这些 ``QLabel`` 上时，
+          事件根本到不了卡片自己（它们是卡片的子控件）。
+        """
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dialog._on_card_clicked(self)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802 - Qt 命名
+        """空格 / 回车也能切选中。
+
+        ★ 卡片是 ``StrongFocus`` 的可聚焦控件，键盘用户按空格必须有反应 ——
+          只做鼠标的话，这个界面在键盘下就是一块点不动的画。
+        """
+        if event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._dialog._on_card_clicked(self)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    # ------------------------------------------------------------------
+    # 闸门
+    # ------------------------------------------------------------------
+
+    def showEvent(self, event: QEvent) -> None:  # noqa: N802 - Qt 命名
+        """每次显示都过一遍"没有透明度效果"的运行时闸门（4a / 4b）。"""
+        _assert_no_opacity_effect(self)
+        super().showEvent(event)
+
+
 class ModelCenterDialog(QDialog):
-    """模型中心：看清单、挑模型、串行下载。
+    """模型中心：卡片流看清单、点选卡片、按顺序下载。
 
     调用方一般直接用 :func:`open_model_center`，不用自己 new。
 
@@ -236,33 +824,36 @@ class ModelCenterDialog(QDialog):
 
     downloadFinished = Signal(list)
 
-    #: 列表的六列（= :data:`COLUMN_TITLES`，保留这个类属性只是为了兼容老写法）。
-    COLUMNS = COLUMN_TITLES
-
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(DIALOG_TITLE)
         self.setModal(True)
-        self.resize(980, 600)
+        self.resize(1040, 660)
 
         #: 清单里的全部模型（含"本机已有"补进来的那些）
         self._models: list[RemoteModel] = []
         #: 上面那批合成出来的界面条目
         self._choices: list[ModelChoice] = []
-        #: 用户勾上的 id / 在列表里出现过的 id（用来在刷新后保住用户的选择）
+        #: 用户选中的 id / 在界面上出现过的 id（用来在重画后保住用户的选择）
         self._checked_ids: set[str] = set()
         self._seen_ids: set[str] = set()
         #: 这一轮真正装好的 id —— 调用方读 :attr:`downloaded`
         self._downloaded: list[str] = []
+
+        #: ``{模型 id: 卡片}`` 与界面上卡片的**顺序**（下载按这个顺序来）
+        self._card_map: dict[str, ModelCard] = {}
+        self._card_order: list[ModelCard] = []
+        #: 筛选后的组，供 :meth:`_iter_cards` / 分组标题复现用
+        self._groups: list[tuple[str, list[ModelChoice]]] = []
+
+        #: 「复制链接」在这张卡片上点过之后的兜底目标（清单读不到时用得上）
+        self._link_target_id = ""
 
         #: 本机配置的读数，只探一次（``system_info.snapshot()`` 自己也带缓存）。
         #: ``None`` 表示"还没探过"，和"探过但没读到"用 :attr:`_machine_read` 区分。
         self._machine_ram: float | None = None
         self._machine_vram: float | None = None
         self._machine_read = False
-
-        #: 每行的操作列控件：``{模型 id: [按钮, ...]}`` —— 忙的时候一起禁用。
-        self._row_buttons: dict[str, list[QWidget]] = {}
 
         self._busy = False
         self._populating = False
@@ -300,27 +891,26 @@ class ModelCenterDialog(QDialog):
         intro.setWordWrap(True)
         outer.addWidget(intro)
 
-        self._tree = QTreeWidget()
-        self._tree.setColumnCount(len(COLUMN_TITLES))
-        self._tree.setHeaderLabels(list(COLUMN_TITLES))
-        self._tree.setUniformRowHeights(True)
-        self._tree.setAlternatingRowColors(True)
-        self._tree.setRootIsDecorated(True)
-        header = self._tree.header()
-        # 名称吃掉剩下的宽度；大小 / 适配场景 / 负载 / 状态按内容收紧。
-        header.setSectionResizeMode(COLUMN_NAME, QHeaderView.ResizeMode.Stretch)
-        for column in (COLUMN_SIZE, COLUMN_SCENE, COLUMN_LOAD, COLUMN_STATUS):
-            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
-        # ★ 操作列必须写死宽度：列里放的是 setCellWidget 进去的按钮，
-        #   ResizeToContents 不会把它们算进来（AGENTS.md 4c 第 2 条），
-        #   不写死的话按钮会被裁掉半个字。
-        # ★ 还要先关掉 setStretchLastSection —— QHeaderView 默认就是开着它的，
-        #   最后一列会被强行拉到填满视口，Fixed 模式和 setColumnWidth 全被它盖掉。
-        header.setStretchLastSection(False)
-        header.setSectionResizeMode(COLUMN_ACTION, QHeaderView.ResizeMode.Fixed)
-        self._tree.setColumnWidth(COLUMN_ACTION, ACTION_COLUMN_WIDTH)
-        self._tree.itemChanged.connect(self._on_item_changed)
-        outer.addWidget(self._tree, 1)
+        # ---- 卡片流：QScrollArea + QGridLayout -------------------------
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+
+        self._grid_host = QWidget()
+        self._grid_host.setObjectName("ModelCardHost")
+        # 卡片自己的背景由 CARD_STYLE 画；容器保持透明（见 ui/styles.qss 开头）。
+        self._grid_host.setStyleSheet("background: transparent;")
+        self._grid = QGridLayout(self._grid_host)
+        self._grid.setContentsMargins(2, 2, 2, 12)
+        self._grid.setSpacing(CARD_SPACING)
+        for column in range(GRID_COLUMNS):
+            self._grid.setColumnStretch(column, 1)
+        self._grid.setRowStretch(0, 1)
+        self._scroll.setWidget(self._grid_host)
+        outer.addWidget(self._scroll, 1)
 
         self._plan = QLabel("")
         self._plan.setObjectName("Muted")
@@ -348,16 +938,21 @@ class ModelCenterDialog(QDialog):
         self._refresh_btn.setMinimumWidth(110)
         self._refresh_btn.clicked.connect(self._load_manifest)
 
-        self._download_btn = QPushButton("下载选中")
+        # ★ 页面底部统一一个下载按钮：卡片内部**没有**下载按钮。
+        self._download_btn = QPushButton(self._download_button_text(0))
         self._download_btn.setObjectName("Primary")
         self._download_btn.setMinimumHeight(36)
-        self._download_btn.setMinimumWidth(130)
+        self._download_btn.setMinimumWidth(150)
+        self._download_btn.setEnabled(False)
         self._download_btn.clicked.connect(self._on_download)
 
         self._copy_btn = QPushButton("复制链接")
         self._copy_btn.setObjectName("Ghost")
         self._copy_btn.setMinimumHeight(36)
         self._copy_btn.setMinimumWidth(110)
+        self._copy_btn.setToolTip(
+            "把选中的卡片（没有选中时用清单地址）的下载地址复制到剪贴板。"
+        )
         self._copy_btn.clicked.connect(self._on_copy_link)
 
         self._close_btn = QPushButton("关闭")
@@ -373,17 +968,30 @@ class ModelCenterDialog(QDialog):
         row.addWidget(self._close_btn)
         outer.addLayout(row)
 
+        self._placeholder: QLabel | None = None
+
+    @staticmethod
+    def _download_button_text(count: int) -> str:
+        """底部按钮的文案。``count > 0`` 时带上张数（施工单：下载选中（N））。"""
+        if count <= 0:
+            return "下载选中"
+        return f"下载选中（{count}）"
+
     # ------------------------------------------------------------------
     # 本机配置（只探一次）
     # ------------------------------------------------------------------
 
-    def _machine_kwargs(self) -> dict[str, float | None]:
+    def _machine_kwargs(self) -> dict[str, Any]:
         """本机内存 / 显存，**整个对话框只探一次**。
 
-        ★ 为什么要把读数记下来、而不是每次重建列表都让
+        ★ 为什么要把读数记下来、而不是每次重画卡片都让
           :func:`build_choices` 自己探：同一台机器的读数在一轮会话里看不出变化，
           探两次只会让"刚才还轻松、刷新一下变困难"这种事有机会发生
           （``nvidia-smi`` 抽一下就是 ``None``）。探一次、存下来、两次共用。
+        ★ 顺带把 ``dest_dir`` 也带上（:meth:`models_root`）：**对话框自己**
+          调 ``build_choices`` / ``merged_with_local`` 一律走这里 —— 少传一次
+          ``dest_dir``，那一次读的就是默认用户目录（``%LOCALAPPDATA%\\SGMS\\models``），
+          于是"本机已有"那条会用真实机器上的文件冒充结果，测试桩也拦不住。
         """
         if not self._machine_read:
             # ★ 用和 core.ai.model_registry 同一个真源（core.system_info），
@@ -398,7 +1006,11 @@ class ModelCenterDialog(QDialog):
                 self._machine_ram = getattr(info, "total_ram_gb", None)
                 self._machine_vram = getattr(info, "max_vram_gb", None)
             self._machine_read = True
-        return {"ram_gb": self._machine_ram, "vram_gb": self._machine_vram}
+        return {
+            "ram_gb": self._machine_ram,
+            "vram_gb": self._machine_vram,
+            "dest_dir": self.models_root,
+        }
 
     # ------------------------------------------------------------------
     # 取清单
@@ -425,7 +1037,7 @@ class ModelCenterDialog(QDialog):
             self._status.setText("清单的返回格式不对，这次没读成。")
             return
 
-        self._models = merged_with_local(models)
+        self._models = merged_with_local(models, dest_dir=self.models_root)
         self._choices = build_choices(self._models, **self._machine_kwargs())
         self._populate()
 
@@ -434,270 +1046,242 @@ class ModelCenterDialog(QDialog):
             text = f"{status} 有 {len(warnings)} 条没能用上：" + " ".join(warnings[:5])
             if len(warnings) > 5:
                 text += f"（还有 {len(warnings) - 5} 条同类的）"
+        if not self._choices:
+            # 清单拉取失败的兜底：界面照开，给一句能自己动手的话。
+            text = f"{text} {MANIFEST_FALLBACK_HINT}"
+            self._show_placeholder()
         self._status.setText(text)
 
     def _on_manifest_error(self, exc: BaseException) -> None:
         self._refresh_btn.setEnabled(True)
-        self._status.setText(f"读取清单失败：{type(exc).__name__}，稍后再试。")
+        self._status.setText(
+            f"读取清单失败：{type(exc).__name__}，稍后再试。{MANIFEST_FALLBACK_HINT}"
+        )
+        self._link_target_id = ""
 
     # ------------------------------------------------------------------
-    # 画列表
+    # 画卡片流
     # ------------------------------------------------------------------
 
     def _populate(self) -> None:
-        """按分组重画整棵树。"""
+        """按分组重画整个卡片流。"""
         self._populating = True
         try:
-            self._tree.clear()
-            self._row_buttons.clear()
-            for group_name, items in group_choices(self._choices):
-                top = QTreeWidgetItem([group_name, "", "", "", "", ""])
-                top.setFirstColumnSpanned(True)
-                # 组名只是个标题，别让用户选中它
-                top.setFlags(top.flags() & ~Qt.ItemFlag.ItemIsSelectable)
-                font = top.font(0)
-                font.setBold(True)
-                top.setFont(0, font)
-                self._tree.addTopLevelItem(top)
-
-                for choice in items:
-                    self._append_row(top, choice)
+            self._clear_cards()
+            groups = group_choices(self._choices)
+            self._groups = groups
+            if not groups:
+                self._add_placeholder()
+            else:
+                for group_name, items in groups:
+                    self._add_group(group_name)
+                    for choice in items:
+                        self._add_card(choice)
         finally:
             self._populating = False
 
         self._seen_ids |= {choice.model.id for choice in self._choices}
-        self._sync_checked()
-        self._apply_failure_marks()
+        self._enforce_all_states()
+        # ★ 把"这一轮真正选中的"记回 _checked_ids：重画（清单刷新 / 那次迟到的
+        #   后台回调落地）重建卡片时 _wants_selected 先看 _checked_ids，不看就
+        #   全丢 —— 用户选中的几张会被**静默清空**，界面上看不出任何异常
+        #   （实测就踩到了；判据 test_重画之后选中不会丢）。
+        self._checked_ids |= {card.model_id for card in self._card_order if card.selected}
         self._update_plan()
 
-    def _load_widget(self, choice: ModelChoice) -> QWidget:
-        """负载那一格：一个彩色圆点 + 中文等级（**不用 emoji**）。
+    def _clear_cards(self) -> None:
+        while self._grid.count():
+            item = self._grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        self._card_map.clear()
+        self._card_order.clear()
+        self._placeholder = None
+        # 行号自己数（QGridLayout 不会自动回收空行）
+        self._grid_row = 0
 
-        ★ 圆点用 QSS 的 ``border-radius`` 把一个 10x10 的小方块磨成圆，
-          不用 ``●`` 字符、更不用 emoji —— 一个 emoji 要现场做彩色字形合成
-          （``AGENTS.md`` 4l 实测 241.7ms），而且不同机器上图 shape 差得远。
+    def _add_placeholder(self) -> None:
+        """一条条目都没有时的占位（清单读不到 / 清单是空的）。"""
+        label = QLabel(MANIFEST_FALLBACK_HINT)
+        label.setObjectName("Muted")
+        label.setWordWrap(True)
+        label.setMinimumWidth(240)
+        self._grid.addWidget(label, self._grid_row, 0, 1, GRID_COLUMNS)
+        # ★ 占位也要占掉一行 —— 不然下一次 _clear_cards 之后的卡片会排到
+        #   这行文字上面，两张东西叠在一起。
+        self._grid_row += 1
+        self._placeholder = label
+
+    def _show_placeholder(self) -> None:
+        """清单没读成 / 是空的：把兜底提示**放进卡片流**里再说一遍。
+
+        ★ 为什么要放第二处：状态行在窗口最底下，一屏十来张卡片的时候
+          用户根本看不到它。清单读不到时卡片流是空的 —— 那句话必须出现在
+          用户正在看的那个位置。
         """
-        holder = QWidget()
-        layout = QHBoxLayout(holder)
-        layout.setContentsMargins(4, 0, 4, 0)
-        layout.setSpacing(6)
+        if self._placeholder is None and not self._card_order:
+            self._add_placeholder()
 
-        color = LOAD_COLORS.get(choice.load_level, MUTED_COLOR)
-        dot = QLabel("")
-        dot.setFixedSize(10, 10)
-        dot.setStyleSheet(
-            f"background-color: {color}; border-radius: 5px; border: none;"
+    def _add_group(self, title: str) -> None:
+        """组标题栏 + 一条分隔线（``group`` 的真实取值见 ``update/ai_models.json``：
+        「推荐」/「高级」，运行期还会多一个「本机已有」）。"""
+        if self._grid_row > 0:
+            # 第一组上面不要空出一截；后面的组各留一行间距。
+            spacer = QWidget()
+            spacer.setFixedHeight(CARD_SPACING)
+            self._grid.addWidget(spacer, self._grid_row, 0, 1, GRID_COLUMNS)
+            self._grid_row += 1
+
+        header = QWidget()
+        header.setObjectName("ModelGroupHeader")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(2, 0, 2, 0)
+        header_layout.setSpacing(8)
+
+        label = QLabel(title)
+        label.setStyleSheet(
+            "font-size: 14px; font-weight: 700; color: #334155; border: none;"
         )
+        header_layout.addWidget(label)
 
-        text = QLabel(choice.load_text)
-        text.setStyleSheet(f"color: {color}; border: none;")
+        # 组间那条分隔线：从标题右侧一直拉到卡片流的右边缘。
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFixedHeight(1)
+        line.setStyleSheet("background: #E2E8F0; border: none;")
+        header_layout.addWidget(line, 1)
+        self._grid.addWidget(header, self._grid_row, 0, 1, GRID_COLUMNS)
+        self._grid_row += 1
 
-        layout.addWidget(dot)
-        layout.addWidget(text)
-        layout.addStretch(1)
-        holder.setToolTip(choice.load_note)
-        return holder
+    def _add_card(self, choice: ModelChoice) -> None:
+        card = ModelCard(self, choice)
+        model_id = choice.model.id
 
-    def _action_widget(self, choice: ModelChoice) -> QWidget:
-        """操作那一格。
+        # 选中态：出现过的听用户的（_checked_ids），第一次出现的听清单的。
+        # ★ 走 set_selected() 而不是直接写 _selected —— 它自带 can_select() 闸门，
+        #   「困难」/ 内存不够的卡片即使清单说默认选中也进不来。
+        card.set_selected(self._wants_selected(choice))
 
-        三条规则各管各的，**别混**：
+        # ★ 子控件也要挂事件过滤器：点在名称 / 说明这些 QLabel 上时，
+        #   事件到不了卡片自己，必须由对话框转发（见 eventFilter）。
+        self._watch_children(card)
 
-        * **还没装** → 「下载」：只下这一条（不必先去左边打勾）。
-          这一档也是「困难」的落点 —— 负载判成困难时这个按钮
-          ``setEnabled(False)`` + :data:`HARD_LOAD_TOOLTIP`；
-          内存闸门没过（整行没有 ``ItemIsEnabled``）时同样置灰，
-          但气泡说的是内存那句。
+        # 卡片按固定列数排；组标题各占一整行，所以行号自己数最稳
+        # （别用 self._grid.count()，那里面还混着标题和占位行）。
+        index = len(self._card_order)
+        if index and index % GRID_COLUMNS == 0:
+            self._grid_row += 1
+        self._grid.addWidget(card, self._grid_row, index % GRID_COLUMNS)
+        self._card_map[model_id] = card
+        self._card_order.append(card)
 
-        ★ **两条判断的先后是有讲究的**：「困难」是"内存也不够"的**子集** ——
-          困难要求 ``内存 < minRamGb × RAM_TIGHT_RATIO``，而内存闸门要求
-          ``内存 ≥ minRamGb``，所以困难的行一定同时没过内存闸门（见
-          :func:`core.ai.model_registry._load_level_of`）。既然两条都成立，
-          先判谁就决定了用户看到哪一句。任务书点名困难行要显示
-          :data:`HARD_LOAD_TOOLTIP`，所以 **困难先判**；
-          「勉强但内存不够」（``0.7 × minRamGb ≤ 内存 < minRamGb``）那一档
-          仍然拿内存那句 —— 那才是真正拦住它的原因。
-        * **已装** → 「卸载」：删 ``models/<id>/`` 再销账（B2）。
-        * **下载两次都失败** → 「复制链接」：把直链送进剪贴板，让用户自己下（B5）。
-          （顶部那个「复制链接」按钮是同一个动作的"按选中行"版本。）
+    def _watch_children(self, card: ModelCard) -> None:
+        card.installEventFilter(self)
+        for child in card.findChildren(QWidget):
+            child.installEventFilter(self)
 
-        ★ 按钮宽度一律写死：``setCellWidget`` 放进去的控件不参与
-          ``ResizeToContents``，不写死就会被裁掉半个字（``AGENTS.md`` 4c 第 2 条）。
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802 - Qt 命名
+        """把卡片（含其子控件）上的左键点击转发给卡片。
+
+        ★ 为什么非要过滤器：卡片的内容全是 ``QLabel`` —— 它们是卡片的**子控件**，
+          鼠标点在它们身上时事件不会冒泡到父控件，卡片自己的 ``mousePressEvent``
+          根本不会被调用（``AGENTS.md`` 4h：挂在鼠标上的逻辑必须真走一遍鼠标）。
         """
-        model = choice.model
-        holder = QWidget()
-        layout = QHBoxLayout(holder)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        if (
+            event.type() == QEvent.Type.MouseButtonPress
+            and isinstance(obj, QWidget)
+        ):
+            card = self._card_of(obj)
+            if card is not None and isinstance(event, QMouseEvent):
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self._on_card_clicked(card)
+                    return True
+        return super().eventFilter(obj, event)
 
-        buttons: list[QWidget] = []
-        installed = choice.state == STATE_INSTALLED
-        failed = model.id in dict(self._failures)
+    def _card_of(self, widget: QWidget) -> ModelCard | None:
+        node: QWidget | None = widget
+        while node is not None:
+            if isinstance(node, ModelCard):
+                return node
+            parent = node.parentWidget()
+            node = parent
+        return None
 
-        if not installed and model.url:
-            download = QPushButton("下载")
-            download.setObjectName("Ghost")
-            download.setMinimumHeight(26)
-            download.setFixedWidth(UNINSTALL_BUTTON_WIDTH)
-            if choice.load_level == LOAD_HARD:
-                download.setEnabled(False)
-                download.setToolTip(HARD_LOAD_TOOLTIP)
-            elif not choice.selectable:
-                download.setEnabled(False)
-                download.setToolTip(choice.memory_note or "这台电脑的内存不够跑这个模型。")
-            else:
-                download.setToolTip("只下载这一条模型。")
-            download.clicked.connect(
-                lambda _checked=False, mid=model.id: self._on_row_download(mid)
-            )
-            layout.addWidget(download)
-            buttons.append(download)
+    # ------------------------------------------------------------------
+    # 选中
+    # ------------------------------------------------------------------
 
-        if installed and model.url:
-            uninstall = QPushButton("卸载")
-            uninstall.setObjectName("Ghost")
-            uninstall.setMinimumHeight(26)
-            uninstall.setFixedWidth(UNINSTALL_BUTTON_WIDTH)
-            uninstall.setToolTip(
-                "把已经下好的模型文件从硬盘上删掉，需要时可以重新下载。"
-            )
-            uninstall.clicked.connect(
-                lambda _checked=False, mid=model.id: self._on_uninstall(mid)
-            )
-            layout.addWidget(uninstall)
-            buttons.append(uninstall)
-
-        if failed and model.url:
-            copy = QPushButton("复制链接")
-            copy.setObjectName("Ghost")
-            copy.setMinimumHeight(26)
-            copy.setFixedWidth(COPY_BUTTON_WIDTH)
-            copy.setToolTip("把这一条的下载地址复制到剪贴板，自己用浏览器下载。")
-            copy.clicked.connect(
-                lambda _checked=False, mid=model.id: self._on_copy_link(mid)
-            )
-            layout.addWidget(copy)
-            buttons.append(copy)
-
-        layout.addStretch(1)
-        if buttons:
-            self._row_buttons[model.id] = buttons
-            holder.setMinimumHeight(
-                max(btn.minimumSizeHint().height() for btn in buttons) + 8
-            )
-            if self._busy:
-                for button in buttons:
-                    button.setEnabled(False)
-        return holder
-
-    def _append_row(self, top: QTreeWidgetItem, choice: ModelChoice) -> None:
-        model = choice.model
-        row = QTreeWidgetItem(
-            [
-                model.display,
-                model.size_text,
-                choice.load_note,
-                "",
-                choice.status_text,
-                "",
-            ]
-        )
-        # ★ id 存在 UserRole 里，绝不靠显示文字反查 —— 显示文字是可以随便改的
-        row.setData(COLUMN_NAME, Qt.ItemDataRole.UserRole, model.id)
-
-        flags = Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable
-        if choice.selectable and model.url:
-            flags |= Qt.ItemFlag.ItemIsEnabled
-        # 内存不够 / 没有下载地址的行去掉 ItemIsEnabled：
-        # 它还是看得见（用户得知道有这个东西、为什么不能用），但勾不动。
-        # ★ 这一条只看 minRamGb（内存闸门），和"负载"那三档是两套判据。
-        row.setFlags(flags)
-
-        # 名称那一格的悬停提示：清单里的说明 + （困难时）再补一句
-        # "这台机器可能带不动"。两个都是纯文本，不许 Markdown 记号。
-        name_parts = [model.note] if model.note else []
-        if model.url and choice.load_level == LOAD_HARD:
-            name_parts.append(HARD_LOAD_TOOLTIP)
-        if name_parts:
-            row.setToolTip(COLUMN_NAME, "；".join(name_parts))
-
-        if model.url:
-            row.setToolTip(COLUMN_SCENE, choice.load_note)
-            row.setToolTip(
-                COLUMN_LOAD,
-                f"{choice.load_text}：{choice.load_note}"
-                if choice.load_note
-                else choice.load_text,
-            )
-        if self._checked_now(choice):
-            row.setCheckState(COLUMN_NAME, Qt.CheckState.Checked)
-        else:
-            row.setCheckState(COLUMN_NAME, Qt.CheckState.Unchecked)
-        top.addChild(row)
-        tree = top.treeWidget()
-        tree.setItemWidget(row, COLUMN_LOAD, self._load_widget(choice))
-        tree.setItemWidget(row, COLUMN_ACTION, self._action_widget(choice))
-
-    def _checked_now(self, choice: ModelChoice) -> bool:
-        """这一行此刻该不该处于勾选状态。
+    def _wants_selected(self, choice: ModelChoice) -> bool:
+        """这张卡片此刻该不该处于选中状态。
 
         ★ 已经出现过的模型听用户的（``_checked_ids``），
-          第一次出现的新模型听清单的（``choice.checked``）——
-          不然"刷新清单"会把用户刚取消的勾又打回来。
+          第一次出现的新模型听清单的（``choice.checked``，= 负载「轻松」）——
+          不然"刷新清单"会把用户刚取消的选中又打回来。
         """
         if choice.model.id in self._seen_ids:
             return choice.model.id in self._checked_ids
         return bool(choice.checked)
 
-    def _iter_rows(self) -> Iterator[QTreeWidgetItem]:
-        for index in range(self._tree.topLevelItemCount()):
-            top = self._tree.topLevelItem(index)
-            for child_index in range(top.childCount()):
-                yield top.child(child_index)
+    def selected_ids(self) -> list[str]:
+        """当前选中的模型 id（按卡片在界面上的顺序，只读副本）。"""
+        return [c.model_id for c in self._card_order if c.selected]
 
-    def _on_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
-        if self._populating or column != COLUMN_NAME:
+    def _on_card_clicked(self, card: ModelCard) -> None:
+        """卡片被点了一下。"""
+        if self._busy or self._populating:
             return
-        model_id = str(item.data(COLUMN_NAME, Qt.ItemDataRole.UserRole) or "")
-        if not model_id:
+        if not card.can_select():
+            # 「困难」/ 内存不够的卡片**不响应选中**（施工单 LOAD_HARD 那一条）。
+            self._status.setText(
+                f"{card.choice.model.display}："
+                f"{card.choice.memory_note or HARD_LOAD_TOOLTIP}"
+            )
             return
-        if item.checkState(COLUMN_NAME) == Qt.CheckState.Checked:
+        now = card.toggle_selected()
+        model_id = card.model_id
+        if now:
             self._checked_ids.add(model_id)
         else:
             self._checked_ids.discard(model_id)
-        self._sync_checked()
         self._update_plan()
 
-    def _sync_checked(self) -> None:
-        """把树上的勾选状态写回 :attr:`_choices`，好让计划文案跟着变。"""
-        states: dict[str, bool] = {}
-        for row in self._iter_rows():
-            model_id = str(row.data(COLUMN_NAME, Qt.ItemDataRole.UserRole) or "")
-            if model_id:
-                states[model_id] = (
-                    row.checkState(COLUMN_NAME) == Qt.CheckState.Checked
-                )
-        for choice in self._choices:
-            if choice.model.id in states:
-                choice.checked = states[choice.model.id]
+    def _enforce_all_states(self) -> None:
+        """把每张卡片的安装态 / 视觉降级 / 选中闸门过一遍。"""
+        for card in self._card_order:
+            card.refresh()
+            if card.selected and not card.can_select():
+                card.set_selected(False)
+        self._checked_ids &= {c.model_id for c in self._card_order if c.selected}
 
-    def _apply_failure_marks(self) -> None:
-        """把上一轮失败的行标红 + 写明原因（重画之后要重新标）。"""
-        reasons = dict(self._failures)
-        if not reasons:
-            return
-        brush = QBrush(QColor(DANGER_COLOR))
-        for row in self._iter_rows():
-            model_id = str(row.data(COLUMN_NAME, Qt.ItemDataRole.UserRole) or "")
-            if model_id in reasons:
-                row.setText(COLUMN_STATUS, f"下载失败：{reasons[model_id]}")
-                row.setForeground(COLUMN_STATUS, brush)
-                row.setToolTip(COLUMN_STATUS, reasons[model_id])
+    def _iter_cards(self) -> Iterator[ModelCard]:
+        """按界面顺序遍历卡片（测试与内部逻辑都用它，别去摸 ``_grid``）。"""
+        return iter(list(self._card_order))
+
+    def _check_mutable(self, choice: ModelChoice, selected: bool) -> None:
+        """把选中写回 ``choice``。
+
+        ★ 只为还读 ``choice.checked`` 的老代码留的兼容路径（``describe_download_plan``
+          就是一个）—— 卡片流的唯一真源是卡片自己的 ``selected``。
+        """
+        try:  # pragma: no cover - 正常路径永远进得来
+            choice.checked = bool(selected)
+        except Exception:  # pragma: no cover - 只读实现就当没这回事
+            pass
 
     def _update_plan(self) -> None:
-        if self._busy:
-            return
-        self._plan.setText(describe_download_plan(self._choices))
+        """刷新底部按钮的张数与计划文案。"""
+        selected = [c for c in self._card_order if c.selected]
+        self._download_btn.setText(self._download_button_text(len(selected)))
+        self._download_btn.setEnabled(bool(selected) and not self._busy)
+        for choice in self._choices:
+            self._check_mutable(choice, choice.model.id in set(self.selected_ids()))
+        if not self._busy:
+            self._plan.setText(describe_download_plan(self._choices))
+
+    def _failure_reason(self, model_id: str) -> str:
+        return dict(self._failures).get(model_id, "")
 
     def _title_of(self, model_id: str) -> str:
         for choice in self._choices:
@@ -714,9 +1298,40 @@ class ModelCenterDialog(QDialog):
 
         卸载完 / 下载完都走这儿 —— **一次真源是磁盘**：
         ``build_choices`` 会重新调 ``installed_state()``，谁在谁不在以文件为准。
+
+        ★ ``dest_dir`` 走 :meth:`models_root`（``model_dir`` 那一个真源）：
+          不传的话这里读的是默认用户目录，测试里桩掉 ``model_dir`` 就不管用了
+          —— 那会让"卸载完卡片上的徽章没掉"这类 bug 溜过去。
         """
-        self._choices = build_choices(self._models, **self._machine_kwargs())
+        self._choices = build_choices(
+            self._models, dest_dir=self.models_root, **self._machine_kwargs()
+        )
         self._populate()
+
+    @property
+    def models_root(self) -> Path:
+        """模型装在哪个目录下（唯一真源：``model_dir`` 的默认值）。
+
+        ★ 用 ``model_dir(".").parent`` 反推，而不是自己再写一遍
+          ``default_root() / "models"`` —— 第二个实现迟早和第一个不一致。
+          点和点号都会被 :func:`core.ai.model_downloader._safe_name` 换成
+          ``model``，所以这里丢掉那一段、只留它的父目录。
+        ★ 万一 ``model_dir(".")`` 直接就是目录本身（测试把 ``model_dir``
+          整个换成了 ``tmp/"models" / name`` 的假函数，它不做名字清洗），
+          那就原样用它 —— 硬砍一层会把模型目录指到人家的 ``tmp_path`` 根上。
+        """
+        override = getattr(self, "_tl_models_dir", None)
+        if override is not None:
+            return Path(override)
+        base = Path(model_dir("."))
+        if base == Path(".") or base.name in ("", "."):
+            return base
+        return base.parent
+
+    def _apply_failure_marks(self) -> None:
+        """把上一轮失败的卡片标红 + 写明原因（重画之后要重新标）。"""
+        for card in self._card_order:
+            card._refresh_status()
 
     # ------------------------------------------------------------------
     # 复制链接（B5 的兜底路径）
@@ -726,19 +1341,18 @@ class ModelCenterDialog(QDialog):
         """把某一条的下载地址复制到剪贴板。
 
         Args:
-            model_id: 要复制哪一条；留空表示"用列表里选中的那一行"
-                （顶部那个「复制链接」按钮就是这么调的）。
+            model_id: 要复制哪一条；留空表示"用选中的卡片，没有就复制清单地址"
+                （底部那个「复制链接」按钮就是这么调的）。
         """
         if not model_id:
-            item = self._tree.currentItem()
-            model_id = (
-                str(item.data(COLUMN_NAME, Qt.ItemDataRole.UserRole) or "")
-                if item is not None
-                else ""
-            )
+            selected = self.selected_ids()
+            model_id = selected[0] if selected else self._link_target_id
         if not model_id:
             QMessageBox.information(
-                self, "先选一行", "先在列表里点一行模型，再点「复制链接」。"
+                self,
+                "先选一张卡片",
+                "先点一下要下载的卡片，再点「复制链接」。"
+                "清单读不到时，这里会复制清单本身的地址。",
             )
             return
         model = next(
@@ -796,7 +1410,7 @@ class ModelCenterDialog(QDialog):
 
         removed = delete_model(model.id)
         if removed:
-            forget_installed(model.id)
+            forget_installed(model.id, dest_dir=self.models_root)
             self._checked_ids.discard(model.id)
             self._status.setText(f"已卸载 {model.display}。")
         else:
@@ -814,29 +1428,34 @@ class ModelCenterDialog(QDialog):
     def _on_download(self) -> None:
         if self._busy:
             return
-        self._sync_checked()
+        self._enforce_all_states()
         picked = [
-            c for c in self._choices if c.checked and c.model.url and c.runnable
+            c
+            for c in self._card_order
+            if c.selected and c.choice.model.url and c.choice.runnable
         ]
         blocked = [
-            c for c in self._choices if c.checked and c.model.url and not c.runnable
+            c
+            for c in self._card_order
+            if c.selected and c.choice.model.url and not c.choice.runnable
         ]
         if not picked:
             QMessageBox.information(
                 self,
                 "还没选模型",
-                "还没有勾选任何能下载的模型。先在列表里勾上要下载的，再点「下载选中」。",
+                "还没有选中任何能下载的模型。先点一下卡片选中它，"
+                "再点「下载选中」。",
             )
             return
 
-        todo = [c for c in picked if c.state != STATE_INSTALLED]
-        already = [c for c in picked if c.state == STATE_INSTALLED]
+        todo = [c for c in picked if c.choice.state != STATE_INSTALLED]
+        already = [c for c in picked if c.choice.state == STATE_INSTALLED]
 
-        lines = [f"{describe_download_plan(picked)}。"]
+        lines = [f"{describe_download_plan([c.choice for c in picked])}。"]
         if blocked:
-            names = "、".join(c.model.display for c in blocked[:3])
+            names = "、".join(c.choice.model.display for c in blocked[:3])
             lines.append(
-                f"另外勾了 {len(blocked)} 个这台电脑跑不动的（{names}），这次会跳过。"
+                f"另外选中了 {len(blocked)} 个这台电脑跑不动的（{names}），这次会跳过。"
             )
         if already:
             lines.append(f"其中 {len(already)} 个已经装好了，这次会跳过。")
@@ -850,8 +1469,9 @@ class ModelCenterDialog(QDialog):
 
         self._downloaded = []
         self._failures = []
-        self._skipped = [c.model.id for c in already]
-        self._queue = list(todo)
+        self._skipped = [c.choice.model.id for c in already]
+        # ★ 按卡片在界面上的顺序下载（施工单：按顺序下载全部选中项）。
+        self._queue = [c.choice for c in todo]
         self._queue_index = 0
         self._cancel = False
 
@@ -865,78 +1485,19 @@ class ModelCenterDialog(QDialog):
         self._progress.setValue(0)
         self._next_in_queue()
 
-    def _on_row_download(self, model_id: str) -> None:
-        """操作列那个「下载」按钮：只下这一条。
-
-        ★ 这里是"逐行下载"的入口，所以负载判成「困难」时**不靠按钮置灰兜底就算完**：
-          用户完全可能用键盘（Tab + 空格）摸到这个按钮，或者旧版本留下的
-          ``_failures`` 让按钮又活过来。真正的闸门放在这句判断里 ——
-          置灰只是提示，拦得住的是这一段。
-
-        ★ 「困难」先判（和 :meth:`_action_widget` 里的气泡同一个顺序）：
-          困难的行一定同时没过内存闸门，两条都成立时先说的那句才是用户看到的。
-        """
-        if self._busy:
-            return
-        choice = next((c for c in self._choices if c.model.id == model_id), None)
-        if choice is None or not choice.model.url:
-            return
-        if choice.load_level == LOAD_HARD:
-            QMessageBox.information(
-                self,
-                "这台电脑可能带不动",
-                f"{choice.model.display}：{choice.load_note}。"
-                "真要下也可以用下面的「下载选中」，但很可能跑不流畅。",
-            )
-            return
-        if not choice.selectable:
-            QMessageBox.information(
-                self,
-                "这台电脑跑不动",
-                f"{choice.model.display} 需要 {choice.model.min_ram_gb:g} GB 内存，"
-                "这台电脑的内存不够，先别下了。",
-            )
-            return
-
-        # 只下这一条：把别的勾全部取消、只留这一条，再走同一条确认 + 队列流程。
-        # ★ 直接改复选框、不走 _checked_ids —— 让 _on_item_changed 自己去同步，
-        #   否则 _on_download 里的 _sync_checked() 会用旧状态把它盖回去。
-        for other in self._iter_rows():
-            other_id = str(other.data(COLUMN_NAME, Qt.ItemDataRole.UserRole) or "")
-            state = (
-                Qt.CheckState.Checked
-                if other_id == model_id
-                else Qt.CheckState.Unchecked
-            )
-            other.setCheckState(COLUMN_NAME, state)
-        self._on_download()
-
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         self._refresh_btn.setEnabled(not busy)
-        self._download_btn.setEnabled(not busy)
         self._copy_btn.setEnabled(not busy)
-        # 每行操作列里的按钮跟着一起禁用：下载中不该再点得动「卸载」，
-        # 也不该在下载没结束时又发一次下载。
-        # ★ 放开时只"打开"当初是启用的那些 —— 「困难」/ 内存不够的行
-        #   在功能上本来就不该能点，别在这里顺手把它们点活。
-        for model_id, buttons in self._row_buttons.items():
-            usable = self._button_usable(model_id, buttons)
-            for button in buttons:
-                button.setEnabled(busy is False and usable)
-
-    def _button_usable(self, model_id: str, buttons: list[QWidget]) -> bool:
-        """这一行的按钮"功能上"可不可用（与忙不忙无关）。
-
-        判据只有一条：「下载」按钮在负载判成困难、或内存闸门没过时不可用。
-        卸载 / 复制链接两个按钮任何时候都能点。
-        """
-        choice = next((c for c in self._choices if c.model.id == model_id), None)
-        if choice is None:
-            return True
-        if not any(btn.text() == "下载" for btn in buttons):
-            return True
-        return bool(choice.selectable and choice.load_level != LOAD_HARD)
+        self._download_btn.setEnabled(
+            (not busy) and any(c.selected for c in self._card_order)
+        )
+        # 下载中不该再点得动「卸载」，也不该在下载没结束时又发一次下载。
+        for card in self._card_order:
+            card.uninstall_btn.setEnabled(
+                (not busy) and card._is_installed()
+            )
+            card.setEnabled(not busy)
 
     def _next_in_queue(self) -> None:
         if self._cancel or self._queue_index >= len(self._queue):
@@ -958,7 +1519,7 @@ class ModelCenterDialog(QDialog):
         relay = _ProgressRelay(self)
         relay.progress.connect(self._on_progress)
         self._relay = relay
-        target = _target_path(choice.model)
+        target = _target_path(choice.model, model_dir(choice.model.id))
 
         def job() -> dict[str, Any]:
             download_exe(
@@ -1009,6 +1570,7 @@ class ModelCenterDialog(QDialog):
             size=size,
             file=path.name,
             label=choice.model.display,
+            dest_dir=self.models_root,
         )
         self._downloaded.append(choice.model.id)
         self._status.setText(
@@ -1076,7 +1638,7 @@ class ModelCenterDialog(QDialog):
                 lines.append(f"「{self._title_of(model_id)}」：{reason}")
             lines.append("")
             lines.append(
-                "失败的那一行有一个「复制链接」按钮，点它会把下载地址放进剪贴板，"
+                "失败的那张卡片有一个「复制链接」按钮，点它会把下载地址放进剪贴板，"
                 "可以直接在浏览器里下载。"
             )
         QMessageBox.information(self, "下载结束", "\n".join(lines))
@@ -1114,6 +1676,9 @@ def open_model_center(
     on_installed: Callable[[list[str]], None] | None = None,
 ) -> int:
     """打开模型中心（模态）。返回 ``QDialog.exec()`` 的结果码。
+
+    ★ **对外签名冻结**（v1.9 的调用方就这么调，一个字都不许改）——
+      见 ``ui/pages/settings_page.py`` 的 ``_do_open_model_center``。
 
     Args:
         parent: 父窗口（一般传设置页）。

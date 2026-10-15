@@ -46,7 +46,8 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtCore import QEvent, Qt  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
     QDialog,
@@ -546,11 +547,42 @@ def center(
     monkeypatch.setattr(
         system_info, "snapshot", lambda *a, **k: _fake_system(RAM_GB, VRAM_GB)
     )
+    # ★ 构造时 ``_load_manifest()`` 丢出去的那次清单拉取，回调是**投递到主线程
+    #   队列**的：它要等下一次 processEvents 才跑，跑起来就用桩返回的空清单
+    #   把界面重画一遍。这里套一层"跑完了"的锁存器，把这次回调**先等回来**，
+    #   用例后面装的卡片才不会被它冲掉（也不许拿 ``_refresh_btn.isEnabled()``
+    #   当判据 —— 那个按钮在回调跑之前就是 False）。
+    settled: list[bool] = []
+    real_done = mcd.ModelCenterDialog._on_manifest
+    real_error = mcd.ModelCenterDialog._on_manifest_error
+
+    def _spy_done(self: Any, result: Any) -> None:
+        try:
+            real_done(self, result)
+        finally:
+            settled.append(True)
+
+    def _spy_error(self: Any, exc: BaseException) -> None:
+        try:
+            real_error(self, exc)
+        finally:
+            settled.append(True)
+
+    monkeypatch.setattr(mcd.ModelCenterDialog, "_on_manifest", _spy_done)
+    monkeypatch.setattr(mcd.ModelCenterDialog, "_on_manifest_error", _spy_error)
+
     dialog = mcd.ModelCenterDialog()
     dialog._machine_ram = RAM_GB
     dialog._machine_vram = VRAM_GB
     dialog._machine_read = True
     dialog._tl_models_dir = models_dir
+    waited = 0
+    while not settled and waited < 3000:
+        app.processEvents()
+        QTest.qWait(10)
+        waited += 10
+    app.processEvents()
+    assert settled, "清单拉取的回调一直没回来（后台线程卡住了？）"
     yield dialog
     dialog.deleteLater()
 
@@ -568,37 +600,62 @@ def _install(dialog: Any, models: list[RemoteModel]) -> None:
     dialog._populate()
 
 
-def _rows(dialog: Any) -> list[Any]:
-    return list(dialog._iter_rows())
+def _cards(dialog: Any) -> list[Any]:
+    """按界面顺序拿卡片（v1.9.1：原来的 ``_rows(dialog)`` 就是它）。"""
+    return list(dialog._iter_cards())
 
 
-def _buttons_of(dialog: Any, row: Any) -> dict[str, QPushButton]:
-    widget = dialog._tree.itemWidget(row, mcd.COLUMN_ACTION)
-    return {
-        button.text(): button
-        for button in widget.findChildren(QPushButton)
-    }
+def _card(dialog: Any, model_id: str) -> Any:
+    return dialog._card_map[model_id]
 
 
-def _load_labels(dialog: Any, row: Any) -> list[str]:
-    widget = dialog._tree.itemWidget(row, mcd.COLUMN_LOAD)
-    return [label.text() for label in widget.findChildren(QLabel)]
+def _buttons_of(dialog: Any, card: Any) -> dict[str, QPushButton]:
+    """卡片上的按钮（卡片内部**没有**下载按钮，只有卸载 / 复制链接）。"""
+    return {button.text(): button for button in card.findChildren(QPushButton)}
 
 
-def test_界面有六列且操作列写死宽度(center: Any, app: QApplication) -> None:
-    """★ 操作列里放的是 ``setCellWidget`` 的按钮 —— 宽度必须写死（4c 第 2 条）。"""
-    assert mcd.COLUMN_TITLES == ("名称", "大小", "适配场景", "负载", "状态", "操作")
-    header = center._tree.header()
-    assert center._tree.columnCount() == len(mcd.COLUMN_TITLES)
-    assert header.sectionResizeMode(mcd.COLUMN_ACTION) == mcd.QHeaderView.ResizeMode.Fixed
+def _boom(message: str) -> Any:
+    """一个"被调到就炸"的替身 —— 用来钉死"这条路径根本不该走到"。"""
+
+    def _raise(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(message)
+
+    return _raise
+
+
+def _load_labels(dialog: Any, card: Any) -> list[str]:
+    """卡片上"负载"那一格的文字（圆点是个空文字 QLabel）。"""
+    return [label.text() for label in card.load_holder.findChildren(QLabel)]
+
+
+def test_界面是卡片流而不是六列表格(center: Any, app: QApplication) -> None:
+    """★ v1.9.1：六列表格**已经整体换成卡片流**，这条改成守新结构。
+
+    老判据（``COLUMN_TITLES`` 六列 + 操作列 ``Fixed`` 宽度）随表格一起作废 ——
+    那六个列名常量也**已经从模块里删掉**了（留着会让人以为还能拼回去）。
+    4c 第 2 条那条坑（``ResizeToContents`` 不算 ``setCellWidget`` 的控件）
+    在卡片流里不存在了：卡片宽度由 ``QGridLayout`` 均分，不再有"操作列"。
+    新结构的完整判据在 ``tests/test_model_center_card.py``；这里只留一条
+    "表格已经拆干净、卡片列数写死"的冒烟，防止有人把 ``QTreeWidget`` 搬回来。
+    """
+    assert not hasattr(center, "_tree"), "六列表格应该已经拆掉了"
+    assert not hasattr(mcd, "COLUMN_TITLES"), "六列那套常量不该再留着"
+    assert isinstance(mcd.GRID_COLUMNS, int) and mcd.GRID_COLUMNS >= 1
+    _install(center, [_model("a", min_ram_gb=2.0)])
     center.show()
     app.processEvents()
-    assert center._tree.columnWidth(mcd.COLUMN_ACTION) == mcd.ACTION_COLUMN_WIDTH
-    # 只要最宽的两个按钮 + 间距放得下，就不能被裁
-    assert mcd.ACTION_COLUMN_WIDTH >= mcd.COPY_BUTTON_WIDTH + mcd.UNINSTALL_BUTTON_WIDTH
+    # 卡片流是 QGridLayout 排的：每张卡片都在格子里，且列下标 < GRID_COLUMNS
+    cards = list(center._iter_cards())
+    assert len(cards) == 1
+    index = center._grid.indexOf(cards[0])
+    assert index >= 0
+    row, column, _span_r, _span_c = center._grid.getItemPosition(index)
+    assert 0 <= column < mcd.GRID_COLUMNS
+    assert row >= 0
 
 
 def test_每行都有负载圆点与中文(center: Any) -> None:
+    """卡片流版：每张卡片的负载格里都是"彩色圆点 + 中文"（不是 emoji）。"""
     _install(
         center,
         [
@@ -606,20 +663,20 @@ def test_每行都有负载圆点与中文(center: Any) -> None:
             _model("hard", min_ram_gb=64.0),
         ],
     )
-    rows = _rows(center)
-    assert len(rows) == 2
-    light_labels = _load_labels(center, rows[0])
-    hard_labels = _load_labels(center, rows[1])
+    cards = _cards(center)
+    assert len(cards) == 2
+    light_labels = _load_labels(center, cards[0])
+    hard_labels = _load_labels(center, cards[1])
     assert light_labels[-1] == "轻松"
     assert hard_labels[-1] == "困难"
     # 圆点是个空文字的小方块 + 圆角；颜色来自 LOAD_COLORS
-    dot = center._tree.itemWidget(rows[0], mcd.COLUMN_LOAD).findChildren(QLabel)[0]
+    dot = cards[0].load_dot
     assert dot.text() == ""
     assert LOAD_COLORS[LOAD_EASY] in dot.styleSheet()
     assert "border-radius" in dot.styleSheet()
 
 
-def test_负载那一列的文案与提示都是纯文本(center: Any) -> None:
+def test_负载那一格的文案与提示都是纯文本(center: Any) -> None:
     _install(
         center,
         [
@@ -627,21 +684,27 @@ def test_负载那一列的文案与提示都是纯文本(center: Any) -> None:
             _model("hard", min_ram_gb=64.0, note="大模型"),
         ],
     )
-    rows = _rows(center)
-    for row in rows:
-        widget = center._tree.itemWidget(row, mcd.COLUMN_LOAD)
-        assert widget.toolTip()
-        _assert_plain_text(widget.toolTip())
-        for label in widget.findChildren(QLabel):
+    cards = _cards(center)
+    for card in cards:
+        # 卡片整张的气泡（清单说明 + 困难那句）与负载格的气泡都是纯文本
+        for tip in (card.toolTip(), card.load_holder.toolTip()):
+            assert tip
+            _assert_plain_text(tip)
+        for label in card.load_holder.findChildren(QLabel):
             _assert_plain_text(label.text())
-        for column in range(center._tree.columnCount()):
-            _assert_plain_text(row.toolTip(column))
-    # 困难那行的名称气泡里带上那句提示
-    assert "困难" in " ".join(_load_labels(center, rows[1]))
+        _assert_plain_text(card.name_label.text())
+        _assert_plain_text(card.note_label.text())
+    # 困难那张的名称气泡里带上那句提示
+    assert "困难" in " ".join(_load_labels(center, cards[1]))
+    assert mcd.HARD_LOAD_TOOLTIP in cards[1].toolTip()
 
 
-def test_内存不够的行没有ItemIsEnabled(center: Any) -> None:
-    """★ 施工单点名的"两条规则别混"：内存闸门只看 ``minRamGb``。"""
+def test_内存不够的卡片不能选中(center: Any) -> None:
+    """★ 施工单点名的"两条规则别混"：内存闸门只看 ``minRamGb``。
+
+    v1.9.1 把表格行的 ``ItemIsEnabled`` 换成了卡片的 ``can_select()`` ——
+    语义一个字没变：内存不够的**整张卡片不可选**，不只是不勾。
+    """
     _install(
         center,
         [
@@ -649,20 +712,21 @@ def test_内存不够的行没有ItemIsEnabled(center: Any) -> None:
             _model("huge", min_ram_gb=9999.0),
         ],
     )
-    rows = _rows(center)
-    assert rows[0].flags() & Qt.ItemFlag.ItemIsEnabled
-    assert not (rows[1].flags() & Qt.ItemFlag.ItemIsEnabled)
-    # 反过来说：「困难」的行**一定**同时没有 ItemIsEnabled —— 困难要求
+    cards = _cards(center)
+    assert cards[0].can_select() is True
+    assert cards[1].can_select() is False
+    assert cards[1].choice.selectable is False
+    # 反过来说：「困难」的卡片**一定**同时不可选 —— 困难要求
     # 内存 < minRamGb × 0.7，那必然小于 minRamGb（见 test_困难必然同时被内存闸门挡住）。
     # 下面这行是"内存够、只是显存不够"→「勉强」：这一档照样可选可勾。
     _install(center, [_model("slow", min_ram_gb=4.0, min_vram_gb=999.0)])
-    slow = _rows(center)[0]
-    assert slow.flags() & Qt.ItemFlag.ItemIsEnabled
-    assert slow.checkState(mcd.COLUMN_NAME) == Qt.CheckState.Unchecked
+    slow = _cards(center)[0]
+    assert slow.can_select() is True
+    assert slow.selected is False  # 勉强档默认不勾
 
 
 def test_困难的行下载按钮置灰并带提示(center: Any) -> None:
-    """三档各自的气泡 —— 判断的先后决定了困难行显示的是哪一句。"""
+    """三档各自的气泡 —— 卡片流版：卡片内部没有下载按钮，闸门在底部那个按钮上。"""
     _install(
         center,
         [
@@ -671,36 +735,54 @@ def test_困难的行下载按钮置灰并带提示(center: Any) -> None:
             _model("mid", min_ram_gb=16.0),
         ],
     )
-    rows = _rows(center)
-    light_buttons = _buttons_of(center, rows[0])
-    hard_buttons = _buttons_of(center, rows[1])
-    mid_buttons = _buttons_of(center, rows[2])
-    assert light_buttons["下载"].isEnabled()
-    assert not hard_buttons["下载"].isEnabled()
-    assert hard_buttons["下载"].toolTip() == mcd.HARD_LOAD_TOOLTIP
+    cards = _cards(center)
+    light, hard, mid = cards
+    assert light.can_select() is True
+    assert hard.can_select() is False
+    assert "下载" not in _buttons_of(center, hard)
     assert mcd.HARD_LOAD_TOOLTIP == "当前电脑配置可能无法流畅运行此模型"
+    assert mcd.HARD_LOAD_TOOLTIP in hard.toolTip()
     # ★ 「困难」是"内存也不够"的**子集**（困难 ⟹ 内存 < minRamGb × 0.7 < minRamGb），
-    #   所以两条判断都成立，先后决定了显示哪一句 —— 任务书点名困难行给这一句，
+    #   所以两条判断都成立，先后决定了显示哪一句 —— 任务书点名困难卡片给这一句，
     #   于是 LOAD_HARD 先判。「勉强但内存不够」（15.4 GB < 16 GB，且 15.4 ≥ 11.2）
     #   这一档仍然拿内存那句：那才是真正拦住它的原因。
-    assert not mid_buttons["下载"].isEnabled()
-    assert "内存" in mid_buttons["下载"].toolTip()
+    assert mid.can_select() is False
+    assert "内存" in mid.status_label.toolTip()
+    # 底部按钮只数能下载的那些：轻松一张（默认选中）
+    center.show()
+    assert center._download_btn.text() == "下载选中（1）"
 
 
 def test_困难的行即使按到下载也不进队列(
     center: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """置灰只是提示；真正的闸门在 ``_on_row_download`` 里。"""
+    """置灰只是提示；真正的闸门在点卡片那一下（``_on_card_clicked``）。
+
+    v1.9.1 起卡片内部没有下载按钮 —— 点「困难」卡片既不选中，也不会进下载队列。
+    """
     _install(center, [_model("slow", min_ram_gb=64.0, min_vram_gb=999.0)])
-    spy = _MessageSpy(monkeypatch)
     started: list[str] = []
-    monkeypatch.setattr(
-        center, "_on_download", lambda: started.append("download")
-    )
-    center._on_row_download("slow")
+    monkeypatch.setattr(mcd, "download_exe", _boom("困难那张卡片不该走到下载"))
+    monkeypatch.setattr(center, "_start_one", lambda *a, **k: started.append("start"))
+    # 点卡片：困难的既不选中，也不启动下载
+    center._on_card_clicked(_card(center, "slow"))
     assert started == []
-    assert any("可能带不动" in text for text in spy.texts)
+    assert center.selected_ids() == []
+    assert center._download_btn.text() == "下载选中"
+    # 卡片角落那个 × 是卸载用的，不是下载：卡片上**没有**下载入口
+    # （复制链接是卡片自己的兜底入口，跟下载无关）。
+    assert "下载" not in _buttons_of(center, _card(center, "slow"))
+    assert set(_buttons_of(center, _card(center, "slow"))) == {"×", "复制链接"}
+    # 底部那个按钮真的按下去也不会开始下载（一张都没选中）：它自己先拦住，
+    # 走的是"还没有选中任何模型"那条提示，压根不该碰下载 Job。
+    notices: list[str] = []
+    monkeypatch.setattr(
+        mcd.QMessageBox, "information", lambda *a, **k: notices.append(a[2])
+    )
+    center._on_download()
+    assert started == []
+    assert notices and "还没有选中" in notices[0]
 
 
 # ---------------------------------------------------------------------------
@@ -796,9 +878,16 @@ def test_已装的行才有卸载按钮(center: Any) -> None:
     )
     _install(center, [_model("m", min_ram_gb=4.0)])
     assert center._choices[0].state == mr.STATE_INSTALLED
-    buttons = _buttons_of(center, _rows(center)[0])
-    assert "卸载" in buttons
-    assert "下载" not in buttons
+    card = _cards(center)[0]
+    # ★ 卡片流：装好的那张长出绿色徽章 + 卸载小按钮，卡片内部**没有**下载按钮
+    #   判可见性用 ``isVisibleTo(card)`` 而不是 ``isVisible()``：对话框自己
+    #   没 ``show()``，``isVisible()`` 会因为顶层窗口不可见而一律 False
+    #   （量的是"整条父链都可见吗"，测不了"这个控件被显示了吗"）。
+    assert card.badge.isVisibleTo(card) is True
+    assert card.badge.text() == "已安装"
+    assert card.uninstall_btn.isVisibleTo(card) is True
+    assert card.uninstall_btn.text() == "×"
+    assert "下载" not in _buttons_of(center, card)
 
 
 # ---------------------------------------------------------------------------
@@ -810,15 +899,26 @@ def test_失败两次之后出现复制链接(
     center: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """v1.9.1：卡片流里「复制链接」是**卡片上常驻的兜底入口**。
+
+    表格时代它只在重试两次失败之后才出现（操作列一次只放一个按钮）；
+    卡片里有位置，所以有地址的卡片**一开始就带**这个入口 —— 失败两次之后
+    界面上要能看到"为什么失败"，而不是多长出一个按钮。
+    """
     _install(center, [_model("m", min_ram_gb=4.0)])
-    assert "复制链接" not in _buttons_of(center, _rows(center)[0])
+    card = _cards(center)[0]
+    assert "复制链接" in _buttons_of(center, card)
+    assert card.status_label.text() == mr.STATE_MISSING
     center._failures = [("m", "网断了")]
     center._apply_failure_marks()
     center._populate()
-    buttons = _buttons_of(center, _rows(center)[0])
+    card = _cards(center)[0]
+    buttons = _buttons_of(center, card)
     assert "复制链接" in buttons
     assert buttons["复制链接"].isEnabled()
-    assert "下载失败" in _rows(center)[0].text(mcd.COLUMN_STATUS)
+    assert "下载失败" in card.status_label.text()
+    # ★ 重画之后失败标记要重新贴上去（卡片是新建的，标记不会自己跟过来）
+    assert "网断了" in card.status_label.text()
 
 
 def test_重试上限是两次() -> None:
@@ -837,7 +937,6 @@ def test_复制链接把直链放进剪贴板(
     )
     spy = _MessageSpy(monkeypatch)
     app.clipboard().setText("（先放点别的）")
-    _buttons_of(center, _rows(center)[0])
     center._on_copy_link("m")
     assert app.clipboard().text() == "https://example.com/m.gguf"
     assert any("models/ 目录" in text for text in spy.texts)
@@ -880,8 +979,10 @@ def test_界面复用同一份本机读数(
         mcd, "fetch_model_list", lambda *a, **k: ([], [], "（测试桩）")
     )
     # 这条用例自己建对话框（不走 center fixture），所以模型目录要自己指走 ——
-    # 对话框内部调 build_choices 时不带 dest_dir，不指就会去读真实用户目录。
-    monkeypatch.setattr(mcd, "model_dir", lambda name, *a, **k: models_dir / name)
+    # 桩要**照抄 registry 的语义**（拿 ``.`` 探根目录时不能被清洗成 ``model``）。
+    monkeypatch.setattr(
+        mcd, "model_dir", lambda name, *a, **k: models_dir / mr._safe_name(name)
+    )
     calls: list[int] = []
 
     def fake_snapshot(*args: Any, **kwargs: Any) -> Any:
@@ -896,7 +997,13 @@ def test_界面复用同一份本机读数(
     dialog._tl_models_dir = models_dir
     first = dialog._machine_kwargs()
     second = dialog._machine_kwargs()
-    assert first == second == {"ram_gb": 15.4, "vram_gb": 11.9}
+    # ★ ``dest_dir`` 也在这一份 kwargs 里（v1.9.1 加）：对话框自己调
+    #   build_choices / merged_with_local 都走它 —— 少传一次就会去读真实的
+    #   ``%LOCALAPPDATA%\SGMS\models``，测试桩拦不住，界面还会冒出"本机已有"。
+    assert first == second
+    assert first["ram_gb"] == 15.4
+    assert first["vram_gb"] == 11.9
+    assert Path(first["dest_dir"]) == models_dir
     assert len(calls) == 1
     # 界面自己不许有第二套判据：它必须拿到 registry 的等级
     _install(dialog, [_model("m", min_ram_gb=4.0)])
@@ -906,7 +1013,9 @@ def test_界面复用同一份本机读数(
 
 
 def test_对话框可以真的建起来(center: Any) -> None:
-    """冒烟：六列都建好了、没有一行是真的下载按钮在跑。"""
+    """冒烟：卡片流建好了、没有一行是真的下载按钮在跑。"""
     assert isinstance(center, QDialog)
-    assert center._tree.columnCount() == len(mcd.COLUMN_TITLES)
+    assert not hasattr(center, "_tree"), "六列表格应该已经拆掉了"
     assert center.windowTitle() == mcd.DIALOG_TITLE
+    assert center._scroll is not None
+    assert center._grid is not None
