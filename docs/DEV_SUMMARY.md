@@ -2058,3 +2058,203 @@ apply(records, *, semester, batch_id, policy=USE_OVERWRITE, on_conflict=None) ->
 `tests/test_grade_overwrite.py`（36 用例：覆盖 / 跳过 / 全部覆盖 / 全部跳过、冲突回调抛异常
 时整批不写、主键去重、空参数报错）+ `tests/test_profile_merge.py`（28 用例：档案合并与两个
 标签页的数据源）。
+
+---
+
+## 二十五、v1.9.1 紧急修复：现行规格与判据
+
+v1.9.1 **不新增业务能力** —— 它把 v1.9 上线后暴露的七个问题修掉，顺手结清三笔旧账
+（版本号 / 迁移跳、`CHECK_MODULES` 漏登记、`delete_user()` 的 `OSError`）。逐条的
+现象 / 根因 / 修法 / 判据在仓库根 **`CHANGELOG_v1.9.1.md`**；**本节只记现行规格**。
+
+**版本与迁移**：`core/version.py` 的 `CURRENT_VERSION` = **`"1.9.1"`**（1.9 → 1.9.1）；
+`core/migrator.py` 的 `_STEPS` 补一跳 `("1.9", "1.9.1", _lift_1_9_to_1_9_1)` —— 函数体
+只有 `return data`，照细则 **§23b**（**升版本就必须补一跳，哪怕数据结构没变**）。
+老库**零转换**：`audit/grade_changes.json.enc` 与 `gpa_settings.json.enc` 都是**新建载荷**，
+读到"没有这个文件"就当空。★ 界面里的版本号**一个字都没改** —— 三处全从 `core.version`
+推导（细则 §23a / 铁律 10）。
+
+### 25.0 ★ 规格例外：`grade_history` / 侧写走**应用级**加密（Owner 已拍板）
+
+**这是一条正式记录的例外。它与细则 §16 那句「成绩绝不许往应用级里塞」冲突时，以本条为准。**
+
+* 决定：**Owner 在 v1.9 二期拍板** —— 「**成绩加密方案 C：应用级加密 + 审计日志**」。
+  `core/database.py` 的两份载荷 `grade_history.json.enc`（成绩历史库）与
+  `student_profiles.json.enc`（学生侧写 / 总评与侧写）落在**应用级**（`core/user_store`），
+  **不需要密码**即可读写。
+* 为什么只能这样：档案页要"登录进来就能看历史"，而**自动登录只有 session token、没有
+  密码**，库密钥解不开（§16 那条分工的同一条道理）—— 走密码级的话，自动登录的用户看到
+  的是**空档案**。
+* **例外只到这里为止**：§16 的旧底线对其余落点**照旧生效** —— 单次导入的 `grades`
+  原始库、意愿标签等**仍然只走密码级**；不许拿这条当"成绩可以随便塞应用级"的通行证。
+* 代价用**审计日志**抵（25.5）：应用级成绩库的每一次写 / 覆盖 / 删都留痕，
+  且**只记"谁在什么时候动了哪条"，不记分数**。
+
+### 25.1 模型中心：卡片流（细则 §33 的界面侧）
+
+`ui/model_center_dialog.py` 从"表格 + 复选"改成**卡片流**：`ModelCard` +
+`QScrollArea` + `QGridLayout`（**3 列**）、按 `group` 分组、悬浮**上移 2px + 阴影**、
+点选 **2px `#0078D4` 边框**、已安装**绿徽章** + `×` 卸载、不可用行（🔴）**整行不可选**
+并挂气泡说明、底部按钮「**下载选中（N）**」实时显示条数。
+
+★ 数据侧规则**一个字没改**（细则 §33 仍然全量生效）：负载三档、默认**只勾 🟢**、
+**内存探不到一律放行**、装没装**以磁盘为准**。
+
+判据：`tests/test_model_center_card.py`（**36 用例**）—— 卡片结构 / 分组 / 选中态 /
+徽章与卸载入口 / 🔴 不可选 + 气泡 / 按钮计数。
+
+### 25.2 档案页第三标签页「AI 辅导」（细则 §34）
+
+`ui/pages/profile_page.py:1299` `self._tabs.addTab(self._build_chat_pane(), "AI 辅导")`。
+结构 = **学生卡 + 只读历史 + 输入区**；后台线程**流式**返回（工作线程契约与
+`ui/chat_dialog.py` 一致 —— 它是 `ChatDialog` 的**姊妹实现**，见 25.9）。
+
+* **系统提示词注入**：该学生的成绩 / 德育 / 侧写以 **JSON** 原样注入（不做自然语言摘要
+  —— 数字与空值都保持原样，**空 ≠ 0** 在提示词里也是空）。
+* **历史落盘**：`u_<uid>\cache\chat_history_<学号>.json.enc`
+  （`CHAT_HISTORY_PREFIX = "chat_history_"`，:204）。★ 文件名**按学号**不按姓名
+  （细则 §9：同名学生会串号）；**没学号**才退回一份共用文件。★ 明文聊天记录
+  **绝不落盘**（红线 3）。
+* **降级**：缺模型 → 「请先在模型中心下载模型」+ 跳转按钮；缺引擎 → 给**中文原因**
+  （§34 的"明确降级，不许静默失败、不许偷偷走云端"）。
+* 「总评与侧写」补全：**生成 → 可编辑 → 保存**闭环。
+
+判据：`tests/test_profile_ai.py`（**33 用例**）。
+
+### 25.3 单条删除（成绩 / 德育 / 侧写）
+
+* 数据层（`core/database.py`）：`GradeHistoryDB.delete_record(student_id, semester,
+  course_name)`（:500）、`delete_semester(student_id, semester)`（:520）、`clear()`（:488）
+  —— **都返回删除行数**；`ProfileStore.clear_side_text(student_id)`（:898）、
+  `clear_all()`（:918）。
+* 确认文案：「**确定删除此条记录？此操作不可恢复。**」；删掉某学期**最后一条**成绩时
+  追加「**该学期已无成绩，是否同时删除学期记录？**」（不追问就会留下一个点进去什么都没有
+  的空学期壳）。
+
+判据：`tests/test_grade_delete.py`（**74 用例**，含数据层 / 界面 / 审计 / GPA）。
+
+### 25.4 「删除成绩库」：判据 + 接线（细则 §35）
+
+* **判据只有一条**：`core.database.library_inventory()`（:993）返回的 **`has_data`**
+  = `bool(grade_rows or profile_rows or files)`（:1066）—— **不算 `audit_rows`**
+  （审计日志要留着，它本身就是"删过什么"的凭据）。旧的"拿文件名当判据"会说假话。
+* **删除动作全在数据层**：`core.database.clear_library()`（:1070，可单测）；设置页只做
+  `library_inventory()` → **两次确认** → `clear_library()`（`ui/pages/settings_page.py`
+  :1055 / :1093），删完把清单如实报出来。
+* **删完发信号** `library_cleared(int, int, int)`（`ui/pages/settings_page.py:144`，
+  发在 :1113；三个数 = 成绩行数 / 侧写份数 / 文件数）。
+* **主窗接线**：`ui/main_window.py:299` 连到 `_on_library_cleared`（:330）—— 用
+  `getattr(target, name, None)` + `callable()` 探 `profile_page.show_no_data` /
+  `archive_page.reload` / `scholarship_page.reload_classes`；刷新失败**只
+  `traceback.print_exc()`、不弹窗**（§18：数据已经删干净了），并打一行汇总日志。
+* **档案页的空钩子**：`ui/pages/profile_page.py:1114 show_no_data()` —— 名单是
+  `set_roster()` 推进内存的，清库不会自己收回去；它显式清空名单 / 载荷 / 谈话状态并显示
+  「暂无数据：成绩库已清空，先在「📊 智育分析」导入成绩表。」（**只动显示状态**，
+  不碰 AI 辅导与侧写的既有逻辑）。
+* ★ **智育分析页不接这个刷新**：它的表格是"本次导入的内存结果"，页面上没有"重新读库"
+  的入口（`set_user()` 只清 `_archive` / `_grade_decisions`）。
+
+### 25.5 审计日志 `audit/grade_changes.json.enc`
+
+* `class GradeAuditLog`（`core/database.py:659`，`filename = AUDIT_FILE` :678）；
+  `AUDIT_DIR = "audit"`（:120）、`AUDIT_FILE = f"{AUDIT_DIR}/grade_changes.json.enc"`
+  （:122）、`TABLE_GRADE_AUDIT = "grade_audit"`。
+* **字段**：`at` / `operation` / `student_id` / `semester` / `course_name` / `count`。
+  `AUDIT_OPERATIONS = (OP_INSERT, OP_OVERWRITE, OP_DELETE)`（:131，不在白名单的 operation
+  直接拒收）；`AUDIT_MAX_ENTRIES = 2000`（:124，超了砍最旧的）。
+* ★★ **不记分数**：审计只回答"谁在什么时候动了哪条记录"，`score` **一个字节都不进**审计
+  文件 —— 成绩本体只在成绩库里，审计是最小化的旁证（也是 25.0 那条规格例外的代价）。
+* 写在**应用级**（`u_<uid>/audit/…json.enc`），所以 `delete_user()` 会连着它一起清（25.7）。
+* ★ **坏了只降级为警告**：`record()` / `record_many()` 失败只 `warnings` 并返回
+  `None` / `[]` —— **审计不许挡住用户删记录**；`changes()` 读到坏文件返回 `[]`。
+* ★ **目前只写不读**：没有界面入口（`changes()` 是留给以后 / 脚本的只读查询 API，
+  见 25.9 未做）。
+
+### 25.6 GPA 方案 1（`core/gpa.py`）
+
+新建 **`core/gpa.py`**（**没有**写进封板的 `core/calculator.py`，理由见 25.9）：
+`SCHEME_STANDARD_4 = "standard4"`、`DEFAULT_SCHEME`、`STANDARD_4_TABLE`（:69）、
+`grade_point(score, scheme)`（:244）、`gpa_detail(courses, scheme)`（:262）、
+`gpa_of(courses, scheme)`（:309）、`scheme_options()`（:138）、`available_schemes()`（:143）、
+`load_scheme()`（:332）/ `save_scheme()`（:351）。
+
+换算表（标准 4.0）—— ★ **一行都不在界面里，真源只有 `core/gpa.py`**：
+
+| 百分制 | ≥90 | ≥85 | ≥82 | ≥78 | ≥75 | ≥72 | ≥68 | ≥64 | ≥60 | <60 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 绩点 | 4.0 | 3.7 | 3.3 | 3.0 | 2.7 | 2.3 | 2.0 | 1.5 | 1.0 | 0.0 |
+
+`GPA = Σ(绩点 × 学分) / Σ学分`。
+
+* ★ **空 ≠ 0（红线 2 的同一条）**：`BLANK_TOKENS`（:90）=
+  `{"", "-", "/", "—", "–", "未选", "无", "未修"}` → 这门课**不进分母**；
+  数字 `0` = **缺考** → 绩点 0.0、**学分进分母**。
+* 一门可算的课都没有 → `gpa_of()` 返回 **`None`**（界面"暂无数据"，**不是 0.00**）。
+* 设置存 **`gpa_settings.json.enc`**（`GPA_SETTINGS_FILE` :327，键
+  `GPA_SETTINGS_KEY = "scheme"` :329），走**应用级**；设置页下拉在
+  `ui/pages/settings_page.py:292`（`_build_gpa_card`）—— 换算表在界面上**一个字都没有**。
+* **方案 2 / 3 / 4 预留**：`SCHEMES`（:96）里 `available=False`，界面 label
+  「方案 N（待定）」+ 禁用（未实现，见 25.9）。
+
+判据：`tests/test_grade_delete.py` 的 GPA 部分（`gpa_of([]) is None`、空学分不算、
+`0` 进分母、90+78 混合、`Course(85, 2.0)` ≈ 3.7、未实现方案报错）。
+
+### 25.7 附带修复（三笔旧账）
+
+1. **`core/crypto_store.delete_user()`**（:835）：旧写法结尾 `user_dir.rmdir()` ——
+   只要 `u_xxx/audit/` 子目录存在就抛
+   `OSError: [WinError 145] 目录不是空的`，而且异常发生在 `save_users()` **之前**，
+   结果是"**载荷删了、账户记录还在**"。现在按**深度倒序** `rglob`：目录 `rmdir()`、
+   文件 `unlink()`，单个失败 `except OSError: continue`（删不掉的**不报成删掉了**）；
+   最后 `user_dir.rmdir()` 包在 `try/except OSError: pass` 里（**清不掉空壳不算失败**，
+   账户记录照样移除）。**签名与"删账户"语义未变。**
+2. **`main.py` 的 `CHECK_MODULES` 补 `core.gpa`**（42 → **43** 项）—— 自检的模块导入闸门
+   要能发现新模块坏了。
+3. **版本号 + 迁移跳**（见本节开头）。
+
+### 25.8 导入「核对提取结果」：QSplitter + `ui_state.ini`
+
+* `ui/review_dialog.py`：横向 `QSplitter`，默认 `_DEFAULT_SIZES = (700, 300)`（≈ 0.70，:69），
+  窗口初始 `_DEFAULT_SIZE = (1000, 700)`，单栏最小 `_MIN_PANE_WIDTHS = (280, 200)`（:72），
+  `setStretchFactor(0, 7)` / `(1, 3)`；**右栏套 `QScrollArea` 自己滚动**；表头 `Interactive`
+  + `minimumSectionSize = MIN_COLUMN_WIDTH = 72`（:60），初始列宽
+  `_COLUMN_WIDTHS = (72, 260, 96, 84, 150, 150)`（:63）。
+* 拖动位置**记在应用级 ini**：**`%LOCALAPPDATA%\SGMS\ui_state.ini`**，键
+  **`grade_import/splitter_state`**（`SPLITTER_KEY` :75，`_STATE_FILE_NAME = "ui_state.ini"`
+  :78，`state_path()` :106）—— 用 `QSettings(IniFormat)` **显式指路径**，
+  **刻意不用注册表**（红线 2）。`saveState()` 在 :403，`restoreState()` 在 :381
+  （读不出来 / 长度不对 → 退回 `_DEFAULT_SIZES`，:397）。
+
+判据：`tests/test_import_review_ui.py`（**50 用例**）。
+
+### 25.9 v1.9.1 判据汇总 / 两处差异 / 未做
+
+| 测试文件 | 用例数 | 覆盖 |
+|---|---|---|
+| `tests/test_model_center_card.py` | **36** | 卡片流结构 / 分组 / 选中态 / 徽章 / 🔴 不可选 |
+| `tests/test_profile_ai.py` | **33** | 档案页 AI 辅导 / 侧写闭环 |
+| `tests/test_grade_delete.py` | **74** | 单条删除 / 删库判据 / 审计日志 / GPA |
+| `tests/test_import_review_ui.py` | **50** | QSplitter / ini 落点 / 列宽 |
+
+四份合计 **193** 用例（`--collect-only` 实测）。另跑
+`main.py --selfcheck` → **RESULT: ALL OK**；
+`pytest tests/test_version_migration.py tests/test_manifest.py tests/test_profile_merge.py -q`
+→ **119 passed**。
+
+**与任务书字面的两处差异（有意为之，不是漏做）**：
+
+1. **GPA 落在新建的 `core/gpa.py`**，**没有**写进 `core/calculator.py` —— 后者是铁律 1 的
+   封板文件（`main.FROZEN_FILE_SHA256`，细则 §27f），往里加一行就要解冻铁律 1。
+2. 删掉的是**全局** AI 助手入口（主窗顶栏按钮 + `_open_chat_assistant`），
+   **`ui/chat_dialog.py` 的 `ChatDialog` 类保留**为内部组件（细则 §34 的冻结接口
+   `ui.chat_dialog.open_chat(...)` 签名不许改），档案页「AI 辅导」是它的**姊妹实现**
+   —— 两者工作线程契约一致。
+
+**未做 / 待定**（记录在案，不是待办清单）：
+
+* **GPA 方案 2 / 3 / 4** 只有壳（`SCHEMES` 里 `available=False`，界面禁用 +「待定」）；
+  真要实现是 Owner 定口径的事。
+* **审计日志只写不读** —— 没有界面查看入口，`GradeAuditLog.changes()` 是留给以后 /
+  脚本的只读 API。
+* **模型中心的悬浮 / 阴影 / 点选边框未做人工鼠标验收** —— 目前只有结构断言 + 自动化像素
+  断言（细则 4h 的"必须真的动鼠标"留给下一轮回归）。

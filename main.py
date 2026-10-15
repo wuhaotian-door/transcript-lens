@@ -107,6 +107,7 @@ CHECK_MODULES: tuple[str, ...] = (
     "core.import_workers",
     "core.scholarship",
     "core.database",
+    "core.gpa",
     "core.system_info",
     "core.ai",
     "core.ai.local_assistant",

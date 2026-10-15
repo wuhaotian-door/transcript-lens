@@ -148,6 +148,25 @@ def _lift_1_8_1_to_1_9(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def _lift_1_9_to_1_9_1(data: dict[str, Any]) -> dict[str, Any]:
+    """1.9 → 1.9.1：**没有数据结构变化**。
+
+    v1.9.1 是 v1.9 的**紧急修复版**（七个问题）：全局 AI 助手入口删掉、谈话能力
+    收进档案页的「AI 辅导」标签页、模型中心改卡片流、成绩单条删除与「删除成绩库」
+    判据修复（``core.database.library_inventory``）、审计日志
+    （``audit/grade_changes.json.enc``）、GPA 方案 1（新建 ``core/gpa.py``，
+    ``gpa_settings.json.enc``）与核对界面 QSplitter。
+
+    这些全部是**新增文件**或**界面行为**：加密库里没有字段增删，老库原样可读。
+    ``audit/grade_changes.json.enc`` 与 ``gpa_settings.json.enc`` 都是新建载荷 ——
+    老库打开时读到"没有这个文件"就当空，已有数据一个字节都不动。
+
+    ★ 这一跳是**发版需要**（更新检查靠版本号比大小，见 AGENTS.md §23b），
+      照旧什么都不用改，只把标记从 1.9 抬到 1.9.1。
+    """
+    return data
+
+
 #: 版本链：``(起点, 终点, 变换函数)``。
 #:
 #: ★ 这是"未来版本在此添加分支"的那张表（任务书 2.3）。加一跳只需要
@@ -158,6 +177,7 @@ _STEPS: tuple[tuple[str, str, Callable[[dict[str, Any]], dict[str, Any]]], ...] 
     ("1.7", "1.8", _lift_1_7_to_1_8),
     ("1.8", "1.8.1", _lift_1_8_to_1_8_1),
     ("1.8.1", "1.9", _lift_1_8_1_to_1_9),
+    ("1.9", "1.9.1", _lift_1_9_to_1_9_1),
 )
 
 

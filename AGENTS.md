@@ -428,6 +428,12 @@ onefile 的 exe 启动时会**再起一个子进程**（bootloader + 真正的�
 
 ★ **成绩绝不许往应用级里塞。** 这是这条分工的底线。
 
+★ **例外（Owner 在 v1.9 二期拍板，v1.9.1 正式记录）**：**成绩历史**
+（`u_<uid>/grade_history.json.enc`）与**侧写**（`student_profiles.json.enc`）走
+**应用级密文 + 审计日志**（"成绩加密方案 C：应用级加密 + 审计日志"）—— 自动登录时没有密码，
+档案页要能读；**与本条旧底线的冲突以这一条为准**。**其余成绩**（导入的原始成绩库、按密码级
+保存的那份）**仍然绝不许**进应用级。
+
 ## 17. ★★ 切页抖动的正解：不要给页面挂透明度效果
 
 **症状**：点侧栏切页，落定之后界面**略微抖一下**。
@@ -941,11 +947,14 @@ parse_excel(path, engine=engine_for(path))   # 调用方传引擎进去
 ## 34. ★ AI 推理引擎（v1.9 二期）
 
 * `core/ai/inference.py` **零 HTTP import，且 import 期绝不 import `llama_cpp`**
-  （可选依赖藏在 `_import_engine()` 里）；`ui/chat_dialog.py` 挂「AI 谈话助手」。
+  （可选依赖藏在 `_import_engine()` 里）；★ **全局 AI 助手入口已删**（v1.9.1 摘掉顶栏按钮与
+  `_open_chat_assistant`），`ui/chat_dialog.py` 的 `ChatDialog` **保留为内部组件**；档案页
+  「AI 辅导」是它的**姊妹实现**（同一套 `ui/workers.py` 工作线程契约）。
 * `llama-cpp-python` **不进 exe、不动 `build_exe.ps1`**（`requirements.txt` 里只写
   注释）。没引擎时 `engine_available()` 给中文原因、抛 `InferenceUnavailable` ——
   **明确降级，不许静默失败、不许偷偷走云端**。
-* ★ **聊天历史不落明文**（红线 3）：存应用级 `chat_history.json.enc`。
+* ★ **聊天历史不落明文**（红线 3）：存应用级 `chat_history.json.enc`；档案页「AI 辅导」
+  按学生存 `u_<uid>\cache\chat_history_<学号>.json.enc`。
 * 冻结接口（档案页要用）：`ui.chat_dialog.open_chat(parent, *, system_prompt=None,
   initial_prompt=None, prefer_model=None)`（**签名冻结，不许改**）。
 
@@ -961,3 +970,9 @@ parse_excel(path, engine=engine_for(path))   # 调用方传引擎进去
   「总评与侧写」（只显示有真源的平均分/加权均分/GPA/排名）；「AI 侧写」按钮懒 import
   `open_chat()` 并 try/except。★ 不许挂 `QGraphicsEffect`。**完整 API 与判据 → 总纲
   §二十四。**
+* ★ v1.9.1：档案页新增第三标签页「AI 辅导」（见 §34）；成绩/德育/侧写支持**单条删除**，确认
+  文案「确定删除此条记录？此操作不可恢复。」，删掉某学期最后一条成绩时追问「该学期已无成绩，
+  是否同时删除学期记录？」。**「删除成绩库」的判据 = `library_inventory().has_data`**（不是
+  "目录存在"）+ 两次确认，删完发 `SettingsPage.library_cleared(int, int, int)` → 主窗刷新档案/
+  侧写页（§18：只打日志、不弹窗）；**审计日志** `u_<uid>/audit/grade_changes.json.enc` 只记
+  时间/操作/学生ID/学期/课程名，**不记分数**（见 §16 例外）。
