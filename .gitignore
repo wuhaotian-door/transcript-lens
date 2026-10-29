@@ -45,3 +45,8 @@ logs/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 打包自检 / 启动自检的产物（build_exe.ps1 会落在仓库根）
+transcript-lens-selfcheck.txt
+transcript-lens-bootcheck.txt
+transcript-lens-bootcheck.png

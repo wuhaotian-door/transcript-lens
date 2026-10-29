@@ -605,35 +605,49 @@ class GradeHistoryDB:
         Returns:
             ``(改挂过去的行数, 因主键重复而丢弃的行数)``
         """
-        old = _clean_text(old_id)
-        new = _clean_text(new_id)
-        if not (old and new):
+        old_raw = _clean_text(old_id)
+        new_raw = _clean_text(new_id)
+        if not (old_raw and new_raw):
             raise ValueError("old_id / new_id 都不能为空")
-        if old == new:
+        # ★ 两个标识符空间必须在这里对齐：学生主档 / 聊天文件按 ``sid:<学号>``
+        #   存，而成绩历史是**导入时按裸学号**落盘的（``analysis_page`` 直接写
+        #   ``row.student_id``）。不归一的话"改学号"一条成绩也迁不走 ——
+        #   ``report.grades`` 恒 0 且**不报错**（v1.9.2 实测踩到）。
+        old_bare = _bare_student_id(old_raw)
+        new_bare = _bare_student_id(new_raw)
+        if not (old_bare and new_bare):
+            raise ValueError("old_id / new_id 都必须是学号（sid: 前缀可有可无）")
+        if old_bare == new_bare:
             return (0, 0)
+        # 写回时**跟随每一行自己的写法**（导入按裸学号落、档案页按 sid: 落，
+        # 两种都可能同表并存）—— 一律改写成同一种反而会让同一张表两种键混用。
+        new_key = _student_id_of(new_raw)
         rows = self._raw_rows()
-        existing = {_rest_key(row) for row in rows
-                    if _rest_key(row)[0] == new}
+        existing = {(_bare_student_id(_rest_key(row)[0]), _rest_key(row)[1],
+                     _rest_key(row)[2])
+                    for row in rows
+                    if _bare_student_id(_rest_key(row)[0]) == new_bare}
         moved = 0
         dropped = 0
         kept: list[dict[str, Any]] = []
         for row in rows:
-            if _rest_key(row)[0] != old:
+            if _bare_student_id(_rest_key(row)[0]) != old_bare:
                 kept.append(row)
                 continue
-            key = (new, _rest_key(row)[1], _rest_key(row)[2])
+            key = (new_bare, _rest_key(row)[1], _rest_key(row)[2])
             if key in existing:
                 dropped += 1
                 continue
             rewritten = dict(row)
-            rewritten["student_id"] = new
+            rewritten["student_id"] = (
+                f"sid:{new_bare}" if _rest_key(row)[0].startswith("sid:") else new_bare)
             kept.append(rewritten)
             existing.add(key)
             moved += 1
         if moved or dropped:
             self._write(kept)
-            self._audit_record(OP_STUDENT_MIGRATE, student_id=new, count=moved,
-                               detail=f"学号 {old} → {new}；成绩 {moved} 条"
+            self._audit_record(OP_STUDENT_MIGRATE, student_id=new_key, count=moved,
+                               detail=f"学号 {old_raw} → {new_raw}；成绩 {moved} 条"
                                       + (f"，撞键丢弃 {dropped} 条" if dropped else ""))
         return (moved, dropped)
 
@@ -1007,9 +1021,30 @@ class ProfileStore:
         return self._uid
 
     # -- 读 -----------------------------------------------------------------
+    def _resolve_key(self, student_id: Any) -> str:
+        """把 ``2023001`` / ``sid:2023001`` 都解析成**表里实际用的那个键**。
+
+        ★ 同一个学生在不同表里可能两种写法并存（档案页按 ``sid:`` 走，早期写入
+          的侧写行是裸学号）。读 / 写 / 迁移都先过这一层，否则"改学号"迁完
+          侧写还留在旧键下 —— 界面看着像丢了，而且不报错。
+        """
+        raw = _clean_text(student_id)
+        if not raw:
+            return ""
+        if raw in self._cache:
+            return raw
+        bare = _bare_student_id(raw)
+        if bare:
+            for key in self._cache:
+                if _bare_student_id(key) == bare:
+                    return str(key)
+        # 表里还没有这个学生：**按调用方给的写法**建行（不要强行补 ``sid:``）——
+        # ``all_profiles()`` 的键就是"当初写进来的那个写法"，测试与界面都依赖这一点。
+        return raw
+
     def side_text(self, student_id: str) -> str:
         """侧写正文；没有存过（或存的是空串）就返回 ``""``。"""
-        row = self._cache.get(_clean_text(student_id))
+        row = self._cache.get(self._resolve_key(student_id))
         if not isinstance(row, dict):
             return ""
         text = row.get("side_text")
@@ -1030,7 +1065,7 @@ class ProfileStore:
     # -- 写 -----------------------------------------------------------------
     def save_side_text(self, student_id: str, text: str) -> None:
         """写一个学生的侧写正文（**先写盘、成功了才更新内存**，避免假成功）。"""
-        sid = _clean_text(student_id)
+        sid = self._resolve_key(student_id)
         if not sid:
             raise ValueError("student_id 不能为空")
         rows = self._rows_copy()
@@ -1049,7 +1084,7 @@ class ProfileStore:
         Returns:
             ``True`` 表示真抹掉了非空正文；``False`` 表示本来就没有正文可抹。
         """
-        sid = _clean_text(student_id)
+        sid = self._resolve_key(student_id)
         if not sid:
             raise ValueError("student_id 不能为空")
         row = self._cache.get(sid)
@@ -1066,7 +1101,7 @@ class ProfileStore:
     # -- 学期侧写（v1.9.2） ---------------------------------------------------
     def semester_sides(self, student_id: str) -> dict[str, str]:
         """一个学生的**按学期**侧写（``{学期: 正文}``；没有就是空 dict）。"""
-        row = self._cache.get(_clean_text(student_id))
+        row = self._cache.get(self._resolve_key(student_id))
         if not isinstance(row, dict):
             return {}
         stored = row.get("semester_side")
@@ -1084,7 +1119,7 @@ class ProfileStore:
 
     def save_semester_side_text(self, student_id: str, semester: str, text: str) -> None:
         """写该生某学期的侧写正文（先写盘、成功了才更新内存）。"""
-        sid = _clean_text(student_id)
+        sid = self._resolve_key(student_id)
         term = _clean_text(semester)
         if not sid:
             raise ValueError("student_id 不能为空")
@@ -1111,8 +1146,8 @@ class ProfileStore:
         Returns:
             ``True`` 表示真动过；``False`` 表示旧学号本来就没有侧写。
         """
-        old = _clean_text(old_id)
-        new = _clean_text(new_id)
+        old = self._resolve_key(old_id)
+        new = self._resolve_key(new_id)
         if not (old and new) or old == new:
             return False
         source = self._cache.get(old)
@@ -1148,7 +1183,7 @@ class ProfileStore:
 
     def remove(self, student_id: str) -> bool:
         """删掉一个学生的整行侧写（含学期侧写）。彻底删除学生时用。"""
-        sid = _clean_text(student_id)
+        sid = self._resolve_key(student_id)
         if not sid or sid not in self._cache:
             return False
         rows = self._rows_copy()

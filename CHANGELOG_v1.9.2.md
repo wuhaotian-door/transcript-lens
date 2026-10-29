@@ -107,14 +107,18 @@
 
 | 文件 | 用例 | 覆盖 |
 |---|---|---|
-| `tests/test_student_crud.py`（新） | 37 | 主档增删改归档、学号迁移六个来源、审计、聊天缓存清除 |
-| `tests/test_archive_navigation.py`（新） | 62 | 档案页两级视图、学期节点、学期侧写页 |
-| `tests/test_runtime_setup.py`（新） | 41 | 安装目录、sys.path、pip 参数、取消、失败文案、后端状态 |
+| `tests/test_student_crud.py`（新） | 50 | 主档增删改归档、学号迁移六个来源、**裸学号归一 4 条**、审计、聊天缓存清除 |
+| `tests/test_archive_navigation.py`（新） | 74 | 档案页两级视图、学期节点、学期侧写页 |
+| `tests/test_runtime_setup.py`（新） | 46 | 安装目录、sys.path、pip 参数、取消、失败文案、后端状态 |
 | `tests/test_profile_navigation.py`（新） | 30 | 名单来源、搜索、新建/编辑（迁移）/删除、进学期页与返回 |
+| `tests/test_model_center_card.py`（新） | 36 | 卡片流：分组、选中回写、已安装/困难不可选、下载按钮文案 |
+| `tests/test_profile_ai.py`（新） | 33 | 档案页「AI 辅导」：学生 JSON 注入、流式、按生隔离、三条降级 |
 | `tests/test_grade_delete.py`（改） | 77 | 原 74 条 + 3 条聊天缓存随清库删除 |
+| `tests/test_import_review_ui.py`（改） | 50 | 加"模态弹窗不许泄漏"的 autouse 夹具（修跨文件污染） |
+| `tests/test_profile_merge.py`（改） | 29 | 3 条断言跟着档案页三标签页改 |
 
-全量：`pytest tests/ -q` → **861 passed / 0 failed / 0 errors（417.15s）**
-（v1.9.1 基线 660 passed；本次新增 4 个测试文件共 170 条、改 1 个文件 3 条）。
+全量：`pytest tests/ -q` → **865 passed / 0 failed / 0 errors（416.91s）**
+（v1.9.1 基线 660 passed；本次新增 **6 个测试文件共 269 条**、改 3 个文件共 6 条）。
 
 ## 六、已知限制（记录，不是待办）
 
@@ -125,3 +129,9 @@
 - 聊天缓存随"删除成绩库"清除的条件是**勾选了"同时清侧写"**（不勾则按辅助数据保留）。
 - `Qt` 的 `setTextAlignment(int)` 在 `ui/pages/profile_page.py` 里仍有 DeprecationWarning（无害）。
 - `tests/test_profile_navigation.py::test_ui_texts_have_no_markdown` **只扫档案详情页**：在同一进程里先 `open_semester()` 再 `findChildren()` 有可复现的卡死（实测把整条用例挂住），学期侧重页的文案改由离屏 lint 复核。
+- **`show_no_data()` 不删学生主档**：它只清当前视图与名单缓存；主档里还有学生时，
+  名单照常显示（"删除成绩库"删的是成绩/侧写/聊天，不是人）。两条语义都写了用例。
+- 名单下方说明行是「筛出 N / M 人」（搜索态），不是"共 M 人"——`tests/test_profile_navigation.py`
+  按实测文案断言。
+- `open_semester()` 在没有选中学生、或学期名为空时**静默 no-op**（不弹窗、不切页）；
+  这是刻意的：它挂在"点学期节点"的鼠标事件上，弹窗会打断连续点击。

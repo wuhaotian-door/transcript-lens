@@ -543,3 +543,67 @@ def test_名册主档rename_student两个薄封装(vault: CryptoStore, students:
         semester=TERM_A, batch_id="b10")
     assert GradeHistoryDB(username=USER, store=vault).rename_student(SID_A, SID_B) == 1
     assert ProfileStore(username=USER, store=vault).rename_student(SID_A, SID_B) is False
+
+
+# ---------------------------------------------------------------------------
+# ⑭ 裸学号形态（**生产环境就是这个形态**）：导入时 analysis_page 直接写
+#    ``row.student_id``（裸学号），而主档 / 聊天文件按 ``sid:`` 存 ——
+#    两条标识符空间不对齐时，"改学号"一条成绩也迁不走且不报错。
+# ---------------------------------------------------------------------------
+
+
+BARE_A = "20230101"
+BARE_NEW = "20230199"
+
+
+def seed_grade_bare(db: GradeHistoryDB, sid: str = BARE_A) -> None:
+    db.apply([
+        {"student_id": sid, "course_name": MATH, "score": 88.0, "credit": 4.0},
+        {"student_id": sid, "course_name": ENGLISH, "score": 91.0, "credit": 2.0},
+    ], semester=TERM_A, batch_id="bare-1")
+
+
+def test_改学号把裸学号成绩一起迁走(vault: CryptoStore, students: StudentStore) -> None:
+    """生产形态：成绩行是裸学号、主档是 sid: 前缀，迁移也必须一条不少。"""
+    make(students, sid=BARE_A)
+    db = GradeHistoryDB(username=USER, store=vault)
+    seed_grade_bare(db)
+    report = migrate_student_id(BARE_A, BARE_NEW, store=vault, username=USER)
+    assert report.grades == 2, report.as_text()
+    rows = GradeHistoryDB(username=USER, store=vault).rows()
+    assert sorted(r["student_id"] for r in rows) == [BARE_NEW, BARE_NEW]
+
+
+def test_改学号把裸学号侧写一起迁走(vault: CryptoStore, students: StudentStore) -> None:
+    make(students, sid=BARE_A)
+    profiles = ProfileStore(username=USER, store=vault)
+    profiles.save_side_text(BARE_A, "整体评价")
+    profiles.save_semester_side_text(BARE_A, TERM_A, "本学期评价")
+    report = migrate_student_id(BARE_A, BARE_NEW, store=vault, username=USER)
+    assert report.profiles == 1
+    fresh = ProfileStore(username=USER, store=vault)
+    assert fresh.side_text(BARE_NEW) == "整体评价"
+    assert fresh.semester_side_text(BARE_NEW, TERM_A) == "本学期评价"
+    assert fresh.side_text(BARE_A) == ""
+
+
+def test_rekey_student裸学号与sid前缀都能迁(vault: CryptoStore, students: StudentStore) -> None:
+    """两种落盘写法都认：裸学号行按裸写、sid 行按 sid 写。"""
+    db = GradeHistoryDB(username=USER, store=vault)
+    db.apply([{"student_id": BARE_A, "course_name": MATH, "score": 90.0, "credit": 4.0}],
+             semester=TERM_A, batch_id="bare-2")
+    assert db.rekey_student(BARE_A, BARE_NEW) == (1, 0)
+    assert db.rekey_student("sid:" + BARE_NEW, "sid:20230198") == (1, 0)
+    rows = GradeHistoryDB(username=USER, store=vault).rows()
+    # ★ 写回跟随"这一行原来的写法"：原来的行是裸学号，迁完仍是裸学号。
+    assert [r["student_id"] for r in rows] == ["20230198"]
+
+
+def test_ProfileStore读写两种学号写法都命中(vault: CryptoStore) -> None:
+    profiles = ProfileStore(username=USER, store=vault)
+    profiles.save_side_text("sid:20230201", "带前缀写入")
+    fresh = ProfileStore(username=USER, store=vault)
+    assert fresh.side_text("20230201") == "带前缀写入"
+    assert fresh.side_text("sid:20230201") == "带前缀写入"
+    profiles.save_semester_side_text("20230201", TERM_A, "裸学号写学期侧写")
+    assert ProfileStore(username=USER, store=vault).semester_side_text("sid:20230201", TERM_A) == "裸学号写学期侧写"
