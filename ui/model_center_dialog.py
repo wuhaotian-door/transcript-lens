@@ -76,6 +76,7 @@ v1.9.1 的施工单把界面这一侧收得更紧：**困难卡片点了也不�
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -121,6 +122,27 @@ from core.updater import DownloadCancelled, download_exe, verify_checksum
 from ui.workers import run_async
 
 __all__ = ["ModelCenterDialog", "ModelCard", "ModelVerifyError", "open_model_center"]
+
+#: 本模块的日志器。后端组件缺失 / 检查失败**只记日志**，模型中心照常打开。
+_log = logging.getLogger(__name__)
+
+
+def _backend_available() -> bool:
+    """本机的推理后端装好没有。
+
+    ★ 契约来自 :mod:`core.ai.runtime_setup`（v1.9.2）。并行开发期间它可能还
+      没落地 —— 那种情况下**按"可用"处理**：不插安装卡片，也绝不崩，
+      模型中心照常打开（本模块的既有行为一个字不变）。
+    """
+    try:
+        from core.ai.runtime_setup import is_backend_available  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 - 还没落地：不插卡片，界面照开
+        return True
+    try:
+        return bool(is_backend_available())
+    except Exception:  # noqa: BLE001 - 检查失败按可用处理，别误报"未安装"
+        _log.warning("检查推理后端是否可用失败，按可用处理", exc_info=True)
+        return True
 
 #: 对话框标题。
 DIALOG_TITLE = "模型中心"
@@ -891,6 +913,12 @@ class ModelCenterDialog(QDialog):
         intro.setWordWrap(True)
         outer.addWidget(intro)
 
+        # ★ v1.9.2：推理引擎没装时，在说明文字下方、滚动区上方插一张安装卡片
+        #   （AGENTS §36：三态卡片是**唯一**入口；这里不复制安装流程）。
+        self._backend_card = self._make_backend_card()
+        if self._backend_card is not None:
+            outer.addWidget(self._backend_card)
+
         # ---- 卡片流：QScrollArea + QGridLayout -------------------------
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
@@ -908,7 +936,10 @@ class ModelCenterDialog(QDialog):
         self._grid.setSpacing(CARD_SPACING)
         for column in range(GRID_COLUMNS):
             self._grid.setColumnStretch(column, 1)
-        self._grid.setRowStretch(0, 1)
+        # ★ v1.9.2：**不要**再给第 0 行（组标题行）挂 stretch —— 那会让"视口高度一变，
+        #   卡片整体往下顶同样多"，而安装卡片的折行高度在首次显示后会自己差 2px，
+        #   于是鼠标一进卡片、卡片自己的 y 就跟着挪 2px（4c：只能量像素才看得见）。
+        #   剩下的竖直余量本来就落在最后一行的下面，卡片因此**顶对齐**、位置恒定。
         self._scroll.setWidget(self._grid_host)
         outer.addWidget(self._scroll, 1)
 
@@ -969,6 +1000,52 @@ class ModelCenterDialog(QDialog):
         outer.addLayout(row)
 
         self._placeholder: QLabel | None = None
+
+    # ------------------------------------------------------------------
+    # 推理后端安装卡片（v1.9.2）
+    # ------------------------------------------------------------------
+
+    def _make_backend_card(self) -> QWidget | None:
+        """引擎没装时建一张 ``BackendSetupCard``，返回 ``None`` 表示不插。
+
+        ★ ``ui.widgets.backend_setup`` 与它依赖的 ``core.ai.runtime_setup`` 是
+          并行开发的组件：**任何一步缺失都只记 warning**，模型中心照常打开，
+          绝不允许 import 失败把整个对话框带崩。
+        """
+        if _backend_available():
+            return None
+        try:
+            from ui.widgets.backend_setup import BackendSetupCard  # noqa: PLC0415
+        except Exception:  # noqa: BLE001 - 组件还没落地：界面照开
+            _log.warning("后端安装卡片还没落地，模型中心按原样打开")
+            return None
+        try:
+            card = BackendSetupCard(self)
+        except Exception:  # noqa: BLE001 - 建不出来也不许崩
+            _log.warning("后端安装卡片创建失败", exc_info=True)
+            return None
+        card.ready.connect(self._on_backend_ready)
+        refresh = getattr(card, "refresh", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:  # noqa: BLE001 - 刷新失败只记日志
+                _log.warning("后端安装卡片刷新失败", exc_info=True)
+        return card
+
+    def _on_backend_ready(self) -> None:
+        """引擎装好了：收起卡片，并把模型状态刷新一次。"""
+        card = getattr(self, "_backend_card", None)
+        if card is not None:
+            try:
+                card.setVisible(False)
+                card.deleteLater()
+            finally:
+                self._backend_card = None
+        try:
+            self._load_manifest()
+        except Exception:  # noqa: BLE001 - 刷新失败只记日志
+            _log.warning("后端就绪后刷新模型状态失败", exc_info=True)
 
     @staticmethod
     def _download_button_text(count: int) -> str:
