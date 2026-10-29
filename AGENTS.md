@@ -159,49 +159,8 @@ PyInstaller 会把整个 Qt 排除，**exe 一启动就 `ModuleNotFoundError`，
 
 ### 4j. `QGraphicsDropShadowEffect` 挂整窗的代价：约 40ms/次切页
 
-实测（1900×1200，150% DPI）：阴影开中位 523ms、关 483ms（**+8%**）。
-Qt 会缓存效果的源 pixmap，页面淡入淡出**不会**每帧重新模糊整窗（否则 +1200ms），所以代价
-可接受 —— 但**别在动画期间额外触发整窗 `update()`**。测法 → §二十三 4j。
-
-### 4k. ★★★ 窗口动画的 `finished` 回调里**不许销毁那个窗口** —— 会静默炸进程
-
-症状：双击 exe → 开屏 → 打招呼 → **然后就没了**（界面不出来、**没有任何报错**，退出码
-`0xC0000409` = STATUS_STACK_BUFFER_OVERRUN）。根因是动画回调里销毁窗口造成两步 use-after-free（三步推导 → §二十三 4k）。
-
-**正确写法是让回调延后一拍** —— ⛔ `anim.finished.connect(lambda: on_done())`；✓
-`anim.finished.connect(lambda: QTimer.singleShot(0, window, on_done))`。`ui/anim.py` 的
-`_drop` 必须是 `finished` 上的**第一个**槽，并用 `shiboken6.isValid()` 判活之后再碰动画对象。
-
-**规矩**：任何"动画结束后销毁触发它的那个对象"的代码，回调必须延后一拍；并且**必须有测试
-真的把动画跑完**，不许 `skip_to_end()`。两道闸门**都别再拆掉**：`%TEMP%\tl_boot_test.py`
-（`auto` / `login` / `switch` 三个真实时序，每个**单独进程**，退出码即断言）和
-`transcript-lens.exe --bootcheck`；`build_exe.ps1` 打完包**两个都跑**，非 0 判失败。
-逐步推导与 400 项测试为何没抓到 → §二十三 4k。
-
-### 4l. ★★ 启动慢的两个真凶：`QSplashScreen` 和标题里的 emoji
-
-实测（`%TEMP%\tl_splash_probe.py` / `tl_perf_bench.py`，带 `sleep(0.15)` 对照组校准）：
-**跟动画时长、跟机器性能都无关**，是两笔一次性开销：`QSplashScreen` 比自绘 `QWidget` 慢
-**865ms**（`ui/splash.py` 已改成自绘 `QWidget`）；开屏标题里的 **emoji 一个字 241.7ms**
-（只删开屏 pixmap 里的，**已映射窗口**里的 emoji 不占启动时间）；剩下 765ms 全黑是因为开屏
-**先发 finished 再淡出**，现在**先叫下一个窗口、再淡出自己**（`ui/splash.py._start_fade_out`）
-—— 因果 → §二十三 4l。
-各变体完整实测表 → §二十三 4l。
-
-**预热的三条规矩**（`AppFlow._prewarm_main` 提前建好主窗并 `show()`）★ **不能在 `run()`
-之后紧接着预热**（那样会把**淡入动画冻在第一帧**，用户看到"点了没反应"，所以挂在
-`on_shown` 上）；★ 停留时间要**扣掉**预热耗时（`HOLD_MS - spent`）；★ `HOLD_MS` = **1500**
-（总纲 §10.2 写死的）—— 因为扣时间，这 1500 里含主窗构造那 ~600ms，**不是** 1500 + 600。
-三条各自的踩坑现场 → §二十三 4l。
-
-### 4m. 切页卡顿：淡出那一段是纯粹的等待
-
-实测一次切页的耗时 vs 两段动画时长（真跑 `StackSwitcher`，取中位数）：`180+240`（原）→
-**439 ms**、`120+180` → 326 ms、`90+150` → 260 ms、`0+150` → 166 ms、**`0+130`（现在）
-→ ~137 ms**。`180 → 0` 一项就省掉近 300ms，是整条链上最划算的一刀：那段旧页在变淡、新页
-还没出现，用户盯着一个越来越空的屏幕，它不传递任何信息。要回淡出就把 `ui/anim.py` 的
-`FADE_OUT_MS` 设回 180，`switch()` 会自动走回淡出分支，**两条路径都有测试覆盖**。
-
+实测（1900×1200、150% DPI）：阴影开中位 523ms、关 483ms（**+8%**）—— 代价可接受，
+但**别在动画期间额外触发整窗 `update()`**。测法 → §二十三 4j。
 ## 5. 密码找回：已接通邮箱（网易 163 SMTP）
 
 - **恢复码 = 唯一的第二把钥匙。** 注册成功时生成一串 24 位找回码，本地存一份"用它包起来的库
@@ -796,12 +755,8 @@ manually.` —— pandas 自己的 sniff 只认 zip 和 OLE2。
 
 ### 27b. ★★ "导 .xlsx 却弹出 xlrd 错误"的根因（实测复现）
 
-pandas **不看扩展名，看内容的魔数**。一个"扩展名 `.xlsx`、内容其实是 OLE2"的文件
-（**教务系统导出的老格式表经常长这样**）被判成 `"xls"` → 调 xlrd →
-没装就抛 `ImportError: Missing optional dependency 'xlrd'. … Use pip or conda
-to install xlrd.` —— 用户看到的是"我导的是 xlsx，为什么跟我说 xlrd"，错误里还带着 pip 指令。
-**修法**：按内容选引擎 + 兜底链（认定的引擎失败就换另一个试）→ §二十三 27b。
-
+pandas **不看扩展名、看内容魔数**：扩展名 `.xlsx` 而内容是 OLE2 的老表会被判成 `xls`，
+没装 xlrd 就抛带 pip 指令的 `ImportError`。**修法**：按内容选引擎 + 兜底链。→ §二十三 27b
 ### 27c. ★ `xlrd` 必须 **>= 2.0.1**，任务书写的 `<2.0` 是错的
 
 | xlrd 版本 | pandas 2.3.3 读 .xls |
@@ -976,3 +931,34 @@ parse_excel(path, engine=engine_for(path))   # 调用方传引擎进去
   "目录存在"）+ 两次确认，删完发 `SettingsPage.library_cleared(int, int, int)` → 主窗刷新档案/
   侧写页（§18：只打日志、不弹窗）；**审计日志** `u_<uid>/audit/grade_changes.json.enc` 只记
   时间/操作/学生ID/学期/课程名，**不记分数**（见 §16 例外）。
+
+## 36. ★ 推理后端一键安装（v1.9.2）
+
+* `core/ai/runtime_setup.py`：**零 HTTP import**，pip 走子进程（Windows 必须
+  `subprocess.CREATE_NO_WINDOW`，绝不弹黑框）。安装目标是**应用私有目录**
+  `%LOCALAPPDATA%\SGMS\runtime\site`（`pip install --target`），启动时由
+  `ensure_runtime_on_path()` 插进 `sys.path` —— 打包版 `sys.executable` 是 exe 自己、
+  里面没有 pip，所以**必须借本机的系统 Python**；找不到就给「复制命令」，
+  **绝不静默降级**（§13 仍生效：pip 是子进程，不是我们的 HTTP 库）。
+* ★ **绝不静默安装**：只有用户点「一键安装」才跑；取消 = terminate + kill 兜底；
+  失败把**完整命令**摆出来并给「复制命令」「重试」，异常不许冒到事件循环里。
+* `ui/widgets/backend_setup.py` 的三态卡片是**唯一**入口，模型中心与「学期侧写」页摆卡片；档案页「AI 辅导」页**不重复摆**（那页控件已经很多），只贴中文原因 + 「打开模型中心」按钮；装成功后 `ready` 信号自动继续加载模型。
+* llama-cpp-python **仍不进 exe**（`requirements.txt` 只有注释）。判据
+  `tests/test_runtime_setup.py` + `--selfcheck` 那条"`core/ai/*.py` 零 HTTP import"。
+
+## 37. ★ 成绩档案穿透导航与学生主档（v1.9.2）
+
+* `students.json.enc` 是**学生主档**（学号/姓名/班级/备注/归档/来源），
+  `StudentStore` 是唯一读写口；导入成绩时 `upsert_import()` 自动补档 ——
+  **不许另立第二份名单**。列表默认不显示归档，搜索框输入「已归档」才看得到。
+* 档案页是**两级视图**（`QStackedWidget`）：详情页的学期时间轴点一下**穿透**到
+  「学期侧写」页（`ui/pages/semester_side_profile.py`，上下文只注入该学期），
+  返回按钮回详情。导入页「侧写」按钮只发 `student_selected`，主窗切页后由
+  `ProfilePage.ask_semester_and_open()` 让用户选学期。
+* ★ **改学号必须全量迁移**：成绩历史、侧写（含学期侧写）、聊天历史文件、
+  德育分键（`sid:`）、意愿标签 —— 少一样就是**静默丢数据**；走
+  `core.database.migrate_student_id()`，失败只 warning 不中断。删除学生二选一：
+  彻底删除（先清关联数据）或归档隐藏（数据全留）。
+* 学期均分是**算术平均**（界面标签必须写明），加权均分/GPA 一律复用
+  `core/calculator` 与 `core/gpa`，**不许自创换算**；审计日志新增 `detail` 字段，
+  **永不写分数**。完整 API 与判据 → 总纲 §二十六。

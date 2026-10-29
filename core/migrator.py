@@ -167,6 +167,25 @@ def _lift_1_9_to_1_9_1(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def _lift_1_9_1_to_1_9_2(data: dict[str, Any]) -> dict[str, Any]:
+    """1.9.1 → 1.9.2：**没有数据结构变化**。
+
+    v1.9.2 新增的都是**新载荷文件**，老库读到"没有这个文件"就当空，
+    已有数据一个字节都不动：
+
+    * ``students.json.enc`` —— 学生主档（学号 / 姓名 / 班级 / 备注 / 归档 / 来源）；
+    * ``semester_side/<学号>/<学期>.json.enc`` —— 学期侧写正文；
+    * ``runtime/site/`` —— 推理后端（python 包）的可选安装目录，**不在加密库里**。
+
+    ``grade_history.json.enc`` / ``student_profiles.json.enc`` / 审计日志的格式
+    保持向后兼容（审计行只多了一个可选的 ``detail`` 字段，旧行读出来是空串）。
+
+    ★ 这一跳同样是**发版需要**（更新检查靠版本号比大小，见 AGENTS.md §23b），
+      照旧什么都不用改，只把标记从 1.9.1 抬到 1.9.2。
+    """
+    return data
+
+
 #: 版本链：``(起点, 终点, 变换函数)``。
 #:
 #: ★ 这是"未来版本在此添加分支"的那张表（任务书 2.3）。加一跳只需要
@@ -178,6 +197,7 @@ _STEPS: tuple[tuple[str, str, Callable[[dict[str, Any]], dict[str, Any]]], ...] 
     ("1.8", "1.8.1", _lift_1_8_to_1_8_1),
     ("1.8.1", "1.9", _lift_1_8_1_to_1_9),
     ("1.9", "1.9.1", _lift_1_9_to_1_9_1),
+    ("1.9.1", "1.9.2", _lift_1_9_1_to_1_9_2),
 )
 
 

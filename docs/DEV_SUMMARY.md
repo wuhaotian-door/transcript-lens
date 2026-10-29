@@ -2258,3 +2258,112 @@ v1.9.1 **不新增业务能力** —— 它把 v1.9 上线后暴露的七个问�
   脚本的只读 API。
 * **模型中心的悬浮 / 阴影 / 点选边框未做人工鼠标验收** —— 目前只有结构断言 + 自动化像素
   断言（细则 4h 的"必须真的动鼠标"留给下一轮回归）。
+
+## 二十六、v1.9.2：学生主档、两级档案页与一键装推理后端
+
+这一版解决的是**"这个班有哪些学生"到底以谁为准**的问题，以及三个一直没闭环的入口：
+档案页不能新增/删除学生、不能看单个学期的侧写、推理后端只能靠命令行手动装。
+
+### 26.1 学生主档（`students.json.enc`）
+
+* 唯一真源是 `core.database.StudentStore`，载荷 `students.json.enc`（应用级加密，第 16 节）。
+  字段：`student_id`（`sid:<学号>`）、`name`、`class_name`、`note`、`archived`、`source`、
+  `created_at` / `updated_at`。
+* ★ **学号是标识不是约束**：写入口一律 `_student_id_of()` 补 `sid:` 前缀，读出来用
+  `_bare_student_id()` 拆回去。两种写法混用会让同一个人在名单里出现两次（第 9 节同一条道理）。
+* `add()` 撞学号抛 `DuplicateStudentError`（界面捕获后给中文提示，**不是**崩溃）；
+  `update()` 只改姓名/班级/备注（要改学号必须走 26.2 的迁移）；
+  `archive()` 只把 `archived` 置真（**数据一条不删**），`restore()` 反过来；
+  `remove()` 才是真删（界面叫"彻底删除"）。
+* **导入补档**：`upsert_import()` 没有就建、有就**只补空字段**（绝不用 Excel 里的名字
+  覆盖辅导员手改过的名字）。
+* 判据：`tests/test_student_crud.py`（37 项）。
+
+### 26.2 改学号 = 全量迁移（`migrate_student_id`）
+
+学号变了不是改一个字段，而是要把**七处**引用一起搬：
+
+| # | 来源 | 怎么搬 |
+|---|---|---|
+| 1 | 成绩历史 `grade_history` | `GradeHistoryDB.rekey_student()` 重建主键；撞键（同学生同学期同课程）时保分高的一条、旧的丢并计数 |
+| 2 | 总评侧写 `student_profiles.side_text` | `ProfileStore.move_student()` |
+| 3 | 学期侧写 `student_profiles.semester_side` | 同上（一行一学期） |
+| 4 | AI 聊天缓存 `cache/chat_history_<裸学号>.json.enc` | 文件改名（新名已存在则合并保留旧的） |
+| 5 | 德育分 `class_<班>_moral.json.enc` 的 `scores` 键 | `_rename_key()` + 回写 |
+| 6 | 意愿标签 `tags.json.enc` 的 `intentions` 键 | `_rename_nested()` |
+| 7 | 班级快照 `class_<班>.json.enc` 里的学生键 | `rename_student_key()`（找不到就计 0，不算失败） |
+
+* 返回 `StudentMigrationReport`（`grades` / `grade_dropped` / `profiles` / `chats` / `moral` /
+  `intentions` / `files`，`total()` 与 `as_text()`），界面用它弹"迁了几条"。
+* 审计记一条 `student_migrate`，`detail` 写旧学号→新学号（**不写分数**）。
+* ★ 两个坑：① `ProfileStore` 在内存里有 `_cache`，**迁完必须重建实例**再读，否则读回旧键；
+  ② 德育分与意愿的载荷是**嵌套字典**（`{"scores": {...}}` / `{"intentions": {...}}`），
+  按顶层键改名等于什么都没改。
+
+### 26.3 审计日志扩展
+
+* `AUDIT_OPERATIONS` 由 3 种（`insert` / `overwrite` / `delete`）扩到 9 种：加上
+  `student_add` / `student_edit` / `student_archive` / `student_restore` /
+  `student_delete` / `student_migrate`（+ `semester_delete` 由 `delete_semester` 记）。
+* 每条多一个 `detail` 字段（索引信息，如姓名、旧新学号）——★ **永远不写分数**
+  （`tests/test_grade_delete.py` 有一条断言 `set(entry) == {at, operation, student_id,
+  semester, course_name, count, detail}`，就是在守这条）。
+* `AUDIT_MAX_ENTRIES = 2000` 封顶，超出丢最老的；日志损坏只警告、不清空。
+* 已知：**没有界面查看器**，`GradeAuditLog.changes()` 是只读 API。
+
+### 26.4 档案页两级视图
+
+* `ui/pages/profile_page.py` 用 `QStackedWidget` 两层：第 0 层详情（左名单 + 右学生卡 +
+  学期时间轴 + 三标签页），第 1 层学期侧写（`ui/pages/semester_side_profile.py`）。
+* 名单数据来源**两级兜底**：`StudentBook.durable` 为真用主档；否则用 `set_roster()`
+  推来的内存名单。★ 这一条是硬要求 —— 主档坏了不能把 v1.9.1 的名单一起弄没。
+* 时间轴节点（`profile_shared.TermNode`）只列**成绩历史里真出现过的学期**，
+  按 `_ordered_records()` 的顺序；点节点 = `open_semester(term)`。
+* 主窗穿透：分析页双击 → `show_student()` → `ask_semester_and_open()` 弹选学期 → 第 1 层；
+  清库 → `reset_view()` 把**两级都**复位（只复位一级会让用户切回去还看到上个学生的学期侧写）。
+* ★ 仍然**不许挂 `QGraphicsOpacityEffect` / `QGraphicsDropShadowEffect`**（第 4b/17 节），
+  三个新 UI 文件里对这两个名字只有文档字符串里的"禁止"说明。
+
+### 26.5 清成绩库的判据与聊天缓存
+
+* 界面判据改成 `library_inventory()["grade_rows"]`（= `grade_history` 表为空）。
+  旧版查的是早已废弃的 `grades.enc`，于是出现"档案页有学生、设置页说没有成绩库"。
+* `library_inventory()` 新增 `student_rows` 与 `chat_files`；`clear_library()` 在
+  `with_profiles=True` 时顺带删 `cache/chat_history_*.json.enc`，并把它们写进
+  `report["files"]`；`with_profiles=False` 时**保留**（谈话记录属于辅助数据）。
+* 确认框必须如实写「· 该生的 AI 聊天缓存也会一并清除」——删了用户不知道是红线 3 的同类问题。
+
+### 26.6 推理后端一键安装
+
+* `core/ai/runtime_setup.py`（零 Qt、零 HTTP import）：`pip install --target
+  %LOCALAPPDATA%\SGMS\runtime\site llama-cpp-python`，然后 `ensure_runtime_on_path()`；
+  **绝不改系统 Python、不写注册表**。
+* 默认带 `-i https://mirrors.aliyun.com/pypi/simple/`（`PIP_EXTRA_INDEX`）：
+  国内直连 PyPI 基本必然超时（`INSTALL_TIMEOUT = 600`）。
+* `find_system_python()` 只认"能跑起来"的解释器（`_probe_python` 真跑一次），
+  依次试 `sys.executable` / `python` / `py -3` / 常见安装目录；**全都不是硬编码猜测**。
+* 安装线程 `BackendInstallThread` 可以取消（`cancel()` 置位 + 杀进程树），
+  逐行回调给界面滚动日志（最多 2000 行）；失败给中文原因 + `install_command_text()` 复制命令。
+* `ui/widgets/backend_setup.py` 的三态卡片是**唯一**安装入口（AGENTS §36）；
+  它 import 失败时模型中心照常打开（按"可用"处理，不误报"未安装"）。
+
+### 26.7 判据与闸门
+
+* 新增测试：`tests/test_student_crud.py`（37）、`tests/test_archive_navigation.py`（62）、
+  `tests/test_runtime_setup.py`（41）、`tests/test_profile_navigation.py`（16）；
+  `tests/test_grade_delete.py` 从 74 增至 77（聊天缓存三条）。
+* `main.CHECK_MODULES` 增加 `ui.pages.profile_shared`、`ui.pages.semester_side_profile`、
+  `ui.widgets`、`ui.widgets.backend_setup`、`core.ai.runtime_setup`。
+* 封板四文件 sha256 **未变**；`--selfcheck` 全绿；`known_data_versions()` 到 `"1.9.2"`。
+
+### 26.8 并发开发的两条教训
+
+* ★ **同一个文件只能有一个写者**。这一版里 `ui/pages/profile_page.py` 同时被
+  "档案页重构"和"集成接线"两个子代理认领，结果集成代理先落地了一整套两级视图（含
+  `SemesterSideProfilePage`），重构代理读到旧版后准备从头重写 —— 差点把已完成的实现覆盖掉。
+  **正确做法**：先由主控把目标文件落到磁盘（哪怕只有接口骨架），子代理只补测试或在**互斥**
+  的文件上工作。
+* ★ **契约先落磁盘再并行**。`core.ai.runtime_setup` 被两个代理各写了一套 API
+  （`install()` vs `BackendInstallThread` + `backend_status()`），最后靠主控裁决保留一套、
+  并让 `ui/model_center_dialog.py` 用 `try/except` 探测两端 —— 这种"探测兜底"只能是过渡，
+  版本发布前必须收敛成单一契约（本版已收敛到 `runtime_setup`）。
