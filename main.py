@@ -1991,11 +1991,23 @@ def run_selfcheck() -> int:
     except Exception as exc:  # noqa: BLE001 - 自检自身崩了也要留下痕迹
         ok, report = False, f"自检自身崩溃：{exc.__class__.__name__}: {exc}"
 
+    # ★ 报告路径要有兜底：打包后的窗口版 exe 常常拿不到可用的 %TEMP%
+    #   （实测从 bash / CI 继承 TMP=/tmp 这类假路径时，tempfile 会一路退到
+    #   os.curdir，报告就落在"当时的当前目录" —— 构建脚本按 %TEMP% 找，找不到
+    #   就判失败）。按"临时目录 → 当前目录 → exe 所在目录"依次尝试，
+    #   并把最终落点打出来；一处都写不进去才放弃。
     target = Path(tempfile.gettempdir()) / SELFCHECK_NAME
-    try:
-        target.write_text(report, encoding="utf-8")
-    except OSError:
-        pass
+    for candidate in (
+        target,
+        Path.cwd() / SELFCHECK_NAME,
+        Path(sys.executable).parent / SELFCHECK_NAME,
+    ):
+        try:
+            candidate.write_text(report, encoding="utf-8")
+        except OSError:
+            continue
+        target = candidate
+        break
 
     # 窗口版 exe 的 sys.stdout 是 None，直接 print 会 AttributeError
     stream = getattr(sys, "stdout", None)

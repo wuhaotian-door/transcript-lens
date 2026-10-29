@@ -295,7 +295,16 @@ function Build-One {
 
     if (-not $SkipSelfCheck) {
         Write-Host "=== 打包后自检：$name.exe --selfcheck ===" -ForegroundColor Cyan
-        $report = Join-Path ([System.IO.Path]::GetTempPath()) 'transcript-lens-selfcheck.txt'
+        # ★ exe 必须在**专用空临时目录**里跑：实测本机 %TEMP%（约 2000 个条目）下，
+        #   单文件 exe 每次解包都以 -1 退出、连报告都不写；换成一个新建的空目录立刻
+        #   正常（RESULT: ALL OK）。所以这里给 exe 单开一个 build\_selfcheck_tmp。
+        $exeTmp = Join-Path (Join-Path (Get-Location) 'build') '_selfcheck_tmp'
+        New-Item -ItemType Directory -Force -Path $exeTmp | Out-Null
+        $savedTemp = $env:TEMP
+        $savedTmp = $env:TMP
+        $env:TEMP = $exeTmp
+        $env:TMP = $exeTmp
+        $report = Join-Path $exeTmp 'transcript-lens-selfcheck.txt'
         Remove-Item $report -Force -ErrorAction SilentlyContinue   # 免得读到上一次的旧报告
 
         # ★ 必须用 Start-Process 而不是 `& $exe`：--windowed 的 exe 属于 GUI 子系统，
@@ -326,6 +335,15 @@ function Build-One {
         $proc.Refresh()
         $code = $proc.ExitCode
 
+        if (-not (Test-Path $report)) {
+            # 兜底：打包后的 exe 拿不到可用的 %TEMP% 时，main.run_selfcheck() 会退到
+            # “当前目录 → exe 所在目录”落盘（见那里注释）。三处都看一眼，免得报告
+            # 其实写出来了、脚本却只认 %TEMP% 一个位置而误判成“没找到报告”。
+            foreach ($alt in @((Join-Path (Get-Location) 'transcript-lens-selfcheck.txt'),
+                               (Join-Path (Split-Path $exe) 'transcript-lens-selfcheck.txt'))) {
+                if (Test-Path $alt) { $report = $alt; break }
+            }
+        }
         if (Test-Path $report) {
             Write-Host "--- exe 自检报告 ---"
             Get-Content $report -Encoding UTF8 | ForEach-Object { Write-Host $_ }
@@ -347,7 +365,7 @@ function Build-One {
         # 还在用那个动画对象 → 进程消失。**当时 400 多项测试全绿、源码自检全绿、
         # 两个 exe 都"自检通过"** —— 因为它栽在一条从来没被跑过的路径上。
         Write-Host "=== 打包后：$name.exe --bootcheck（真实启动流程）===" -ForegroundColor Cyan
-        $bootReport = Join-Path ([System.IO.Path]::GetTempPath()) 'transcript-lens-bootcheck.txt'
+        $bootReport = Join-Path $exeTmp 'transcript-lens-bootcheck.txt'
         Remove-Item $bootReport -Force -ErrorAction SilentlyContinue
         $boot = Start-Process -FilePath $exe -ArgumentList '--bootcheck' -PassThru
         $bootDone = $true
@@ -373,6 +391,11 @@ function Build-One {
             throw "exe --bootcheck 失败（退出码 $($boot.ExitCode)）—— 启动流程有问题，看上面的报告"
         }
         Write-Host "exe 启动流程自检通过" -ForegroundColor Green
+
+        # 收工：临时目录与两个环境变量都还原（否则后面的打包步骤会继续用它）
+        $env:TEMP = $savedTemp
+        $env:TMP = $savedTmp
+        Remove-Item $exeTmp -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     return $exe
