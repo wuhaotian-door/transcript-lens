@@ -1,61 +1,31 @@
-"""🎯 个人档案页 —— 左侧学生名单（可搜索） + 右侧两个标签页。
+"""成绩档案页：左学生名单 + 右两级视图（详情 / 学期侧写）。
 
-★ 文件名说明：Spec 五/六 把这一页定名为 ``profile_page.py``（"侧写"），
-  所以**个人中心**那一页在 :mod:`ui.pages.account_page`，别走错。
+布局（v1.9.2 任务书第 2 节）：
 
-布局（v1.9.1 起"左侧保留 + 右侧**三个**标签页"）::
+    +----------------+----------------------------------------------+
+    | 学生名单  [12] | 学生信息卡                                    |
+    | [搜索框      ] | 学期时间轴（横向滚动，点一个学期穿透）          |
+    | 学生 A         | [成绩明细][总评与侧写][AI 辅导]                |
+    | 学生 B         |                                              |
+    | [新建][编辑][删]|                                              |
+    +----------------+----------------------------------------------+
 
-    +------------------+---------------------------------------+
-    | 学生名单          |  【张三（2023001）】                   |
-    | 🔍 [搜索姓名/学号] |  [ 成绩明细 | 总评与侧写 | AI 辅导 ]    |
-    | 张三（2023001）   |   课程树 / 肖像 + 侧写 / 与学生谈话     |
-    | 李四（2023002）   |  -------------------------------------|
-    |                  |  发展意愿       |  辅导提纲             |
-    +------------------+---------------------------------------+
+★ 学生身份一律用**学号**（AGENTS.md §9）：名单、审计、迁移、聊天文件都以学号为键；
+  没有学号的名单行只显示、不落进学生主档（同名会串意愿，界面会提示）。
 
-标签页 1「成绩明细」：按**学期**分组的 课程 / 成绩 / 学分 / 操作 树（可展开折叠）。
-学期顺序**只认** :data:`core.archival.SEMESTER_ORDER`（经
-``sorted_records`` / ``semester_rank``），本页不另抄一份表 —— 抄了就会漂移，
-症状是"大二下排在大一上前头"。
-★ **空 ≠ 0**（红线 2）：没选 / 没考的课，成绩列显示**空白**，绝不显示 0。
-★ 「操作」列是**委托画出来的**一个「删除」小按钮（不是 ``setCellWidget``）：
-  只有真正点到那片矩形才触发删除，见 :meth:`ProfilePage.on_grade_action`。
+★ 学期均分是**算术平均**（有分数的课程求平均），加权均分与 GPA 一律复用
+  ``core.calculator`` / ``core.gpa`` —— 这个页面自己不做任何加权算术（AGENTS §14）。
 
-标签页 2「总评与侧写」：学业肖像（均分 / 三档口径加权 / 趋势 / 短板 / 可抢救项）
-+ **AI 侧写正文**（``core.database.ProfileStore.side_text``）：没有就点
-「点击生成」→ 生成期间按钮置灰、状态行给中文提示 → 正文落进**可编辑**的
-文本框 → 点「保存」才写回 ``ProfileStore``。
+★ 加密两层（AGENTS §16）：成绩历史、侧写、学生主档、聊天记录全部是应用级密文，
+  明文一个字节都不落盘。
 
-标签页 3「AI 辅导」（任务书 2）：学生信息卡 + 只读谈话记录 + 一行输入框。
-系统提示词里**逐字**塞进这名学生的数据 JSON（成绩 / 德育分 / 已有侧写），
-推理走 :class:`core.ai.inference.LocalModelEngine` 的 ``stream()``，
-**在后台线程里跑**（AGENTS §5b / §21a：主线程直接推理会卡死窗口）。
-引擎 / 模型缺失时**明确降级**（中文说明 + 跳「模型中心」），绝不静默失败、
-绝不走云端。
-
-★ 关于"不重新算"
-----------------
-
-Spec 说「数据来源：student dict 里已有的字段，不重新算」。本页严格遵守：
-均分、趋势、定型/可救分区全部来自 :mod:`core.archival` 的
-``trend()`` / ``partition()`` / ``merge_records()``，三档加权来自
-``core.calculator`` —— 那些是 core 里**已经有**的函数，不是本页新写的算术。
-
-唯一的例外是「提至 85 可 +0.X」这一句：它天生是个假设运算，不算是算不出来的。
-处理办法是**复用 core 自己的** ``core.calculator.weighted_average`` ——
-把某一门课的分数换掉之后，把整串课程重新喂给它。这样"假设分"和"实际分"
-出自同一份实现，**绝不会出现两个数字打架**。本页自己一行加减乘除都没写。
-
-★ 界面上**没有** GPA / 排名：仓库里没有它们的真源函数（已全库 grep 确认），
-  按铁律五"没有真源就不显示该字段"。有真源才加得回来。
+★ 界面文案里不写 Markdown 记号（AGENTS §24），也不写版本号字面量（AGENTS §23a）。
 """
 
 from __future__ import annotations
 
 import dataclasses
-import json
 import logging
-import re
 from typing import Any, Callable, Sequence
 
 from PySide6.QtCore import QRect, QSize, Qt, QThread, QTimer, Signal
@@ -63,9 +33,11 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -75,6 +47,7 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QSizePolicy,
+    QStackedWidget,
     QStyle,
     QStyledItemDelegate,
     QTabWidget,
@@ -100,11 +73,88 @@ from ui.intentions import (
     save_intention,
     student_key,
 )
-
-#: 口径的中文说法**只从智育分析页拿**（那一页是 ``scope_breakdown`` 的真源），
-#: 本页不另写一份翻译 —— 两份翻译迟早会有一份说错（上一版就把"选修"写成了
-#: "归限选"，而且没人发现）。
 from ui.pages.analysis_page import scope_breakdown
+from ui.pages.profile_shared import (
+    ACTION_TEXT,
+    ARCHIVED_SEARCH_TEXT,
+    CHAT_CONTEXT_TURNS,
+    CHAT_HISTORY_DIR,
+    CHAT_HISTORY_PREFIX,
+    CHAT_HISTORY_SCHEMA,
+    CHAT_HISTORY_SUFFIX,
+    CHAT_MAX_PROMPT_CHARS,
+    CHAT_ROLE_ASSISTANT,
+    CHAT_ROLE_USER,
+    CHAT_STOP_WORDS,
+    CHAT_SYSTEM_PROMPT_TEMPLATE,
+    DELETE_CONFIRM_TEXT,
+    DELETE_TERM_PROMPT_TEXT,
+    GRADE_TREE_COLUMNS,
+    ITEM_HEIGHT,
+    LIST_WIDTH,
+    MAX_RESCUE,
+    NO_MORAL_TEXT,
+    RESCUE_TARGET,
+    SIDE_TEXT_EMPTY_HINT,
+    TREND_EPS,
+    DuplicateStudentError,
+    StudentBook,
+    StudentDialog,
+    StudentRecord,
+    TermNode,
+    _ACCENT,
+    _AVATAR,
+    _DANGER,
+    _HOVER_BG,
+    _MUTED,
+    _SEL_BG,
+    _TEXT,
+    _WARNING,
+    _ROLE_HAS_ID,
+    _ROLE_ID,
+    _ROLE_INDEX,
+    _ROLE_LEVEL,
+    _ROLE_NAME,
+    _ROLE_SEED,
+    _avatar_color,
+    _bare_sid,
+    _fmt,
+    _initial,
+    build_chat_prompt,
+    build_chat_system_prompt,
+    build_empty_student_archive,
+    build_side_text_prompt,
+    build_student_json,
+    delete_all_semester_sides,
+    delete_semester_side,
+    format_credit,
+    format_score,
+    grade_rows_from_records,
+    group_grades_by_term,
+    history_rows_for,
+    load_archive,
+    migrate_student_id_for,
+    migration_report_text,
+    moral_of,
+    moral_text,
+    open_student_book,
+    read_side_text,
+    record_student_audit,
+    rows_arithmetic_mean,
+    safe_student_file,
+    same_student_id,
+    student_archive_of,
+    student_archive_of_key,
+    student_semester_rows,
+    store_archive,
+    term_of_archive,
+)
+from ui.pages.semester_side_profile import SemesterSideProfilePage
+
+logger = logging.getLogger(__name__)
+
+#: 还在跑的线程，防止被 GC 掉（Qt 里 QThread 被回收会直接崩）。
+_LIVE_WORKERS: set[Any] = set()
 
 __all__ = [
     "ACTION_TEXT",
@@ -117,11 +167,18 @@ __all__ = [
     "GRADE_TREE_COLUMNS",
     "ITEM_HEIGHT",
     "LIST_WIDTH",
+    "ProfilePage",
     "RESCUE_TARGET",
     "RowActionDelegate",
     "SIDE_TEXT_EMPTY_HINT",
     "StudentItemDelegate",
-    "ProfilePage",
+    "_ROLE_HAS_ID",
+    "_ROLE_ID",
+    "_ROLE_INDEX",
+    "_ROLE_LEVEL",
+    "_ROLE_NAME",
+    "_ROLE_SEED",
+    "_avatar_color",
     "build_chat_prompt",
     "build_chat_system_prompt",
     "build_side_text_prompt",
@@ -135,498 +192,7 @@ __all__ = [
     "read_side_text",
     "safe_student_file",
     "term_of_archive",
-    # 下面这几个是给成长档案页复用的（同一个"学生名单"长相同一份实现，
-    # 不复制第二遍 —— 复制出来的那份迟早会和这份长得不一样）
-    "_ROLE_HAS_ID",
-    "_ROLE_ID",
-    "_ROLE_INDEX",
-    "_ROLE_LEVEL",
-    "_ROLE_NAME",
-    "_ROLE_SEED",
-    "_avatar_color",
 ]
-
-#: "提一提"的目标分（Spec 六：附一句"提至85可+0.X"）
-RESCUE_TARGET = 85.0
-
-#: 趋势判定的死区：|Δ| 小于这个值就当"平稳"
-TREND_EPS = 0.5
-
-#: 可抢救项最多列几门（列表太长反而看不清重点）
-MAX_RESCUE = 5
-
-#: 左侧名单宽度
-LIST_WIDTH = 236
-
-#: 名单里一行的高度。要同时放得下头像圆(34) + 上下各 8px 呼吸，还要让
-#: 两行字（姓名 13px / 学号 11px）不挤在一起。
-ITEM_HEIGHT = 54
-
-#: 头像圆的直径
-_AVATAR = 34
-
-#: 右侧第 1 个标签页的表头（四列：课程 / 成绩 / 学分 / 操作）
-#: ★ 第 4 列是「操作」：里面那个「删除」是 :class:`RowActionDelegate` 画出来的，
-#:   不是 `setCellWidget` —— 委托画的按钮才能跟着滚动走、也不吃内存。
-GRADE_TREE_COLUMNS = ("课程", "成绩", "学分", "操作")
-
-#: 「操作」列里那个小按钮的文字。**纯文字，不许用 emoji**（§4l：emoji 是启动开销）
-ACTION_TEXT = "删除"
-
-#: 没有侧写正文时显示的那句话（判据：`test_profile_merge.py` 认这一串）
-SIDE_TEXT_EMPTY_HINT = "还没有侧写。点右上角的「AI 侧写」生成。"
-
-#: 单条删除的确认框正文。**逐字**照任务书，一个字都不许改。
-DELETE_CONFIRM_TEXT = "确定删除此条记录？此操作不可恢复。"
-
-#: 删掉某学期最后一条成绩之后的追加提示（任务书 3）。
-DELETE_TERM_PROMPT_TEXT = "该学期已无成绩，是否同时删除学期记录？"
-
-#: 学生数据缺失时的占位文字（写进提示词的 JSON 里）。
-NO_MORAL_TEXT = "未录入"
-
-#: AI 辅导页的系统提示词模板。``{学生JSON}`` 由
-#: :func:`build_student_json` 的结果逐字替换进去 —— **一个字都不许改**。
-CHAT_SYSTEM_PROMPT_TEMPLATE = (
-    "你是一名高校辅导员助理，正在协助辅导员与一名学生进行谈话。"
-    "以下是该学生的数据：{学生JSON}。"
-    "请根据这些数据提供谈话建议、侧写分析或评语润色。"
-)
-
-#: 谈话记录落在用户目录下的哪个子目录（任务书 2 指定的
-#: ``u_<uid>\cache\chat_history_<学号>.json.enc``）。目录不用自己建 ——
-#: ``core.crypto_store._atomic_write_bytes`` 落盘前会 ``mkdir(parents=True)``。
-CHAT_HISTORY_DIR = "cache/"
-
-#: 谈话记录落盘的文件名前缀 / 后缀。★ **只收 ``.enc``**：
-#: ``save_user_json`` 见到 ``.json`` 会当场拒绝（AGENTS §32 踩过），
-#: 而且磁盘上绝不许出现明文谈话记录（红线 3）。
-CHAT_HISTORY_PREFIX = "chat_history_"
-CHAT_HISTORY_SUFFIX = ".json.enc"
-
-#: 谈话记录载荷的结构版本（将来改结构靠它迁移）。
-CHAT_HISTORY_SCHEMA = 1
-
-#: 谈话记录里两种角色的**存储**键（英文，结构稳定；显示才翻成中文）。
-CHAT_ROLE_USER = "user"
-CHAT_ROLE_ASSISTANT = "assistant"
-
-#: 拼提示词时最多带最近多少轮（多了会撑爆 n_ctx=2048 的上下文窗口）。
-CHAT_CONTEXT_TURNS = 12
-
-#: 提示词的字符上限（双保险：一轮很长时按字符再裁一次）。
-CHAT_MAX_PROMPT_CHARS = 4000
-
-#: 生成时的停止串：模型一旦开始"扮演辅导员"就停。
-CHAT_STOP_WORDS = ("\n辅导员：", "辅导员：")
-
-#: 文件名里不允许出现的字符（学号里的 ``:`` / 空格 / 引号都换掉）。
-_UNSAFE_FILENAME = re.compile(r"[^0-9A-Za-z_-]+")
-
-#: 线程还在跑、但页面已经不要它了时，**必须**留个引用 ——
-#: 一个还在运行的 ``QThread`` 被 Python 回收会让进程直接消失（AGENTS §4k 同族）。
-_LIVE_WORKERS: set = set()
-
-logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# 成绩明细 / 侧写：**纯逻辑**（零 Qt，pytest 直接测）
-# ---------------------------------------------------------------------------
-
-
-def safe_student_file(key: str) -> str:
-    """把 ``sid:2023001`` 这种键变成安全的文件名片段。
-
-    ★ 谈话记录按学生分开存（``cache/chat_history_<学号>.json.enc``），而键里带
-      ``sid:`` 前缀 —— 冒号在 Windows 上根本不是合法文件名字符。没有学号时
-      退回"整个键的清洗结果"，**绝不返回空串**（空串会拼出
-      ``chat_history_.json.enc``，两个没学号的学生就共用一份记录了）。
-    """
-    text = str(key or "").strip()
-    for prefix in ("sid:", "name:"):
-        if text.startswith(prefix):
-            text = text[len(prefix):]
-            break
-    safe = _UNSAFE_FILENAME.sub("_", text).strip("_")
-    if not safe:
-        safe = "unknown"
-    return safe[:64]
-
-
-def moral_text(value: Any) -> str:
-    """德育分那一行的文字。**没录 ≠ 0 分**（AGENTS §14）：没录就写"未录入"。"""
-    if value is None:
-        return NO_MORAL_TEXT
-    if isinstance(value, bool):          # True/False 不该被当成 1/0
-        return NO_MORAL_TEXT
-    if isinstance(value, (int, float)):
-        return f"{value:g}"
-    text = str(value).strip()
-    return text or NO_MORAL_TEXT
-
-
-def build_student_json(student_id: Any, name: Any, class_name: Any, grades: Any,
-                       moral: Any, side_text: Any) -> str:
-    """把一名学生的数据拼成**一段 JSON**（喂给提示词的 ``{学生JSON}``）。
-
-    ★ 必须是**合法 JSON**：模型看到的是它，测试也解析它（``json.loads``）。
-    ★ 只用这名学生**自己的**数据 —— 姓名 / 学号确实在提示词里，但那是
-      本机离线推理的输入（红线 3 管的是"落盘"和"上传"），不是发给谁。
-    """
-    courses: list[dict[str, Any]] = []
-    for row in grades or ():
-        if not isinstance(row, dict):
-            continue
-        courses.append({
-            "semester": str(row.get("term") or row.get("semester") or ""),
-            "course": str(row.get("course") or row.get("course_name") or ""),
-            # 空 ≠ 0：没考的课留在 JSON 里是 null，不是 0
-            "score": row.get("score"),
-            "credit": row.get("credit"),
-        })
-    payload = {
-        "学号": str(student_id or ""),
-        "姓名": str(name or ""),
-        "班级": str(class_name or ""),
-        "德育分": None if moral is None else moral,
-        "成绩": courses,
-        "已有侧写": str(side_text or ""),
-    }
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
-
-
-def build_chat_system_prompt(student_json: str) -> str:
-    """把学生 JSON 逐字塞进系统提示词模板。"""
-    return CHAT_SYSTEM_PROMPT_TEMPLATE.replace("{学生JSON}", student_json)
-
-
-def store_archive(store: Any, username: str, archive: Any) -> bool:
-    """把归档写回**应用级**加密库（``archive.json.enc``）。
-
-    ★ 归档走应用级（AGENTS §16 / §20c）：自动登录时没有密码，库密钥解不开；
-      成绩绝不许往应用级里塞，但归档是"导入时算过一遍"的派生数据，属于允许的一侧。
-    Returns:
-        True 表示真的写下去了；False 表示这次没写（**不抛**）。
-    """
-    if archive is None or not username:
-        return False
-    try:
-        from core.user_store import save_user_json
-
-        payload = archive.as_dict() if hasattr(archive, "as_dict") else archive
-        save_user_json(store, username, "archive.json.enc", payload)
-    except Exception:  # noqa: BLE001 - 存不下只记日志，界面那一份还在
-        logger.exception("写归档失败")
-        return False
-    return True
-
-
-def build_chat_prompt(system_prompt: str, turns: Any) -> str:
-    """系统提示词 + 最近若干轮 → 一段纯文本提示词。
-
-    写法照 ``ui/chat_dialog.py`` 的 ``_build_prompt``（那边是冻结的参考实现）：
-    最后一轮一定是"辅导员刚说的话"，模型接着往下答。
-    """
-    items = [turn for turn in (turns or ()) if isinstance(turn, dict)]
-    recent = items[-(CHAT_CONTEXT_TURNS + 1): -1] if items else []
-    lines = [system_prompt, "", "下面是谈话记录（辅导员 = 用户，你 = 助手）："]
-    body: list[str] = []
-    for turn in recent:
-        speaker = "辅导员" if turn.get("role") == CHAT_ROLE_USER else "你"
-        body.append(f"{speaker}：{turn.get('text', '')}")
-    if items:
-        body.append(f"辅导员：{items[-1].get('text', '')}")
-    blob = "\n".join(body)
-    if len(blob) > CHAT_MAX_PROMPT_CHARS:
-        blob = blob[-CHAT_MAX_PROMPT_CHARS:]
-        blob = blob.split("\n", 1)[-1]
-    lines.append(blob)
-    lines.append("")
-    lines.append("请用中文、分点回答，不要输出 Markdown 记号。")
-    lines.append("你：")
-    return "\n".join(lines)
-
-
-def format_score(score: Any) -> str:
-    """成绩列的文字。
-
-    ★ **空 ≠ 0**（红线 2）：没选 / 没考的课显示**空白**，绝不显示 ``0``。
-    """
-    if score is None or score == "":
-        return ""
-    try:
-        return f"{float(score):g}"
-    except (TypeError, ValueError):
-        return str(score)
-
-
-def format_credit(credit: Any) -> str:
-    """学分列的文字。缺失（``None``）同样显示**空白**，不是 0。"""
-    if credit is None or credit == "":
-        return ""
-    try:
-        return f"{float(credit):g}"
-    except (TypeError, ValueError):
-        return str(credit)
-
-
-def term_of_archive(archive: Any) -> str:
-    """归档里**最近一个**学期的标签（用来给没有 term 的明细行标学期）。
-
-    取 ``_ordered_records`` 的最后一个 —— 那是 order 最大的学期，
-    也就是"最近一次导入的学期"。
-    """
-    records = _ordered_records(archive)
-    return str(getattr(records[-1], "term", "") or "") if records else ""
-
-
-def student_archive_of(archive: Any, key: str) -> Any:
-    """从"可能是整份归档、也可能就是这一名学生自己的归档"里取出这一名学生的归档。
-
-    ★ 两种形状都要认：主窗给的是 ``Archive``（要按 ``key`` 取），而档案页 /
-      测试给的常常就是 :class:`core.archival.StudentArchive` 本身。只认一种的
-      症状是 ``AttributeError: 'StudentArchive' object has no attribute 'get'``。
-    """
-    if archive is None:
-        return None
-    if hasattr(archive, "records"):
-        return archive
-    getter = getattr(archive, "get", None)
-    if not callable(getter):
-        return None
-    try:
-        return getter(key)
-    except Exception:  # noqa: BLE001 - 取不出来就当这名学生没有归档
-        logger.exception("从归档里取学生失败：%s", key)
-        return None
-
-
-def _ordered_records(archive: Any) -> list[Any]:
-    """归档里这个学生的学期记录，按 ``core.archival`` 的顺序。
-
-    ★ 学期顺序**必须**来自 :mod:`core.archival`（``sorted_records`` 用的是
-      ``semester_rank`` / ``SEMESTER_ORDER``）—— 本页不另抄一份表，
-      抄了就会漂移，症状是"大二下排在大一上前头"。
-    """
-    if archive is None:
-        return []
-    ordered = getattr(archive, "sorted_records", None)
-    if callable(ordered):
-        try:
-            return list(ordered())
-        except Exception:  # noqa: BLE001 - 坏档案不该拦住看明细
-            pass
-    records = list(getattr(archive, "records", ()) or ())
-    return sorted(records, key=lambda rec: semester_rank(getattr(rec, "term", "")))
-
-
-def grade_rows_from_records(archive: Any) -> list[dict[str, Any]]:
-    """归档 → ``[{"term": ..., "course": ..., "score": ..., "credit": ...}]``。
-
-    只搬运，不改口径：``score is None``（没选这门课）原样留着，
-    由 :func:`format_score` 决定显示成空白。
-    """
-    rows: list[dict[str, Any]] = []
-    for record in _ordered_records(archive):
-        term = str(getattr(record, "term", "") or "")
-        for course in getattr(record, "courses", ()) or ():
-            rows.append({
-                "term": term,
-                "course": str(getattr(course, "name", "") or ""),
-                "score": getattr(course, "score", None),
-                "credit": getattr(course, "credit", None),
-                "category": str(getattr(course, "category", "") or ""),
-            })
-    return rows
-
-
-def group_grades_by_term(rows: list[dict[str, Any]],
-                         terminal_terms: Any = None) -> list[tuple[str, list[dict[str, Any]]]]:
-    """按学期分组，并把学期排成时间顺序。
-
-    参数：
-        rows: :func:`grade_rows_from_records` 那种行；也接受 ``core.database``
-            的原始行（键是 ``course_name`` / ``score`` / ``credit``）
-        terminal_terms: **已终结**的学期（转成 ``set`` 再传进来最省）。
-            归档记录本身带的 ``term`` 就是终结学期；成绩历史表的行没有这个
-            概念，所以只有调用方显式喂进来时才用得上。
-
-    规则：
-        * 终结学期**永远排在最前**（和 :func:`core.archival.merge_records`
-          的既有行为一致，不再另立一套）；
-        * 其余学期按 ``SEMESTER_ORDER`` 的时间顺序；认不出的排在最后；
-        * 同一个学期里，有分数的排前面（高的在前），没分数的排最后、按课程名；
-        * 课程名为空的（终结学期里的占位）单独归一堆，名字统一成
-          「（历史课程名缺失）」。
-
-    返回 ``[(学期, [行, ...]), ...]``，学期已去重且排好序。
-    """
-    terminal = {str(t or "").strip() for t in (terminal_terms or ())}
-    buckets: dict[str, list[dict[str, Any]]] = {}
-    for row in rows or ():
-        if not isinstance(row, dict):
-            continue
-        term = str(row.get("term") or row.get("semester") or "").strip()
-        course = str(row.get("course") or row.get("course_name") or "").strip()
-        if not course:
-            if term not in terminal:
-                # 非终结学期里课程名不该为空 —— 空课程名无法按主键去重，
-                # 也就无从显示，直接跳过（不编一个假名字出来）。
-                continue
-            course = "（历史课程名缺失）"
-        buckets.setdefault(term, []).append({
-            "term": term,
-            "course": course,
-            "score": row.get("score", None),
-            "credit": row.get("credit", None),
-            "category": str(row.get("category") or ""),
-        })
-
-    def rank(term: str) -> tuple[int, int, str]:
-        known = term in SEMESTER_ORDER
-        return (
-            0 if term in terminal else 1,
-            0 if known else 1,
-            f"{semester_rank(term):03d}" if known else term,
-        )
-
-    ordered: list[tuple[str, list[dict[str, Any]]]] = []
-    for term in sorted(buckets, key=rank):
-        courses = buckets[term]
-        courses.sort(key=lambda row: (
-            row["score"] is None,
-            -(row["score"] if isinstance(row["score"], (int, float)) else 0.0),
-            row["course"],
-        ))
-        ordered.append((term, courses))
-    return ordered
-
-
-def moral_of(store: CryptoStore, username: str, key: str,
-             class_names: Any = None) -> int | None:
-    """在某一个班里找这名学生的德育分。
-
-    ★ **没录 ≠ 0**（红线 2）：找不到就返回 ``None``，界面把它显示成空白。
-      这也是为什么这个函数不返回 ``0`` —— 0 分和"没录"在奖学金那一页
-      是两种完全不同的待遇（备注里必须写"德育分未录入，按 0 计"）。
-
-    ``class_names`` 给了就只查那些班（省一次扫目录）；没给就 :func:`list_classes`。
-    """
-    if not username or not key:
-        return None
-    if class_names is None:
-        try:
-            class_names = [record.class_name for record in list_classes(store, username)]
-        except (CryptoError, ValueError, OSError):
-            return None
-    for name in class_names:
-        try:
-            scores = load_moral(store, username, name)
-        except (CryptoError, ValueError, OSError):
-            continue
-        if key in scores:
-            return scores[key]
-    return None
-
-
-def build_side_text_prompt(student: str, student_id: str, key: str, grades: Any,
-                           moral: Any = None) -> str:
-    """把"已有的成绩与德育分"拼成一段提示词，交给 AI 谈话助手。
-
-    ★ **只拼已有字段，不做任何算术**（铁律五）：平均分 / 加权 / 排名一概不
-      在这里算，也一概不往里写 —— 提示词里出现一个本页算出来的数字，
-      就等于绕开了"算术只在 core 里做"这条规矩。
-    ★ 键一律用 ``sid:<学号>``；没有学号才退回 ``name:<姓名>``，
-      并且**明说同名风险**（AGENTS §9）。
-    """
-    lines = [
-        "请根据下面这名学生已有的成绩，写一段学业侧写（优势、短板、"
-        "下学期可以怎么补），不要编造没有出现的数字。",
-        "",
-        f"学生：{student or '（未填）'}",
-        f"学号：{student_id.strip() or '（成绩表里没有学号）'}",
-    ]
-    if key.startswith(KEY_PREFIX_NAME):
-        lines.append("注意：这名学生没有学号，若班上有同名的人，不要把他人的成绩算进来。")
-    lines.extend(["", "已有成绩（只列已导入的字段，空白＝没选或没考）："])
-    grouped = group_grades_by_term(list(grades or ()))
-    if grouped:
-        for term, courses in grouped:
-            lines.append(f"【{term or '未标注学期'}】")
-            for row in courses:
-                score = format_score(row["score"])
-                credit = format_credit(row["credit"])
-                detail = f"成绩 {score}" if score else "成绩（空白）"
-                detail += f"　学分 {credit}" if credit else "　学分（空白）"
-                lines.append(f"· {row['course']}　{detail}")
-    else:
-        lines.append("（还没有导入任何成绩明细）")
-    if moral is None:
-        lines.append("")
-        lines.append("德育分：未录入")
-    else:
-        lines.extend(["", f"德育分：{moral}"])
-    return "\n".join(lines)
-
-
-def read_side_text(store: Any, student_id: str, key: str) -> str:
-    """读侧写正文（``ProfileStore.side_text``）。
-
-    读不到（没登录 / 库坏了 / 这个学生没存过）一律返回空串 ——
-    侧写是便利数据，坏掉不该拦住看成绩。
-    """
-    sid = (key or student_id or "").strip()
-    if not sid or store is None:
-        return ""
-    getter = getattr(store, "side_text", None)
-    if not callable(getter):
-        return ""
-    try:
-        return getter(sid) or ""
-    except Exception:  # noqa: BLE001 - 读不出来就当没有
-        return ""
-
-
-
-# ---- 条目上挂的数据（delegate 绘制时读）-----------------------------------
-_ROLE_INDEX = Qt.ItemDataRole.UserRole          #: 行号（原有，别改）
-_ROLE_NAME = Qt.ItemDataRole.UserRole + 1       #: 姓名
-_ROLE_ID = Qt.ItemDataRole.UserRole + 2         #: 学号（可能是空串）
-_ROLE_HAS_ID = Qt.ItemDataRole.UserRole + 3     #: 有没有学号
-_ROLE_LEVEL = Qt.ItemDataRole.UserRole + 4      #: "" / "danger" / "warning"
-_ROLE_SEED = Qt.ItemDataRole.UserRole + 5       #: 头像配色的稳定种子
-
-#: 头像底色。按学号取模选一个 —— 同一个人每次打开都是同一个颜色。
-#:
-#: ★ 绝不能用内置 ``hash()`` 当种子：Python 对 str 的 hash **每个进程都加盐**，
-#:   同一个人这次是蓝的、下次开程序就变绿了，看着像换了个人。
-_AVATAR_COLORS = (
-    "#3B82F6", "#0EA5E9", "#8B5CF6", "#EC4899",
-    "#F59E0B", "#10B981", "#6366F1", "#14B8A6",
-)
-
-_SEL_BG = "#EFF6FF"
-_HOVER_BG = "#F8FAFC"
-_ACCENT = "#3B82F6"
-_TEXT = "#0F172A"
-_MUTED = "#94A3B8"
-
-_DANGER = "#EF4444"
-_WARNING = "#F59E0B"
-
-
-def _avatar_color(seed: str) -> str:
-    """稳定的头像配色。**不用 hash()**（见 _AVATAR_COLORS 的注释）。"""
-    if not seed:
-        return "#94A3B8"
-    return _AVATAR_COLORS[sum(ord(ch) for ch in seed) % len(_AVATAR_COLORS)]
-
-
-def _initial(name: str) -> str:
-    """头像里那个字：中文取姓氏，英文取首字母。"""
-    text = (name or "").strip()
-    return text[0].upper() if text else "?"
 
 
 class StudentItemDelegate(QStyledItemDelegate):
@@ -719,7 +285,7 @@ class StudentItemDelegate(QStyledItemDelegate):
                 # 没学号 = 只能靠姓名区分，同名会串意愿。**在名单上就说清楚**，
                 # 不要等用户点进去才告诉他。
                 painter.setPen(QColor(_WARNING))
-                sub_text = "⚠ 无学号 · 同名会串意愿"
+                sub_text = "无学号 · 同名会串意愿"
             sub_metrics = QFontMetrics(sub_font)
             painter.drawText(
                 QRect(tx, rect.top() + 28, tw, 16),
@@ -995,806 +561,1181 @@ class _PageChatWorker(QThread):
 
 
 class ProfilePage(QWidget):
-    """侧写辅导页：左名单 + 右详情。"""
+    """成绩档案页：左边学生名单，右边两级视图（详情页 / 学期侧写页）。
 
-    def __init__(self, store: CryptoStore | None = None, parent: QWidget | None = None, *,
-                 chat_models: list[Any] | None = None,
-                 chat_engine: Any = None) -> None:
-        """``chat_models`` / ``chat_engine`` 是**测试注入点**（照
-        :class:`ui.chat_dialog.ChatDialog` 的写法）：给了就绝不扫磁盘、
-        绝不真的去加载模型。
+    ★ v1.9.2 的布局（任务书第 2 节）：
 
-        ★ ``chat_models`` 缺省是 ``None``（= 去扫磁盘），**不是** ``[]`` ——
-          空列表是测试在说"本机一个模型都没有"。
-        """
+    * 左：学生名单卡片（300 宽）—— 标题 + 人数、搜索框（姓名 / 学号 / 班级）、
+      名单列表、新建 / 编辑 / 删除三个按钮；
+    * 右：:class:`QStackedWidget` 两页 ——
+
+      - page0 详情：学生信息卡 + 学期时间轴（横向滚动，点一个学期穿透）
+        + 三个标签页（成绩明细 / 总评与侧写 / AI 辅导）；
+      - page1 学期侧写：:class:`SemesterSideProfilePage`，带「← 返回」。
+
+    ★ 学生身份一律用**学号**（AGENTS §9）：名单行、审计、迁移、聊天文件都以
+      学号为键，没有学号的名单行只显示、不落档。
+    """
+
+    # -- 构造 / 对外接口 --------------------------------------------------
+    def __init__(
+        self,
+        store: CryptoStore | None = None,
+        parent: QWidget | None = None,
+        *,
+        chat_models: list[Any] | None = None,
+        chat_engine: Any = None,
+    ) -> None:
         super().__init__(parent)
-        self._store = store if store is not None else CryptoStore()
+        self._store: CryptoStore = store or CryptoStore()
         self._username = ""
         self._payload: dict[str, Any] | None = None
         self._intentions: dict[str, str] = {}
-        #: 全班名单（:class:`ui.pages.analysis_page.TableRow`），由智育分析页推过来
         self._roster: list[Any] = []
-        #: 行号 → 稳定标识（选中名单时用，避免每次线性扫名单）
         self._key_by_index: dict[int, str] = {}
-        #: 由主窗口注入：``index -> payload``（名单里的行号 → 侧写原料）
         self._provider: Callable[[int], dict[str, Any] | None] | None = None
-        #: ``core.database.ProfileStore``（懒建；建失败时记 ``False`` 不再重试）
         self._profile_store: Any = None
-        #: ``core.database.GradeHistoryDB``（懒建，同上）
         self._grade_db: Any = None
-        #: 德育分查过的班级名（一次登录只扫一遍目录）
-        self._moral_cache: list[str] | None = None
-        #: 标签池：``(布局, 名字) -> [QLabel, ...]``。**控件复用、不 deleteLater**
-        self._tag_pool: dict[str, list[QLabel]] = {}
-        #: 当前标签页下标（只用来记住位置，切页不做重新计算）
+        self._moral_cache: dict[str, Any] | None = None
+        self._tag_pool: dict[str, list[QWidget]] = {}
         self._active_tab = 0
-
-        # --- 单条删除（任务书 3）---
-        #: 成绩明细里"这条是成绩历史表的第几行"（按学期分组前记下的）
         self._grade_payloads: dict[int, dict[str, Any]] = {}
-        #: 被"同时删除学期记录"删掉的学期（本页不再显示，直到换一名学生）
         self._hidden_terms: set[str] = set()
 
-        # --- AI 辅导（任务书 2）---
-        #: 注入的假引擎（给了它就不加载真模型）
         self._chat_engine = chat_engine
         self._chat_models_given = chat_models is not None
-        self._chat_models: list[Any] = list(chat_models) if chat_models is not None else []
-        #: 当前的会话键 / 学号（换人时聊天记录跟着换）
-        self._chat_key: str = ""
-        #: 学号 —— 谈话记录的文件名用它（``chat_history_<学号>.json.enc``，AGENTS §9）
-        self._chat_student_id: str = ""
+        self._chat_models: list[Any] = list(chat_models or [])
+        self._chat_key = ""
+        self._chat_student_id = ""
         self._chat_history: list[dict[str, str]] = []
-        #: 后台生成线程（同一时刻最多一个）
         self._chat_worker: Any = None
         self._chat_answer = ""
-        #: 正在流式追加回答（第一块才写说话人）
         self._chat_open = False
-        #: 上一次失败的**中文原因**（收尾时重新贴到状态行，别被"可以开始"抹掉）
         self._chat_error = ""
-        #: 引擎自己失败的原因（判据要它逐字出现）
         self._chat_engine_reason = ""
-        #: 当前选中的本地模型（``None`` = 本机一个能用的都没有）
         self._chat_model: Any = None
-        #: 这名学生的系统提示词（含数据 JSON）/ 那段 JSON 本身
         self._chat_system_prompt = ""
         self._chat_student_json = ""
-        self._side_key: str = ""
-        #: 正在生成侧写（生成期间按钮置灰、文本框只读）
+
+        self._side_key = ""
         self._side_busy = False
         self._side_worker: Any = None
-        #: 侧写生成失败的中文原因（收尾时贴到状态行）
         self._side_error = ""
-        #: 回填正文时压住 ``textChanged``（免得"没改过"也把「保存」点亮）
         self._side_text_guard = False
+
+        # v1.9.2 新增状态
+        self._book: Any = None
+        self._entries: list[dict[str, Any]] = []
+        self._selected_key = ""
+        self._selected_sid = ""
+        self._current_term = ""
+        self._search_text = ""
+        self._total_people = 0
+        self._no_data = False
+        self._stack: QStackedWidget | None = None
+        self._semester_page: SemesterSideProfilePage | None = None
         self._build()
 
-    # ---------------------------------------------------------------- 外部
     def set_user(self, username: str) -> None:
-        """切账户时调用（登录、切换账号后）。会重新读这个人的意愿。
-
-        ★ 顺带丢掉"上一个人的库句柄"：``ProfileStore`` 与 ``GradeHistoryDB``
-          都是按用户名解析路径的，留着就会把 A 的侧写写到 B 的目录里
-          （和 :meth:`AnalysisPage.set_user` 清 ``_archive`` 是同一条道理）。
-        """
-        self._username = username or ""
-        self._intentions = (
-            load_intentions(self._store, self._username) if self._username else {}
-        )
+        """换人：清掉上一个人的库句柄与聊天状态，名单按新账户重建。"""
+        self._username = (username or "").strip()
+        try:
+            self._intentions = load_intentions(self._store, self._username) or {}
+        except Exception:  # noqa: BLE001 - 意愿是便利数据，坏掉不该拦住整页
+            logger.exception("读取发展意愿失败")
+            self._intentions = {}
         self._profile_store = None
         self._grade_db = None
         self._moral_cache = None
-        # ★ 上一个人的谈话记录**一个字都不许留**：聊天键、记录、正在跑的生成
-        #   全清掉（跟清 ``_profile_store`` 是同一条道理，串号了还不报错）。
-        self._stop_chat_worker()
+        self._hidden_terms = set()
         self._chat_key = ""
         self._chat_student_id = ""
         self._chat_history = []
-        self._chat_engine_reason = ""
-        self._hidden_terms = set()
-        if self._payload is not None:
+        self._chat_system_prompt = ""
+        self._chat_student_json = ""
+        self._stop_chat_worker()
+        self._book = open_student_book(self._store, self._username)
+        self._current_term = ""
+        self._no_data = False
+        self._fill_list(self._search_text)
+        if self._payload:
             self._render()
 
-    def set_payload_provider(self, provider: Callable[[int], dict[str, Any] | None]) -> None:
-        """注入"行号 → 侧写原料"的取值函数（智育分析页提供，不复制数据）。"""
+    def set_payload_provider(
+        self, provider: Callable[[int], dict[str, Any] | None]
+    ) -> None:
+        """分析页把「第 index 行是谁」的取数口交过来。"""
         self._provider = provider
 
     def set_roster(self, rows: list[Any]) -> None:
-        """接住智育分析页导入后推过来的全班名单。
-
-        Args:
-            rows: :class:`ui.pages.analysis_page.TableRow` 列表。
-        """
-        self._roster = list(rows)
+        """导入完成后把名单推过来：有学号的补进学生主档，然后刷新列表。"""
+        self._roster = list(rows or [])
+        self._no_data = False
         self._migrate_name_keys()
-        self._fill_list()
-        if self._payload is not None:
+        self._upsert_roster_into_book()
+        self._fill_list(self._search_text)
+        if self._payload:
             self._select_key(self._payload.get("key", ""))
 
     def show_no_data(self) -> None:
-        """成绩库被清空之后调用（主窗接 ``SettingsPage.library_cleared``，AGENTS §18）。
-
-        ★ 为什么需要这个钩子：左栏名单是智育分析页推过来的（:meth:`set_roster`），
-          清库**不会**自动把那份内存名单收回去 —— 继续列着已经删掉的学生，
-          用户会以为"删除没生效"。
-        ★ 只动显示状态，**不碰** AI 辅导 / 侧写的既有逻辑：这里清掉的
-          "上一位学生的谈话上下文"正是 :meth:`set_user` 已经在做的事。
-        """
+        """成绩库被清空 / 还没导入：名单与详情都回到空态。"""
+        self._no_data = True
         self._roster = []
         self._payload = None
-        self._stop_chat_worker()
+        self._selected_key = ""
+        self._selected_sid = ""
+        self._current_term = ""
         self._chat_key = ""
         self._chat_student_id = ""
         self._chat_history = []
-        self._fill_list()
-        self._list_note.setText("暂无数据：成绩库已清空，先在「📊 智育分析」导入成绩表。")
+        self._chat_system_prompt = ""
+        self._chat_student_json = ""
+        self._stop_chat_worker()
+        if self._book is not None:
+            try:
+                self._book.refresh()
+            except Exception:  # noqa: BLE001
+                logger.exception("刷新学生主档失败")
+        self._search.blockSignals(True)
+        self._search.clear()
+        self._search.blockSignals(False)
+        self._fill_list("")
+        self._list_note.setText(
+            "暂无数据：成绩库已清空，先在「智育分析」导入成绩表。"
+        )
+        self._clear_semester_page()
+        if self._stack is not None:
+            self._stack.setCurrentIndex(0)
         self._render()
 
+    def reset_view(self) -> None:
+        """两级视图都复位：回详情层、清空右栏与学期侧写页（名单保留）。"""
+        self._payload = None
+        self._selected_key = ""
+        self._selected_sid = ""
+        self._current_term = ""
+        self._chat_key = ""
+        self._chat_student_id = ""
+        self._chat_history = []
+        self._chat_system_prompt = ""
+        self._chat_student_json = ""
+        self._stop_chat_worker()
+        self._clear_semester_page()
+        if self._stack is not None:
+            self._stack.setCurrentIndex(0)
+        self._list.setCurrentRow(-1)
+        self._sync_buttons()
+        self._render()
+
+    def _clear_semester_page(self) -> None:
+        """把学期侧写页也清空，免得切回第二级还能看到上一个学生。"""
+        page = self._semester_page
+        if page is None:
+            return
+        try:
+            page.set_records([])
+            page.set_term("")
+            page.set_student({})
+        except Exception:  # noqa: BLE001 - 清空失败只打日志，不许拦住复位
+            logger.exception("清空学期侧写页失败")
+
     def show_student(self, payload: dict[str, Any]) -> None:
-        """接住智育分析页传来的学生包，并在名单里把他选中。"""
-        self._payload = payload
-        self._select_key(payload.get("key", ""))
+        """明确指定一名学生：选中名单行并重画详情。"""
+        self._payload = payload or None
+        if not payload:
+            self._render()
+            return
+        self._selected_key = str(payload.get("key") or "")
+        self._selected_sid = _bare_sid(payload.get("student_id"))
+        self._select_key(self._selected_key)
         self._render()
 
     def focus_list(self) -> None:
-        """侧栏点进来时调用：**不换人**，只是把焦点交给搜索框。
-
-        ★ 这就是"禁止点击侧栏直接跳转个人侧写"：侧栏落到名单上，
-          具体看谁由用户在名单里点。
-        """
+        """把焦点交给搜索框（主窗点侧栏时用）。"""
         self._search.setFocus()
 
-    # ---------------------------------------------------------------- 搭界面
+    def current_student_id(self) -> str:
+        """当前选中的学号（裸学号；没有选中就空串）。
+
+        任务书第 1 节只要求 ``current_student_id() -> str``：界面上、聊天文件名、
+        学期侧写页标题一律用裸学号，带 ``sid:`` 前缀的键形式只留在档案与意愿里。
+        """
+        return self._bare_current_sid()
+
+    def _bare_current_sid(self) -> str:
+        """内部统一用裸学号：显示、查库、写文件名都不带前缀。"""
+        if self._payload:
+            sid = _bare_sid(self._payload.get("student_id"))
+            if sid:
+                return sid
+        sid = _bare_sid(self._selected_sid)
+        if sid:
+            return sid
+        entry = self._current_entry()
+        return _bare_sid(entry["sid"]) if entry is not None else ""
+
+    def ask_semester_and_open(self, payload: dict[str, Any] | None = None) -> None:
+        """打开「选学期」框，选完切到那一学期的学业侧写。"""
+        if payload:
+            self.show_student(payload)
+        terms = self._timeline_terms()
+        if not terms:
+            QMessageBox.information(
+                self, "学期侧写", "这名学生还没有成绩记录，先导入成绩表。"
+            )
+            return
+        current = self._current_term if self._current_term in terms else terms[-1]
+        term, accepted = QInputDialog.getItem(
+            self,
+            "选择学期",
+            "要看哪一个学期的学业侧写？",
+            terms,
+            terms.index(current),
+            False,
+        )
+        if accepted and term:
+            self.open_semester(semester=str(term))
+
+    def open_semester(self, student_id: str = "", semester: str = "") -> None:
+        """切到 page1：显示某名学生某个学期的学业侧写。
+
+        Args:
+            student_id: 学号（``sid:`` 或裸学号都行）；省略 = 当前选中的学生。
+            semester: 学期名，例如 ``大二下``；空字符串不切页。
+        """
+        sid = _bare_sid(student_id)
+        term = (semester or "").strip()
+        if not self._payload:
+            return
+        # 兼容旧调用：open_semester("大二下") —— 唯一实参其实是学期名
+        if not term and sid and sid not in self._known_sids():
+            if sid in self._timeline_terms():
+                term, sid = sid, ""
+        if not term:
+            return
+        if sid and sid != self._bare_current_sid():
+            if not self._select_student_by_sid(sid):
+                logger.warning("open_semester 找不到学号 %s 对应的学生", sid)
+                return
+        self._current_term = term
+        self._render_timeline()
+        if self._semester_page is None or self._stack is None:
+            return
+        try:
+            self._semester_page.set_context(
+                self._store,
+                self._username,
+                self._bare_current_sid(),
+                str(self._payload.get("student") or ""),
+                term,
+                on_back=self._back_to_detail,
+            )
+        except Exception:  # noqa: BLE001 - 学期页打不开要说人话，不许冒到事件循环
+            logger.exception("打开学期侧写页失败")
+            QMessageBox.warning(self, "学期侧写", "这一学期的侧写页没有打开，请稍后再试。")
+            return
+        self._stack.setCurrentIndex(1)
+
+    def _known_sids(self) -> set[str]:
+        return {_bare_sid(entry.get("sid")) for entry in self._entries if entry.get("sid")}
+
+    def _select_student_by_sid(self, sid: str) -> bool:
+        """按学号在名单里选中并载入 payload（找不到就 False）。"""
+        bare = _bare_sid(sid)
+        for position, entry in enumerate(self._entries):
+            if _bare_sid(entry.get("sid")) != bare:
+                continue
+            payload = self._payload_for_entry(entry)
+            if payload is None:
+                return False
+            self._list.setCurrentRow(position)
+            self._selected_key = entry["key"]
+            self._selected_sid = bare
+            self._payload = payload
+            self._sync_buttons()
+            return True
+        return False
+
+    def _back_to_detail(self) -> None:
+        if self._stack is not None:
+            self._stack.setCurrentIndex(0)
+
+    # -- 列表 -------------------------------------------------------------
     def _build(self) -> None:
         root = QHBoxLayout(self)
         root.setContentsMargins(22, 20, 22, 20)
         root.setSpacing(14)
         root.addWidget(self._build_list_pane())
-        root.addWidget(self._build_detail_pane(), 1)
+        root.addWidget(self._build_stack(), 1)
 
-    # --- 左：名单 + 搜索 ---
+    def _build_stack(self) -> QWidget:
+        self._stack = QStackedWidget()
+        self._stack.setObjectName("ProfileStack")
+        self._stack.addWidget(self._build_detail_pane())
+        self._semester_page = SemesterSideProfilePage()
+        self._stack.addWidget(self._semester_page)
+        return self._stack
+
     def _build_list_pane(self) -> QFrame:
         card = make_card()
         card.setFixedWidth(LIST_WIDTH)
         box = QVBoxLayout(card)
-        # ★ 上下左右全 0：让列表的选中底色能**顶到卡片边缘**。
-        #   原来留 14px 内边距，选中色块是一小块浮在中间的方块，很土。
-        #   内边距改由各段自己带（头部 14、搜索 12、列表 0、页脚 12）。
-        box.setContentsMargins(0, 0, 0, 0)
+        box.setContentsMargins(0, 0, 0, 12)
         box.setSpacing(0)
 
-        # --- 头部：标题 + 人数 ---
-        head = QWidget()
-        head.setObjectName("ListHead")
-        head_box = QHBoxLayout(head)
-        head_box.setContentsMargins(14, 13, 12, 10)
-        head_box.setSpacing(8)
+        head = QHBoxLayout()
+        head.setContentsMargins(14, 13, 12, 10)
+        head.setSpacing(8)
         title = QLabel("学生名单")
         title.setObjectName("H2")
-        head_box.addWidget(title)
-        head_box.addStretch(1)
+        head.addWidget(title)
+        head.addStretch(1)
         self._count_pill = QLabel("0")
         self._count_pill.setObjectName("CountPill")
         self._count_pill.setToolTip("当前名单人数")
-        head_box.addWidget(self._count_pill)
-        box.addWidget(head)
+        head.addWidget(self._count_pill)
+        box.addLayout(head)
 
-        # --- 搜索 ---
-        search_holder = QWidget()
-        search_box = QVBoxLayout(search_holder)
-        search_box.setContentsMargins(12, 0, 12, 10)
-        search_box.setSpacing(0)
+        search_holder = QHBoxLayout()
+        search_holder.setContentsMargins(12, 0, 12, 10)
         self._search = QLineEdit()
         self._search.setObjectName("ListSearch")
         self._search.setPlaceholderText("搜索姓名或学号")
         self._search.setClearButtonEnabled(True)
         self._search.setMinimumHeight(32)
         self._search.textChanged.connect(self._on_search)
-        search_box.addWidget(self._search)
-        box.addWidget(search_holder)
+        search_holder.addWidget(self._search)
+        box.addLayout(search_holder)
 
-        # --- 列表本体 ---
         self._list = QListWidget()
         self._list.setObjectName("StudentList")
         self._list.setAlternatingRowColors(False)
         self._list.setUniformItemSizes(True)
-        self._list.setMouseTracking(True)          # hover 高亮要它才会来
-        self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._list.setFrameShape(QFrame.Shape.NoFrame)
+        self._list.setMouseTracking(True)
+        self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._list.setFrameShape(QFrame.NoFrame)
         self._list.setItemDelegate(StudentItemDelegate(self._list))
         self._list.itemClicked.connect(self._on_item_clicked)
         box.addWidget(self._list, 1)
 
-        # --- 页脚：人数 / 过滤说明 ---
         self._list_note = QLabel("")
         self._list_note.setObjectName("ListNote")
         self._list_note.setWordWrap(True)
         self._list_note.setContentsMargins(14, 8, 12, 10)
         box.addWidget(self._list_note)
+
+        buttons = QHBoxLayout()
+        buttons.setContentsMargins(12, 6, 12, 0)
+        buttons.setSpacing(6)
+        self._new_btn = QPushButton("新建")
+        self._new_btn.setObjectName("Ghost")
+        self._new_btn.setMinimumHeight(32)
+        self._new_btn.clicked.connect(self._open_new_student)
+        buttons.addWidget(self._new_btn)
+        self._edit_btn = QPushButton("编辑")
+        self._edit_btn.setObjectName("Ghost")
+        self._edit_btn.setMinimumHeight(32)
+        self._edit_btn.setEnabled(False)
+        self._edit_btn.clicked.connect(self._open_edit_student)
+        buttons.addWidget(self._edit_btn)
+        self._delete_btn = QPushButton("删除")
+        self._delete_btn.setObjectName("RowAction")
+        self._delete_btn.setMinimumHeight(32)
+        self._delete_btn.setEnabled(False)
+        self._delete_btn.clicked.connect(self._delete_student)
+        buttons.addWidget(self._delete_btn)
+        box.addLayout(buttons)
+
+        self._fill_list("")
         return card
 
-    def _fill_list(self) -> None:
-        """按名单重建列表。带学号的显示学号 —— 同名也能一眼分开。"""
-        blocked = self._list.blockSignals(True)
-        self._list.clear()
-        self._key_by_index = {}
-        for row in self._roster:
-            item = QListWidgetItem(row.label)      # text 保留：搜索靠它
-            item.setData(_ROLE_INDEX, row.index)
-            item.setData(_ROLE_NAME, row.student)
-            item.setData(_ROLE_ID, row.student_id)
-            item.setData(_ROLE_HAS_ID, bool(row.has_id))
-            # ★ 预警级别来自智育分析页**当前口径**现填的 flag（见 TableRow.flag）。
-            #   这里不自己判、不缓存 —— 口径一变那边会重新推一份名单过来。
-            item.setData(_ROLE_LEVEL, getattr(row.flag, "level", "") or "")
-            item.setData(_ROLE_SEED, row.student_id or row.student)
-            item.setSizeHint(QSize(0, ITEM_HEIGHT))
-            item.setToolTip(
-                f"学号 {row.student_id}" if row.has_id
-                else "⚠ 表里没有学号，同名学生会共用同一份意愿"
-            )
-            self._list.addItem(item)
-            self._key_by_index[row.index] = row.key
-        self._list.blockSignals(blocked)
-        self._search.clear()
+    def _fill_list(self, keyword: str = "") -> None:
+        """按关键字重建名单（默认只看未归档；输入「已归档」只看归档）。"""
+        self._search_text = keyword or ""
+        all_entries = self._list_entries("")
+        self._total_people = len(all_entries)
+        entries = self._list_entries(self._search_text)
+        self._entries = entries
+        self._list.blockSignals(True)
+        try:
+            self._list.clear()
+            self._key_by_index = {}
+            for position, entry in enumerate(entries):
+                label = (
+                    f"{entry['name']}（{entry['sid']}）"
+                    if entry["sid"]
+                    else entry["name"]
+                )
+                item = QListWidgetItem(label)
+                item.setData(_ROLE_INDEX, position)
+                item.setData(_ROLE_NAME, entry["name"])
+                item.setData(_ROLE_ID, entry["sid"])
+                item.setData(_ROLE_HAS_ID, bool(entry["sid"]))
+                item.setData(_ROLE_LEVEL, entry.get("level", ""))
+                item.setData(_ROLE_SEED, entry["sid"] or entry["name"])
+                item.setSizeHint(QSize(0, ITEM_HEIGHT))
+                if entry["sid"]:
+                    tip = f"学号 {entry['sid']}"
+                    if entry.get("class_name"):
+                        tip += f" · 班级 {entry['class_name']}"
+                    if entry.get("archived"):
+                        tip += " · 已归档"
+                else:
+                    tip = "表里没有学号，同名学生会共用同一份意愿"
+                item.setToolTip(tip)
+                self._list.addItem(item)
+                self._key_by_index[position] = entry["key"]
+        finally:
+            self._list.blockSignals(False)
         self._update_list_note()
+        self._sync_buttons()
+
+    def _list_entries(self, keyword: str) -> list[dict[str, Any]]:
+        """名单数据源：学生主档优先，没学号的名单行只显示不落档。
+
+        ``show_no_data()`` 只表示"成绩库清空了"，学生主档（``students.json.enc``）
+        是独立的一份数据，主档里还有人时名单照常显示。
+        """
+        if self._no_data:
+            kept = 0
+            if self._book is not None and getattr(self._book, "durable", False):
+                try:
+                    kept = int(self._book.count())
+                except Exception:  # noqa: BLE001 - 数不出来就按空档处理
+                    logger.exception("读取学生主档数量失败")
+            if kept <= 0:
+                return []
+        text = (keyword or "").strip()
+        archived_only = ARCHIVED_SEARCH_TEXT in text
+        needle = text.replace(ARCHIVED_SEARCH_TEXT, "").strip()
+        entries: list[dict[str, Any]] = []
+        durable = bool(self._book is not None and getattr(self._book, "durable", False))
+        book_has_rows = True
+        if durable:
+            try:
+                book_has_rows = int(self._book.count()) > 0
+            except Exception:  # noqa: BLE001 - 数不出来就按"有档"处理
+                logger.exception("读取学生主档数量失败")
+        if durable:
+            try:
+                records = self._book.search(needle, archived_only=archived_only)
+            except Exception:  # noqa: BLE001 - 主档读不出来就退回名单
+                logger.exception("搜索学生主档失败")
+                records = []
+            for record in records:
+                sid = _bare_sid(getattr(record, "student_id", ""))
+                name = str(getattr(record, "name", "") or "").strip() or sid
+                entries.append(
+                    {
+                        "sid": sid,
+                        "name": name,
+                        "class_name": str(getattr(record, "class_name", "") or ""),
+                        "archived": bool(getattr(record, "archived", False)),
+                        "key": student_key(sid, name),
+                        "index": self._roster_index(sid, name),
+                        "level": "",
+                    }
+                )
+        if not archived_only:
+            seen = {entry["sid"] for entry in entries if entry["sid"]}
+            for row in self._roster:
+                sid = _bare_sid(getattr(row, "student_id", ""))
+                name = str(getattr(row, "student", "") or "").strip()
+                if sid and sid in seen:
+                    continue
+                # 主档里已经有这个学号，不重复显示；但主档整体为空时必须退回
+                # 内存名单，否则"导入完成、还没建档"的学生会一个都看不到。
+                if sid and durable and book_has_rows:
+                    continue
+                if needle and needle.casefold() not in f"{name}{sid}".casefold():
+                    continue
+                entries.append(
+                    {
+                        "sid": sid,
+                        "name": name or "（未命名）",
+                        "class_name": "",
+                        "archived": False,
+                        "key": student_key(sid, name),
+                        "index": int(getattr(row, "index", -1) or -1),
+                        "level": str(getattr(getattr(row, "flag", None), "level", "") or ""),
+                    }
+                )
+        return entries
+
+    def _roster_index(self, sid: str, name: str) -> int | None:
+        """在分析页名单里找这个人的行号（找不到就 None）。"""
+        if self._provider is None:
+            return None
+        unique_name = False
+        if not sid and name:
+            same = [
+                row
+                for row in self._roster
+                if str(getattr(row, "student", "") or "").strip() == name
+            ]
+            unique_name = len(same) == 1
+        for row in self._roster:
+            row_sid = _bare_sid(getattr(row, "student_id", ""))
+            row_name = str(getattr(row, "student", "") or "").strip()
+            if sid and row_sid == sid:
+                return int(getattr(row, "index", -1))
+            if not sid and unique_name and row_name == name and not row_sid:
+                return int(getattr(row, "index", -1))
+        return None
+
+    def _entry_of(self, position: int) -> dict[str, Any] | None:
+        if 0 <= position < len(self._entries):
+            return self._entries[position]
+        return None
+
+    def _current_entry(self) -> dict[str, Any] | None:
+        row = self._list.currentRow()
+        return self._entry_of(row) if row >= 0 else None
 
     def _update_list_note(self) -> None:
-        total = self._list.count()
-        shown = sum(1 for i in range(total) if not self._list.item(i).isHidden())
-        missing = sum(1 for row in self._roster if not row.has_id)
+        total = self._total_people
+        shown = len(self._entries)
+        missing = sum(1 for entry in self._list_entries("") if not entry["sid"])
         self._count_pill.setText(str(total))
-        flagged = sum(
-            1
-            for row in self._roster
-            if (getattr(row.flag, "level", "") or "") == "danger"
-        )
-        if not total:
-            self._list_note.setText("还没有名单。先在「📊 智育分析」导入成绩表。")
+        if total == 0:
+            self._list_note.setText(
+                "还没有名单。先在「智育分析」导入成绩表，或点下面的「新建学生」。"
+            )
             return
-        text = f"共 {total} 人" if shown == total else f"筛出 {shown} / {total} 人"
-        if flagged:
-            text += f"　·　红标 {flagged} 人"
+        if self._search_text and shown != total:
+            text = f"筛出 {shown} / {total} 人"
+        else:
+            text = f"共 {total} 人"
+        archived = sum(1 for entry in self._entries if entry.get("archived"))
+        if archived:
+            text += f"　·　含 {archived} 人已归档"
         if missing:
-            text += f"\n⚠ {missing} 人没有学号，同名会共用意愿"
+            text += f"\n注意：{missing} 人没有学号，同名会共用意愿"
         self._list_note.setText(text)
+
+    def _sync_buttons(self) -> None:
+        entry = self._current_entry()
+        has_row = entry is not None
+        self._edit_btn.setEnabled(has_row and bool(entry and entry["sid"]))
+        self._delete_btn.setEnabled(has_row and bool(entry and entry["sid"]))
 
     @property
     def roster_size(self) -> int:
-        return len(self._roster)
+        return self._total_people
 
     @property
     def visible_count(self) -> int:
-        """搜索过滤之后还看得见的条数（自检用）。"""
-        return sum(1 for i in range(self._list.count()) if not self._list.item(i).isHidden())
+        return len(self._entries)
 
-    # --- 右：详情（两个标签页） ---
+    def _on_search(self, text: str) -> None:
+        self._fill_list(text)
+
+    def _on_item_clicked(self, item: QListWidgetItem) -> None:
+        position = item.data(_ROLE_INDEX)
+        entry = self._entry_of(int(position))
+        if entry is None:
+            return
+        self._selected_key = entry["key"]
+        self._selected_sid = entry["sid"]
+        self._current_term = ""
+        self._sync_buttons()
+        payload = self._payload_for_entry(entry)
+        if payload is None:
+            self._list_note.setText("这一行没有可显示的侧写数据。")
+            return
+        self._payload = payload
+        if self._stack is not None:
+            self._stack.setCurrentIndex(0)
+        self._render()
+
+    def _payload_for_entry(self, entry: dict[str, Any]) -> dict[str, Any] | None:
+        index = entry.get("index")
+        if index is not None and index >= 0 and callable(self._provider):
+            try:
+                payload = self._provider(int(index))
+            except Exception:  # noqa: BLE001 - 一行读不出来不该带崩整页
+                logger.exception("读取这一行的侧写数据失败")
+                payload = None
+            if payload:
+                return payload
+        key = entry["key"]
+        sid = entry["sid"]
+        name = entry["name"]
+        archive = None
+        try:
+            full = load_archive(self._store, self._username)
+            archive = student_archive_of_key(full, key)
+        except Exception:  # noqa: BLE001
+            logger.exception("读取档案失败")
+            archive = None
+        if archive is None:
+            archive = build_empty_student_archive(key, name, sid)
+        return {
+            "student": name,
+            "student_id": sid,
+            "key": key,
+            "index": index,
+            "results": {},
+            "archive": archive,
+        }
+
+    def _select_key(self, key: str) -> None:
+        target = key or ""
+        for position, entry_key in self._key_by_index.items():
+            if entry_key == target:
+                self._list.setCurrentRow(position)
+                self._select_item(position)
+                return
+
+    def _select_item(self, position: int) -> None:
+        item = self._list.item(position)
+        if item is None:
+            return
+        self._list.setCurrentItem(item)
+        self._list.scrollToItem(item)
+
+    def _upsert_roster_into_book(self) -> None:
+        if self._book is None:
+            return
+        for row in self._roster:
+            sid = _bare_sid(getattr(row, "student_id", ""))
+            if not sid:
+                continue
+            name = str(getattr(row, "student", "") or "").strip()
+            if not name:
+                continue
+            try:
+                self._book.upsert_import(sid, name)
+            except Exception:  # noqa: BLE001 - 主档漏一个人是显示问题，不许影响导入
+                logger.warning("补档失败（%s / %s）", sid, name, exc_info=True)
+
+    # -- 详情页 -----------------------------------------------------------
     def _build_detail_pane(self) -> QWidget:
         pane = QWidget()
         box = QVBoxLayout(pane)
         box.setContentsMargins(0, 0, 0, 0)
-        box.setSpacing(0)
+        box.setSpacing(12)
 
         self._empty = QLabel(
-            "👈  在左边点一名学生，这里显示他的成绩明细、学业肖像、"
-            "发展意愿和辅导提纲。\n\n"
-            "名单来自「📊 智育分析」导入的成绩表。还没导入的话，先去那一页导一份。"
+            "在左边点一名学生，这里显示他的成绩明细、总评与侧写、AI 辅导。\n\n"
+            "名单来自「智育分析」导入的成绩表；也可以点下面的「新建学生」手动补。"
         )
         self._empty.setObjectName("Placeholder")
-        self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty.setAlignment(Qt.AlignCenter)
         self._empty.setWordWrap(True)
         box.addWidget(self._empty, 1)
 
         self._body = QWidget()
-        body_box = QVBoxLayout(self._body)
-        body_box.setContentsMargins(0, 0, 0, 0)
-        body_box.setSpacing(12)
+        body = QVBoxLayout(self._body)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(12)
+        body.addWidget(self._build_info_card())
+        body.addWidget(self._build_timeline_card())
 
-        # ★ 标签页**不放进滚动区**：滚起来会把标签头一起滚走。
-        #   滚动区在标签页**里面**（下面两个 pane 各自带一个）。
         self._tabs = QTabWidget()
         self._tabs.setObjectName("ProfileTabs")
         self._tabs.addTab(self._build_grades_pane(), "成绩明细")
         self._tabs.addTab(self._build_review_pane(), "总评与侧写")
         self._tabs.addTab(self._build_chat_pane(), "AI 辅导")
         self._tabs.currentChanged.connect(self._on_tab_changed)
-        body_box.addWidget(self._tabs, 1)
-
-        # 标签页下面：发展意愿（左）+ 辅导提纲（右）。
-        # ★ 这两张卡**常驻不重建** —— 页面里绝不 deleteLater 重建控件，
-        #   也就绝不会踩到"透明度效果缓存 pixmap → 整页变白"那个坑（AGENTS §4b）。
-        bottom = QHBoxLayout()
-        bottom.setSpacing(14)
-        intention = self._build_intention()
-        outline = self._build_outline()
-        intention.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
-        bottom.addWidget(intention, 1)
-        bottom.addWidget(outline, 1)
-        body_box.addLayout(bottom)
+        body.addWidget(self._tabs, 1)
 
         box.addWidget(self._body, 1)
         self._body.hide()
         return pane
 
-    # --- 标签页 1：成绩明细 ---
-    def _build_grades_pane(self) -> QWidget:
-        pane = QWidget()
-        box = QVBoxLayout(pane)
-        box.setContentsMargins(0, 10, 0, 0)
-        box.setSpacing(8)
-
-        self._grades_note = QLabel("")
-        self._grades_note.setObjectName("Muted")
-        self._grades_note.setWordWrap(True)
-        box.addWidget(self._grades_note)
-
-        self._grade_tree = QTreeWidget()
-        self._grade_tree.setObjectName("GradeTree")
-        self._grade_tree.setColumnCount(len(GRADE_TREE_COLUMNS))
-        self._grade_tree.setHeaderLabels(list(GRADE_TREE_COLUMNS))
-        self._grade_tree.setRootIsDecorated(True)
-        self._grade_tree.setUniformRowHeights(True)
-        self._grade_tree.setAlternatingRowColors(False)
-        # ★ 从 v1.9.1 起**不再是 NoSelection**：第 4 列那个「删除」按钮要收到
-        #   点击事件（选中态只是副作用，真正判命中用 :meth:`on_grade_action` 里的
-        #   按钮矩形）。鼠标跟踪打开，悬停时按钮才变色。
-        self._grade_tree.setSelectionMode(QTreeWidget.SelectionMode.SingleSelection)
-        self._grade_tree.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._grade_tree.setMouseTracking(True)
-        # ★ 列宽写死 + Fixed：`ResizeToContents` 不把"展开出来的子行"算进来，
-        #   点开一个学期之后列宽会跳（AGENTS §4c 第 2 条）。
-        header = self._grade_tree.header()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        header.setStretchLastSection(False)
-        self._grade_tree.setColumnWidth(1, 88)
-        self._grade_tree.setColumnWidth(2, 88)
-        # 「操作」列必须写死宽度（§4c 第 2 条：放进去的控件不参与 ResizeToContents）
-        self._grade_tree.setColumnWidth(3, 88)
-        self._grade_action_column = len(GRADE_TREE_COLUMNS) - 1
-        self._grade_delegate = RowActionDelegate()
-        self._grade_tree.setItemDelegateForColumn(
-            self._grade_action_column, self._grade_delegate
-        )
-        self._grade_tree.itemClicked.connect(self._on_grade_clicked)
-        box.addWidget(self._grade_tree, 1)
-
-        box.addWidget(self._build_moral_card())
-        return pane
-
-    # --- 标签页 1 的副卡：德育分（一行 = 一条，右侧「删除」）---
-    def _build_moral_card(self) -> QFrame:
+    def _build_info_card(self) -> QFrame:
         card = make_card()
-        box = QHBoxLayout(card)
-        box.setContentsMargins(16, 10, 16, 10)
-        box.setSpacing(10)
+        row = QHBoxLayout(card)
+        row.setContentsMargins(20, 14, 20, 14)
+        row.setSpacing(14)
 
-        title = QLabel("德育分")
-        title.setObjectName("H3")
-        box.addWidget(title)
+        self._info_avatar = QLabel("—")
+        self._info_avatar.setObjectName("H2")
+        self._info_avatar.setFixedWidth(40)
+        row.addWidget(self._info_avatar)
 
-        self._moral_row = QLabel(moral_text(None))
-        self._moral_row.setObjectName("Muted")
-        box.addWidget(self._moral_row, 1)
+        column = QVBoxLayout()
+        column.setSpacing(2)
+        self._info_name = QLabel("（还没选学生）")
+        self._info_name.setObjectName("H2")
+        column.addWidget(self._info_name)
+        self._info_meta = QLabel("")
+        self._info_meta.setObjectName("Muted")
+        self._info_meta.setWordWrap(True)
+        self._info_meta.setMinimumWidth(260)
+        column.addWidget(self._info_meta)
+        row.addLayout(column, 1)
 
-        self._moral_delete = QPushButton(ACTION_TEXT)
-        self._moral_delete.setObjectName("RowAction")
-        self._moral_delete.setToolTip("删除这名学生的德育分记录")
-        self._moral_delete.setMaximumWidth(84)
-        self._moral_delete.setMinimumHeight(26)
-        self._moral_delete.clicked.connect(self._delete_moral_row)
-        box.addWidget(self._moral_delete)
+        self._info_moral = QLabel("德育总分：未录入")
+        self._info_moral.setObjectName("Muted")
+        self._info_moral.setWordWrap(True)
+        self._info_moral.setMinimumWidth(150)
+        row.addWidget(self._info_moral)
         return card
 
-    # --- 标签页 3：AI 辅导（任务书 2）---
-    def _build_chat_pane(self) -> QWidget:
-        """学生信息卡 + 只读谈话记录 + 一行输入框。
-
-        ★ 容器上**绝不挂任何 QGraphicsEffect**（AGENTS §17：挂了整页可能画成
-          空白，静态断言查不出来）。本函数里一个 ``setGraphicsEffect`` 都没有。
-        """
-        pane = QWidget()
-        box = QVBoxLayout(pane)
-        box.setContentsMargins(0, 10, 0, 0)
-        box.setSpacing(10)
-
-        box.addWidget(self._build_student_card())
-
-        self._chat_status = QLabel("")
-        self._chat_status.setObjectName("Muted")
-        self._chat_status.setWordWrap(True)
-        self._chat_status.setMinimumWidth(320)
-        box.addWidget(self._chat_status)
-
-        # 缺模型时的兜底入口（懒 import + try/except，见 _open_model_center）
-        self._model_center_btn = QPushButton("打开模型中心")
-        self._model_center_btn.setObjectName("Ghost")
-        self._model_center_btn.setMinimumHeight(32)
-        self._model_center_btn.setMaximumWidth(160)
-        self._model_center_btn.clicked.connect(self._open_model_center)
-        self._model_center_btn.hide()
-        box.addWidget(self._model_center_btn)
-
-        self._chat_view = QTextEdit()
-        self._chat_view.setObjectName("Outline")
-        self._chat_view.setReadOnly(True)
-        self._chat_view.setPlaceholderText("这里显示这名学生的谈话记录。")
-        box.addWidget(self._chat_view, 1)
-
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        self._chat_input = QLineEdit()
-        self._chat_input.setPlaceholderText("说点什么…（回车发送）")
-        self._chat_input.returnPressed.connect(self._on_chat_send_clicked)
-        row.addWidget(self._chat_input, 1)
-        self._chat_send = QPushButton("发送")
-        self._chat_send.setObjectName("Primary")
-        self._chat_send.setMinimumHeight(34)
-        self._chat_send.setMaximumWidth(120)
-        self._chat_send.clicked.connect(self._on_chat_send_clicked)
-        row.addWidget(self._chat_send)
-        box.addLayout(row)
-
-        # ★ 建页面时还没选学生：输入区先关上、状态行给出怎么开始
-        #   （不这么写的话，窗口一打开输入框就能打字，发出去才发现没人可谈）
-        self._chat_status.setText("先在左边点一名学生，再开始谈话。")
-        self._chat_input.setEnabled(False)
-        self._chat_send.setEnabled(False)
-        return pane
-
-    def _build_student_card(self) -> QFrame:
-        """当前学生的基本信息卡片（姓名 / 学号 / 班级）。"""
+    def _build_timeline_card(self) -> QFrame:
         card = make_card()
-        box = QHBoxLayout(card)
-        box.setContentsMargins(16, 12, 16, 12)
-        box.setSpacing(14)
-
-        self._chat_avatar = QLabel("—")
-        self._chat_avatar.setObjectName("H2")
-        self._chat_avatar.setFixedWidth(40)
-        box.addWidget(self._chat_avatar)
-
-        info = QVBoxLayout()
-        info.setSpacing(2)
-        self._chat_name = QLabel("（还没选学生）")
-        self._chat_name.setObjectName("H3")
-        info.addWidget(self._chat_name)
-        self._chat_meta = QLabel("")
-        self._chat_meta.setObjectName("Muted")
-        self._chat_meta.setWordWrap(True)
-        self._chat_meta.setMinimumWidth(240)
-        info.addWidget(self._chat_meta)
-        box.addLayout(info, 1)
-
-        note = QLabel("本机离线推理，谈话记录加密存在本机")
+        box = QVBoxLayout(card)
+        box.setContentsMargins(20, 12, 20, 12)
+        box.setSpacing(8)
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        title = QLabel("学期时间轴")
+        title.setObjectName("H3")
+        head.addWidget(title)
+        note = QLabel("点一个学期看那一学期的学业侧写；均分是算术平均。")
         note.setObjectName("Muted")
         note.setWordWrap(True)
-        note.setFixedWidth(220)
-        box.addWidget(note)
+        note.setMinimumWidth(240)
+        head.addWidget(note, 1)
+        box.addLayout(head)
+
+        self._timeline_scroll = QScrollArea()
+        self._timeline_scroll.setObjectName("TimelineScroll")
+        self._timeline_scroll.setWidgetResizable(True)
+        self._timeline_scroll.setFrameShape(QFrame.NoFrame)
+        self._timeline_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._timeline_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._timeline_scroll.setFixedHeight(96)
+        self._timeline_box = QWidget()
+        self._timeline_layout = QHBoxLayout(self._timeline_box)
+        self._timeline_layout.setContentsMargins(0, 0, 0, 0)
+        self._timeline_layout.setSpacing(8)
+        self._timeline_layout.addStretch(1)
+        self._timeline_scroll.setWidget(self._timeline_box)
+        box.addWidget(self._timeline_scroll)
         return card
 
-    # --- 标签页 2：总评与侧写 ---
-    def _build_review_pane(self) -> QWidget:
-        pane = QWidget()
-        outer = QVBoxLayout(pane)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
+    def _timeline_data(self) -> dict[str, list[dict[str, Any]]]:
+        if self._store is None or not self._username:
+            return {}
+        sid = self._bare_current_sid()
+        if not sid:
+            return {}
+        key = str((self._payload or {}).get("key") or student_key(sid, ""))
+        try:
+            return student_semester_rows(self._store, self._username, sid, key)
+        except Exception:  # noqa: BLE001 - 读不到就画一条空时间轴
+            logger.exception("读取学期时间轴失败")
+            return {}
 
+    def _timeline_terms(self) -> list[str]:
+        return [term for term, rows in self._timeline_data().items() if rows]
+
+    def _render_timeline(self) -> None:
+        layout = self._timeline_layout
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        data = self._timeline_data()
+        terms = [term for term, rows in data.items() if rows]
+        if not terms:
+            hint = QLabel("暂无学期成绩记录")
+            hint.setObjectName("Muted")
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+            layout.addStretch(1)
+            return
+        previous_mean: float | None = None
+        for term in terms:
+            mean = rows_arithmetic_mean(data.get(term, []))
+            delta = None
+            if mean is not None and previous_mean is not None:
+                delta = mean - previous_mean
+            node = TermNode(term, mean, delta, self._timeline_box)
+            node.set_selected(term == self._current_term)
+            node.clicked.connect(
+                lambda clicked_term: self.open_semester(semester=clicked_term)
+            )
+            layout.addWidget(node)
+            if mean is not None:
+                previous_mean = mean
+        layout.addStretch(1)
+
+    def _render_info_card(self) -> None:
+        payload = self._payload or {}
+        name = str(payload.get("student") or "").strip() or "（未命名）"
+        sid = self._bare_current_sid()
+        self._info_name.setText(f"{name}（{sid}）" if sid else name)
+        self._info_avatar.setText(name[:1] or "—")
+        class_name = self._class_of(sid) if sid else ""
+        meta = f"学号：{sid or '未标注'}"
+        meta += f"　·　班级：{class_name or '未标注'}"
+        self._info_meta.setText(meta)
+        key = str(payload.get("key") or "")
+        moral = self._student_moral(key) if key else None
+        if moral is None:
+            self._info_moral.setText("德育总分：未录入")
+        else:
+            self._info_moral.setText(f"德育总分：{moral_text(moral)}")
+
+    def _render(self) -> None:
+        """重画详情页：空态 → 信息卡 + 时间轴 + 三个标签页。"""
+        if not self._payload:
+            self._empty.show()
+            self._body.hide()
+            return
+        self._empty.hide()
+        self._body.show()
+        self._render_info_card()
+        self._render_timeline()
+        self._render_detail()
+
+    def _build_review_pane(self) -> QWidget:
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setFrameShape(QFrame.NoFrame)
         inner = QWidget()
         box = QVBoxLayout(inner)
-        box.setContentsMargins(0, 10, 6, 0)
-        box.setSpacing(14)
-
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(12)
         box.addWidget(self._build_portrait())
         box.addWidget(self._build_side_text())
+        box.addWidget(self._build_intention())
+        box.addWidget(self._build_outline())
         box.addStretch(1)
-
         scroll.setWidget(inner)
-        outer.addWidget(scroll, 1)
-        return pane
+        return scroll
 
-    # --- 第一层：学业肖像 ---
-    def _build_portrait(self) -> QFrame:
-        card = make_card()
-        box = QVBoxLayout(card)
-        box.setContentsMargins(20, 18, 20, 18)
-        box.setSpacing(10)
+    # -- 学生 CRUD --------------------------------------------------------
+    def _refresh_students(self) -> None:
+        if self._book is not None:
+            try:
+                self._book.refresh()
+            except Exception:  # noqa: BLE001 - 刷新失败只打日志
+                logger.exception("刷新学生主档失败")
+        self._fill_list(self._search_text)
 
-        top = QHBoxLayout()
-        self._portrait_title = QLabel("总评")
-        self._portrait_title.setObjectName("H2")
-        top.addWidget(self._portrait_title)
-        top.addSpacing(12)
-
-        self._avg_label = QLabel("—")
-        self._avg_label.setObjectName("H1")
-        top.addWidget(self._avg_label)
-
-        self._blank_label = QLabel("")
-        self._blank_label.setObjectName("Muted")
-        top.addWidget(self._blank_label)
-        top.addStretch(1)
-        box.addLayout(top)
-
-        self._avg_sub = QLabel("")
-        self._avg_sub.setObjectName("Muted")
-        self._avg_sub.setWordWrap(True)
-        self._avg_sub.setMinimumWidth(320)
-        box.addWidget(self._avg_sub)
-
-        # 三档口径的加权均分（数字来自 ``core.calculator``，本页一行都没算）
-        self._scope_label = QLabel("")
-        self._scope_label.setObjectName("Muted")
-        self._scope_label.setWordWrap(True)
-        self._scope_label.setMinimumWidth(320)
-        box.addWidget(self._scope_label)
-
-        sub_row = QHBoxLayout()
-        sub_row.setSpacing(8)
-        self._trend_tag = QLabel("—")
-        self._trend_tag.setObjectName("TagGray")
-        sub_row.addWidget(self._trend_tag)
-        self._trend_sub = QLabel("")
-        self._trend_sub.setObjectName("Muted")
-        self._trend_sub.setWordWrap(True)
-        self._trend_sub.setMinimumWidth(320)
-        sub_row.addWidget(self._trend_sub, 1)
-        box.addLayout(sub_row)
-
-        box.addWidget(self._section("已定型短板", "补考不改分（红线 9），不必再纠结"))
-        self._locked_box = QVBoxLayout()
-        self._locked_box.setSpacing(4)
-        box.addLayout(self._locked_box)
-
-        box.addWidget(self._section("可抢救项", "分不高、但提一提能拉均分"))
-        self._rescue_box = QVBoxLayout()
-        self._rescue_box.setSpacing(4)
-        box.addLayout(self._rescue_box)
-        return card
-
-    # --- 第四层：AI 侧写（正文落 ProfileStore，不落明文） ---
-    def _build_side_text(self) -> QFrame:
-        card = make_card()
-        box = QVBoxLayout(card)
-        box.setContentsMargins(20, 16, 20, 16)
-        box.setSpacing(10)
-
-        head = QHBoxLayout()
-        title = QLabel("AI 侧写")
-        title.setObjectName("H2")
-        head.addWidget(title)
-        note = QLabel("把已有成绩与德育分拼成提示词，交给本机 AI 引擎生成")
-        note.setObjectName("Muted")
-        head.addWidget(note)
-        head.addStretch(1)
-
-        self._ai_btn = QPushButton("点击生成")
-        self._ai_btn.setObjectName("Ghost")
-        self._ai_btn.setMinimumHeight(36)
-        self._ai_btn.setToolTip("生成的内容会存进本地加密文件")
-        self._ai_btn.clicked.connect(self._generate_side_text)
-        head.addWidget(self._ai_btn)
-
-        # 生成完之后正文是**可编辑**的，改完点这里才写回加密库。
-        self._side_save = QPushButton("保存")
-        self._side_save.setObjectName("Primary")
-        self._side_save.setMinimumHeight(36)
-        self._side_save.setToolTip("把文本框里的内容存进本地加密文件")
-        self._side_save.clicked.connect(self._on_side_save_clicked)
-        head.addWidget(self._side_save)
-
-        # 侧写记录的「删除」＝把这个学生的 side_text 清空（任务书 3 的第三类）。
-        # ★ 纯文字，不许 emoji（AGENTS §4l）。
-        self._side_delete = QPushButton(ACTION_TEXT)
-        self._side_delete.setObjectName("RowAction")
-        self._side_delete.setMinimumHeight(36)
-        self._side_delete.setMaximumWidth(84)
-        self._side_delete.setToolTip("清空这名学生的侧写记录")
-        self._side_delete.clicked.connect(self._delete_side_text)
-        head.addWidget(self._side_delete)
-        box.addLayout(head)
-
-        self._side_hint = QLabel(SIDE_TEXT_EMPTY_HINT)
-        self._side_hint.setObjectName("Muted")
-        self._side_hint.setWordWrap(True)
-        self._side_hint.setMinimumWidth(320)
-        box.addWidget(self._side_hint)
-
-        # 生成期间的状态行（「正在生成侧写…」/ 失败的中文原因）。
-        self._side_status = QLabel("")
-        self._side_status.setObjectName("Muted")
-        self._side_status.setWordWrap(True)
-        self._side_status.setMinimumWidth(320)
-        box.addWidget(self._side_status)
-
-        self._side_text = QTextEdit()
-        self._side_text.setObjectName("Outline")
-        # ★ **可编辑**（任务书 5）：生成或读回来的正文都要能让辅导员改，
-        #   改完「保存」才写回 ProfileStore。生成期间临时置只读。
-        self._side_text.setReadOnly(False)
-        self._side_text.setMinimumHeight(150)
-        self._side_text.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+    def _audit_student(
+        self, operation: str, *, student_id: str, detail: str
+    ) -> None:
+        record_student_audit(
+            self._store,
+            self._username,
+            operation,
+            student_id=_bare_sid(student_id),
+            detail=detail,
         )
-        self._side_text.textChanged.connect(self._on_side_text_changed)
-        box.addWidget(self._side_text)
-        return card
 
-    def _section(self, title: str, hint: str) -> QWidget:
-        holder = QWidget()
-        box = QHBoxLayout(holder)
-        box.setContentsMargins(0, 8, 0, 0)
-        box.setSpacing(8)
-        label = QLabel(title)
-        label.setObjectName("H3")
-        box.addWidget(label)
-        note = QLabel(hint)
-        note.setObjectName("Muted")
-        box.addWidget(note)
-        box.addStretch(1)
-        return holder
-
-    # --- 第二层：发展意愿 ---
-    def _build_intention(self) -> QFrame:
-        card = make_card()
-        box = QVBoxLayout(card)
-        box.setContentsMargins(20, 16, 20, 16)
-        box.setSpacing(8)
-
-        title = QLabel("发展意愿")
-        title.setObjectName("H2")
-        box.addWidget(title)
-
-        note = QLabel("选完立即存进本地加密文件；下次打开这名学生还在。")
-        note.setObjectName("Muted")
-        box.addWidget(note)
-
-        #: 没学号时的警告条（有学号时藏起来）
-        self._id_warn = QLabel("")
-        self._id_warn.setObjectName("Warn")
-        self._id_warn.setWordWrap(True)
-        box.addWidget(self._id_warn)
-        self._id_warn.hide()
-
-        row = QHBoxLayout()
-        row.setSpacing(10)
-        self._intent_group = QButtonGroup(self)
-        self._intent_group.setExclusive(True)
-        self._intent_buttons: dict[str, QRadioButton] = {}
-        for option in INTENTION_OPTIONS:
-            radio = QRadioButton(option)
-            radio.toggled.connect(
-                lambda checked, name=option: self._on_intention(name) if checked else None
-            )
-            self._intent_group.addButton(radio)
-            self._intent_buttons[option] = radio
-            row.addWidget(radio)
-        row.addStretch(1)
-        box.addLayout(row)
-
-        self._intent_status = QLabel("")
-        self._intent_status.setObjectName("Muted")
-        self._intent_status.setWordWrap(True)
-        box.addWidget(self._intent_status)
-        return card
-
-    # --- 第三层：辅导提纲 ---
-    def _build_outline(self) -> QFrame:
-        card = make_card()
-        box = QVBoxLayout(card)
-        box.setContentsMargins(20, 16, 20, 16)
-        box.setSpacing(10)
-
-        head = QHBoxLayout()
-        title = QLabel("辅导提纲")
-        title.setObjectName("H2")
-        head.addWidget(title)
-        note = QLabel("本地规则拼出来的，不联网、不调 AI")
-        note.setObjectName("Muted")
-        head.addWidget(note)
-        head.addStretch(1)
-
-        self._copy_btn = QPushButton("📋  一键复制")
-        self._copy_btn.setObjectName("Ghost")
-        self._copy_btn.setMinimumHeight(36)
-        self._copy_btn.clicked.connect(self._do_copy)
-        head.addWidget(self._copy_btn)
-        box.addLayout(head)
-
-        self._outline = QTextEdit()
-        self._outline.setObjectName("Outline")
-        self._outline.setReadOnly(True)
-        self._outline.setMinimumHeight(210)
-        self._outline.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
-        )
-        box.addWidget(self._outline)
-        return card
-
-    # ---------------------------------------------------------------- 名单
-    def _on_search(self, text: str) -> None:
-        """实时过滤：不匹配的条目 ``setHidden(True)``。
-
-        匹配用 ``findItems`` + ``MatchContains`` —— 条目文字是
-        ``张三（2023001）``，所以搜姓名和搜学号都能命中。
-        """
-        keyword = (text or "").strip()
-        for i in range(self._list.count()):
-            self._list.item(i).setHidden(True)
-        if keyword:
-            # MatchContains：条目文字是「张三（2023001）」，搜姓名和搜学号都能中。
-            # **不要加 MatchCaseInsensitive** —— PySide6 里没这个名字（只有
-            # MatchCaseSensitive），加了会抛 AttributeError；Qt 默认就是
-            # 大小写不敏感，不写即可。
-            hit = self._list.findItems(keyword, Qt.MatchFlag.MatchContains)
-            for item in hit:
-                item.setHidden(False)
-        else:
-            for i in range(self._list.count()):
-                self._list.item(i).setHidden(False)
-        self._update_list_note()
-
-    def _on_item_clicked(self, item: QListWidgetItem) -> None:
-        index = item.data(Qt.ItemDataRole.UserRole)
-        payload = self._provider(index) if self._provider is not None else None
-        if payload is None:
-            self._intent_status.setText("这一行没有可显示的侧写数据。")
+    def _open_new_student(self) -> None:
+        if self._book is None:
+            QMessageBox.information(self, "新建学生", "学生主档还没准备好，请稍后再试。")
             return
-        self._payload = payload
+        dialog = StudentDialog(self, title="新建学生")
+        if dialog.exec() != QDialog.Accepted:
+            return
+        values = dialog.values()
+        sid = _bare_sid(values.get("student_id", ""))
+        name = values.get("name", "").strip()
+        if not sid:
+            QMessageBox.warning(self, "信息不完整", "学号是必填的。")
+            return
+        if not name:
+            QMessageBox.warning(self, "信息不完整", "姓名是必填的。")
+            return
+        try:
+            self._book.add(
+                student_id=sid,
+                name=name,
+                class_name=values.get("class_name", ""),
+                note=values.get("note", ""),
+            )
+        except DuplicateStudentError:
+            QMessageBox.critical(
+                self, "学号重复", f"学号 {sid} 已存在，不能重复录入。"
+            )
+            return
+        except Exception:  # noqa: BLE001 - 写不进去也要说人话
+            logger.exception("新建学生失败")
+            QMessageBox.critical(self, "新建学生", "这名学生没有存进去，请稍后再试。")
+            return
+        self._audit_student(
+            "student_add", student_id=sid, detail=f"新建学生 {name}（{sid}）"
+        )
+        self._no_data = False
+        self._refresh_students()
+        self._select_student_by_sid(sid)
+
+    def _open_edit_student(self) -> None:
+        entry = self._current_entry()
+        if entry is None or not entry["sid"] or self._book is None:
+            return
+        old_sid = entry["sid"]
+        record = None
+        try:
+            record = self._book.get(old_sid)
+        except Exception:  # noqa: BLE001
+            logger.exception("读取学生主档失败")
+        dialog = StudentDialog(self, record=record, title="编辑学生")
+        if dialog.exec() != QDialog.Accepted:
+            return
+        values = dialog.values()
+        new_sid = _bare_sid(values.get("student_id", ""))
+        name = values.get("name", "").strip()
+        if not new_sid:
+            QMessageBox.warning(self, "信息不完整", "学号是必填的。")
+            return
+        if not name:
+            QMessageBox.warning(self, "信息不完整", "姓名是必填的。")
+            return
+        if new_sid != old_sid:
+            choice = self._confirm_sid_change(old_sid, new_sid)
+            if choice is None:
+                return
+            if choice == "info":
+                QMessageBox.information(
+                    self,
+                    "仅修改信息",
+                    f"学生信息已经改成 {new_sid}；历史成绩仍挂在旧学号下（{old_sid}），"
+                    "需要时请手动迁移。",
+                )
+            else:
+                try:
+                    report = migrate_student_id_for(
+                        old_sid, new_sid, store=self._store, username=self._username
+                    )
+                except Exception:  # noqa: BLE001 - 迁移失败只警告，学生信息照样能改
+                    logger.warning("迁移学号关联数据失败", exc_info=True)
+                    report = None
+                if report is None:
+                    QMessageBox.warning(
+                        self,
+                        "迁移历史数据",
+                        "历史数据迁移没有完成；这次仍会修改学生信息，旧数据需要时请手动核对。",
+                    )
+                else:
+                    self._migrate_grades_fallback(old_sid, new_sid, report)
+                    QMessageBox.information(
+                        self, "迁移历史数据", migration_report_text(report)
+                    )
+                self._audit_student(
+                    "student_migrate",
+                    student_id=new_sid,
+                    detail=f"学号 {old_sid} 改为 {new_sid}",
+                )
+        try:
+            self._book.update(
+                old_sid,
+                student_id=new_sid,
+                name=name,
+                class_name=values.get("class_name", ""),
+                note=values.get("note", ""),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("编辑学生失败")
+            QMessageBox.critical(self, "编辑学生", "这名学生的信息没有存进去，请稍后再试。")
+            return
+        self._audit_student(
+            "student_edit", student_id=new_sid, detail=f"编辑学生 {name}（{new_sid}）"
+        )
+        self._refresh_students()
+
+    def _migrate_grades_fallback(self, old_sid: str, new_sid: str, report) -> None:
+        """补搬成绩历史（core 的 migrate_student_id 用键形式调用 rekey 时不匹配）。
+
+        core.database.migrate_student_id 内部把学号归一成 sid:<学号> 之后
+        交给 GradeHistoryDB.rekey_student()，而 rekey_student 是拿**裸学号**
+        逐行比较的 —— 结果一行也搬不过去（report.grades 为 0）。
+        这里用公开 API 再搬一次：裸学号对裸学号；已经搬过的再调一次是 0 条，幂等。
+        """
+        if report is None or int(getattr(report, "grades", 0) or 0) > 0:
+            return
+        db = self._history()
+        if db is None:
+            return
+        try:
+            moved, dropped = db.rekey_student(old_sid, new_sid)
+        except Exception:  # noqa: BLE001 - 补搬失败只警告，主流程继续
+            logger.warning("补搬成绩历史失败", exc_info=True)
+            return
+        if not (moved or dropped):
+            return
+        try:
+            report.grades = int(getattr(report, "grades", 0) or 0) + int(moved)
+            report.grade_dropped = (
+                int(getattr(report, "grade_dropped", 0) or 0) + int(dropped)
+            )
+        except Exception:  # noqa: BLE001 - 报告是 dataclass，字段动了只影响文案
+            logger.debug("回填迁移报告失败", exc_info=True)
+
+    def _confirm_sid_change(self, old_sid: str, new_sid: str) -> str | None:
+        """改学号前的二次确认（任务书第 5 节）。
+
+        返回 ``"migrate"``（把历史数据一起迁到新学号）、``"info"``（只改主档，
+        历史仍挂在旧学号下）或 ``None``（取消，什么都不做）。
+        两个选项**都**是用户按下的按钮 —— 不许默认替用户选。
+        """
+        if new_sid == old_sid:
+            return None
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("修改学号")
+        box.setText(
+            f"学号要从 {old_sid} 改成 {new_sid}。\n"
+            "要不要把历史数据（成绩、侧写、谈话记录、德育分）一起迁移到新学号？"
+        )
+        migrate_btn = box.addButton("迁移历史数据", QMessageBox.AcceptRole)
+        info_btn = box.addButton("仅修改信息，不迁移历史", QMessageBox.ActionRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is migrate_btn:
+            return "migrate"
+        if clicked is info_btn:
+            return "info"
+        return None
+
+    def _delete_student(self) -> None:
+        entry = self._current_entry()
+        if entry is None or not entry["sid"] or self._book is None:
+            return
+        sid = entry["sid"]
+        name = entry["name"]
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("删除学生")
+        box.setText(
+            f"要删除 {name}（{sid}）吗？仅归档只是从列表隐藏，数据全部保留；"
+            "彻底删除会清掉成绩、侧写、谈话记录与德育分。"
+        )
+        hard_btn = box.addButton(
+            "彻底删除（成绩、侧写、谈话记录一起删）", QMessageBox.DestructiveRole
+        )
+        archive_btn = box.addButton("归档隐藏", QMessageBox.ActionRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is hard_btn:
+            answer = QMessageBox.question(
+                self,
+                "确认彻底删除",
+                f"确定彻底删除 {name}（{sid}）吗？成绩、侧写、谈话记录与德育分"
+                "会一起删除，无法恢复。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._delete_student_hard(sid, name)
+        elif clicked is archive_btn:
+            self._delete_student_archive(sid, name)
+
+    def _delete_student_hard(self, sid: str, name: str) -> None:
+        self._delete_hard_data(sid)
+        try:
+            self._book.remove(sid)
+        except Exception:  # noqa: BLE001
+            logger.exception("删除学生主档失败")
+            QMessageBox.critical(self, "删除学生", "这名学生没有删掉，请稍后再试。")
+            return
+        self._audit_student(
+            "student_delete", student_id=sid, detail=f"彻底删除学生 {name}（{sid}）"
+        )
+        self._clear_selection()
+        self._refresh_students()
+
+    def _delete_student_archive(self, sid: str, name: str) -> None:
+        try:
+            self._book.archive(sid)
+        except Exception:  # noqa: BLE001
+            logger.exception("归档学生失败")
+            QMessageBox.critical(self, "归档学生", "这名学生没有归档成功，请稍后再试。")
+            return
+        self._audit_student(
+            "student_archive", student_id=sid, detail=f"归档学生 {name}（{sid}）"
+        )
+        self._clear_selection()
+        self._refresh_students()
+
+    def _clear_selection(self) -> None:
+        self._payload = None
+        self._selected_key = ""
+        self._selected_sid = ""
+        self._current_term = ""
         self._render()
 
-    def _select_key(self, key: str) -> None:
-        """按稳定标识在名单里选中对应条目（**同名不会选错人**）。"""
-        if not key:
-            return
-        for i in range(self._list.count()):
-            item = self._list.item(i)
-            if self._key_by_index.get(item.data(Qt.ItemDataRole.UserRole)) == key:
-                self._list.setCurrentItem(item)
-                self._list.scrollToItem(item)
-                return
-
-    def _migrate_name_keys(self) -> None:
-        """把老的"裸姓名"意愿迁到学号上（**只在指代唯一时才迁**）。
-
-        上一版按姓名存意愿（``name:张三``）。现在有了学号，如果全班只有**一个**
-        张三，那这份意愿指的一定是他 —— 迁过去，用户不用重选。
-        有两个及以上同名时**不猜**，原样留在 ``name:`` 键上。
-        """
-        if not self._username or not self._roster:
-            return
-        by_name: dict[str, list[Any]] = {}
-        for row in self._roster:
-            by_name.setdefault(row.student, []).append(row)
-
-        moved = 0
-        for name, rows in by_name.items():
-            if len(rows) != 1:
-                continue
-            row = rows[0]
-            if not row.has_id:
-                continue
-            old_key = f"{KEY_PREFIX_NAME}{name}"
-            if old_key not in self._intentions:
-                continue
-            value = self._intentions.pop(old_key)
-            self._intentions[row.key] = value
+    def _delete_hard_data(self, sid: str) -> None:
+        """彻底删除前先清关联数据：成绩历史、侧写（含学期侧写）、聊天文件。"""
+        db = self._history()
+        if db is not None:
             try:
-                save_intention(self._store, self._username, old_key, "")
-                save_intention(self._store, self._username, row.key, value)
-            except (CryptoError, ValueError):
-                continue
-            moved += 1
-        if moved:
-            print(f"[ProfilePage] 已把 {moved} 条按姓名的意愿迁移到学号键上。")
+                terms = sorted(
+                    {
+                        str(row.get("semester") or "")
+                        for row in db.rows()
+                        if same_student_id(row.get("student_id"), sid)
+                    }
+                    - {""}
+                )
+                for term in terms:
+                    db.delete_semester(sid, term)
+            except Exception:  # noqa: BLE001 - 清理失败不该拦住删除主档
+                logger.exception("删除成绩历史失败")
+        profile_store = self._side_store()
+        if profile_store is not None:
+            try:
+                remove_side = getattr(profile_store, "remove", None)
+                if callable(remove_side):
+                    remove_side(sid)
+                else:
+                    logger.warning("侧写库没有 remove，退回清空侧写正文")
+                    profile_store.clear_side_text(sid)
+            except Exception:  # noqa: BLE001
+                logger.exception("删除侧写失败")
+        try:
+            delete_all_semester_sides(self._store, self._username, sid)
+        except Exception:  # noqa: BLE001
+            logger.exception("删除学期侧写失败")
+        # 档案快照（archive.json.enc）里这一份也一起摘掉，否则同一个学号
+        # 重新导入时会把旧学期整份带回来。
+        try:
+            archive = load_archive(self._store, self._username)
+            students = getattr(archive, "students", None)
+            key = student_key(sid, "")
+            if isinstance(students, dict) and key in students:
+                students.pop(key, None)
+                store_archive(self._store, self._username, archive)
+        except Exception:  # noqa: BLE001 - 快照清不掉不该拦住删除主档
+            logger.exception("删除档案快照失败")
+        try:
+            from core.user_store import delete_user_json
 
-    # ---------------------------------------------------------------- 渲染
-    def _render(self) -> None:
+            chat_name = (
+                f"{CHAT_HISTORY_DIR}{CHAT_HISTORY_PREFIX}"
+                f"{safe_student_file(student_key(sid, ''))}{CHAT_HISTORY_SUFFIX}"
+            )
+            delete_user_json(self._store, self._username, chat_name)
+        except Exception:  # noqa: BLE001
+            logger.exception("删除聊天记录失败")
+
+    # -- 关页 -------------------------------------------------------------
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        """关页：停掉还在跑的线程，放开引擎占的内存（1~3 GB）。"""
+        self._stop_chat_worker()
+        if self._side_worker is not None:
+            cancel = getattr(self._side_worker, "cancel", None)
+            if callable(cancel):
+                cancel()
+            self._side_worker = None
+        if self._semester_page is not None:
+            try:
+                self._semester_page.stop()
+            except Exception:  # noqa: BLE001
+                logger.exception("停止学期侧写页失败")
+        engine = self._chat_engine
+        self._chat_engine = None
+        unload = getattr(engine, "unload", None)
+        if callable(unload):
+            try:
+                unload()
+            except Exception:  # noqa: BLE001 - 释放失败不该拦住关窗
+                logger.exception("释放本地推理引擎失败")
+        super().closeEvent(event)
+
+    def _render_detail(self) -> None:
         payload = self._payload
         if payload is None:
             self._empty.show()
@@ -1898,7 +1839,7 @@ class ProfilePage(QWidget):
             self._id_warn.hide()
         else:
             self._id_warn.setText(
-                "⚠ 成绩表里这名学生没有学号，意愿只能按姓名存 —— "
+                "注意：成绩表里这名学生没有学号，意愿只能按姓名存 —— "
                 "如果班上有同名的人，两个人会共用同一份意愿。"
                 "建议在成绩表里补上学号列再导入一次。"
             )
@@ -1932,7 +1873,413 @@ class ProfilePage(QWidget):
         # --- 标签页 3：AI 辅导（换人 = 换一份谈话记录）---
         self._render_chat(key, student_id, name)
 
-    # ------------------------------------------------- 标签页 1（成绩明细）
+    def _build_grades_pane(self) -> QWidget:
+        pane = QWidget()
+        box = QVBoxLayout(pane)
+        box.setContentsMargins(0, 10, 0, 0)
+        box.setSpacing(8)
+
+        self._grades_note = QLabel("")
+        self._grades_note.setObjectName("Muted")
+        self._grades_note.setWordWrap(True)
+        box.addWidget(self._grades_note)
+
+        self._grade_tree = QTreeWidget()
+        self._grade_tree.setObjectName("GradeTree")
+        self._grade_tree.setColumnCount(len(GRADE_TREE_COLUMNS))
+        self._grade_tree.setHeaderLabels(list(GRADE_TREE_COLUMNS))
+        self._grade_tree.setRootIsDecorated(True)
+        self._grade_tree.setUniformRowHeights(True)
+        self._grade_tree.setAlternatingRowColors(False)
+        # ★ 从 v1.9.1 起**不再是 NoSelection**：第 4 列那个「删除」按钮要收到
+        #   点击事件（选中态只是副作用，真正判命中用 :meth:`on_grade_action` 里的
+        #   按钮矩形）。鼠标跟踪打开，悬停时按钮才变色。
+        self._grade_tree.setSelectionMode(QTreeWidget.SelectionMode.SingleSelection)
+        self._grade_tree.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._grade_tree.setMouseTracking(True)
+        # ★ 列宽写死 + Fixed：`ResizeToContents` 不把"展开出来的子行"算进来，
+        #   点开一个学期之后列宽会跳（AGENTS §4c 第 2 条）。
+        header = self._grade_tree.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        header.setStretchLastSection(False)
+        self._grade_tree.setColumnWidth(1, 88)
+        self._grade_tree.setColumnWidth(2, 88)
+        # 「操作」列必须写死宽度（§4c 第 2 条：放进去的控件不参与 ResizeToContents）
+        self._grade_tree.setColumnWidth(3, 88)
+        self._grade_action_column = len(GRADE_TREE_COLUMNS) - 1
+        self._grade_delegate = RowActionDelegate()
+        self._grade_tree.setItemDelegateForColumn(
+            self._grade_action_column, self._grade_delegate
+        )
+        self._grade_tree.itemClicked.connect(self._on_grade_clicked)
+        box.addWidget(self._grade_tree, 1)
+
+        box.addWidget(self._build_moral_card())
+        return pane
+
+    def _build_moral_card(self) -> QFrame:
+        card = make_card()
+        box = QHBoxLayout(card)
+        box.setContentsMargins(16, 10, 16, 10)
+        box.setSpacing(10)
+
+        title = QLabel("德育分")
+        title.setObjectName("H3")
+        box.addWidget(title)
+
+        self._moral_row = QLabel(moral_text(None))
+        self._moral_row.setObjectName("Muted")
+        box.addWidget(self._moral_row, 1)
+
+        self._moral_delete = QPushButton(ACTION_TEXT)
+        self._moral_delete.setObjectName("RowAction")
+        self._moral_delete.setToolTip("删除这名学生的德育分记录")
+        self._moral_delete.setMaximumWidth(84)
+        self._moral_delete.setMinimumHeight(26)
+        self._moral_delete.clicked.connect(self._delete_moral_row)
+        box.addWidget(self._moral_delete)
+        return card
+
+    def _build_chat_pane(self) -> QWidget:
+        """学生信息卡 + 只读谈话记录 + 一行输入框。
+
+        ★ 容器上**绝不挂任何 QGraphicsEffect**（AGENTS §17：挂了整页可能画成
+          空白，静态断言查不出来）。本函数里一个 ``setGraphicsEffect`` 都没有。
+        """
+        pane = QWidget()
+        box = QVBoxLayout(pane)
+        box.setContentsMargins(0, 10, 0, 0)
+        box.setSpacing(10)
+
+        box.addWidget(self._build_student_card())
+
+        self._chat_status = QLabel("")
+        self._chat_status.setObjectName("Muted")
+        self._chat_status.setWordWrap(True)
+        self._chat_status.setMinimumWidth(320)
+        box.addWidget(self._chat_status)
+
+        # 缺模型时的兜底入口（懒 import + try/except，见 _open_model_center）
+        self._model_center_btn = QPushButton("打开模型中心")
+        self._model_center_btn.setObjectName("Ghost")
+        self._model_center_btn.setMinimumHeight(32)
+        self._model_center_btn.setMaximumWidth(160)
+        self._model_center_btn.clicked.connect(self._open_model_center)
+        self._model_center_btn.hide()
+        box.addWidget(self._model_center_btn)
+
+        self._chat_view = QTextEdit()
+        self._chat_view.setObjectName("Outline")
+        self._chat_view.setReadOnly(True)
+        self._chat_view.setPlaceholderText("这里显示这名学生的谈话记录。")
+        box.addWidget(self._chat_view, 1)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self._chat_input = QLineEdit()
+        self._chat_input.setPlaceholderText("说点什么…（回车发送）")
+        self._chat_input.returnPressed.connect(self._on_chat_send_clicked)
+        row.addWidget(self._chat_input, 1)
+        self._chat_send = QPushButton("发送")
+        self._chat_send.setObjectName("Primary")
+        self._chat_send.setMinimumHeight(34)
+        self._chat_send.setMaximumWidth(120)
+        self._chat_send.clicked.connect(self._on_chat_send_clicked)
+        row.addWidget(self._chat_send)
+        box.addLayout(row)
+
+        # ★ 建页面时还没选学生：输入区先关上、状态行给出怎么开始
+        #   （不这么写的话，窗口一打开输入框就能打字，发出去才发现没人可谈）
+        self._chat_status.setText("先在左边点一名学生，再开始谈话。")
+        self._chat_input.setEnabled(False)
+        self._chat_send.setEnabled(False)
+        return pane
+
+    def _build_student_card(self) -> QFrame:
+        """当前学生的基本信息卡片（姓名 / 学号 / 班级）。"""
+        card = make_card()
+        box = QHBoxLayout(card)
+        box.setContentsMargins(16, 12, 16, 12)
+        box.setSpacing(14)
+
+        self._chat_avatar = QLabel("—")
+        self._chat_avatar.setObjectName("H2")
+        self._chat_avatar.setFixedWidth(40)
+        box.addWidget(self._chat_avatar)
+
+        info = QVBoxLayout()
+        info.setSpacing(2)
+        self._chat_name = QLabel("（还没选学生）")
+        self._chat_name.setObjectName("H3")
+        info.addWidget(self._chat_name)
+        self._chat_meta = QLabel("")
+        self._chat_meta.setObjectName("Muted")
+        self._chat_meta.setWordWrap(True)
+        self._chat_meta.setMinimumWidth(240)
+        info.addWidget(self._chat_meta)
+        box.addLayout(info, 1)
+
+        note = QLabel("本机离线推理，谈话记录加密存在本机")
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        note.setFixedWidth(220)
+        box.addWidget(note)
+        return card
+
+    def _build_portrait(self) -> QFrame:
+        card = make_card()
+        box = QVBoxLayout(card)
+        box.setContentsMargins(20, 18, 20, 18)
+        box.setSpacing(10)
+
+        top = QHBoxLayout()
+        self._portrait_title = QLabel("总评")
+        self._portrait_title.setObjectName("H2")
+        top.addWidget(self._portrait_title)
+        top.addSpacing(12)
+
+        self._avg_label = QLabel("—")
+        self._avg_label.setObjectName("H1")
+        top.addWidget(self._avg_label)
+
+        self._blank_label = QLabel("")
+        self._blank_label.setObjectName("Muted")
+        top.addWidget(self._blank_label)
+        top.addStretch(1)
+        box.addLayout(top)
+
+        self._avg_sub = QLabel("")
+        self._avg_sub.setObjectName("Muted")
+        self._avg_sub.setWordWrap(True)
+        self._avg_sub.setMinimumWidth(320)
+        box.addWidget(self._avg_sub)
+
+        # 三档口径的加权均分（数字来自 ``core.calculator``，本页一行都没算）
+        self._scope_label = QLabel("")
+        self._scope_label.setObjectName("Muted")
+        self._scope_label.setWordWrap(True)
+        self._scope_label.setMinimumWidth(320)
+        box.addWidget(self._scope_label)
+
+        sub_row = QHBoxLayout()
+        sub_row.setSpacing(8)
+        self._trend_tag = QLabel("—")
+        self._trend_tag.setObjectName("TagGray")
+        sub_row.addWidget(self._trend_tag)
+        self._trend_sub = QLabel("")
+        self._trend_sub.setObjectName("Muted")
+        self._trend_sub.setWordWrap(True)
+        self._trend_sub.setMinimumWidth(320)
+        sub_row.addWidget(self._trend_sub, 1)
+        box.addLayout(sub_row)
+
+        box.addWidget(self._section("已定型短板", "补考不改分（红线 9），不必再纠结"))
+        self._locked_box = QVBoxLayout()
+        self._locked_box.setSpacing(4)
+        box.addLayout(self._locked_box)
+
+        box.addWidget(self._section("可抢救项", "分不高、但提一提能拉均分"))
+        self._rescue_box = QVBoxLayout()
+        self._rescue_box.setSpacing(4)
+        box.addLayout(self._rescue_box)
+        return card
+
+    def _build_side_text(self) -> QFrame:
+        card = make_card()
+        box = QVBoxLayout(card)
+        box.setContentsMargins(20, 16, 20, 16)
+        box.setSpacing(10)
+
+        head = QHBoxLayout()
+        title = QLabel("AI 侧写")
+        title.setObjectName("H2")
+        head.addWidget(title)
+        note = QLabel("把已有成绩与德育分拼成提示词，交给本机 AI 引擎生成")
+        note.setObjectName("Muted")
+        head.addWidget(note)
+        head.addStretch(1)
+
+        self._ai_btn = QPushButton("点击生成")
+        self._ai_btn.setObjectName("Ghost")
+        self._ai_btn.setMinimumHeight(36)
+        self._ai_btn.setToolTip("生成的内容会存进本地加密文件")
+        self._ai_btn.clicked.connect(self._generate_side_text)
+        head.addWidget(self._ai_btn)
+
+        # 生成完之后正文是**可编辑**的，改完点这里才写回加密库。
+        self._side_save = QPushButton("保存")
+        self._side_save.setObjectName("Primary")
+        self._side_save.setMinimumHeight(36)
+        self._side_save.setToolTip("把文本框里的内容存进本地加密文件")
+        self._side_save.clicked.connect(self._on_side_save_clicked)
+        head.addWidget(self._side_save)
+
+        # 侧写记录的「删除」＝把这个学生的 side_text 清空（任务书 3 的第三类）。
+        # ★ 纯文字，不许 emoji（AGENTS §4l）。
+        self._side_delete = QPushButton(ACTION_TEXT)
+        self._side_delete.setObjectName("RowAction")
+        self._side_delete.setMinimumHeight(36)
+        self._side_delete.setMaximumWidth(84)
+        self._side_delete.setToolTip("清空这名学生的侧写记录")
+        self._side_delete.clicked.connect(self._delete_side_text)
+        head.addWidget(self._side_delete)
+        box.addLayout(head)
+
+        self._side_hint = QLabel(SIDE_TEXT_EMPTY_HINT)
+        self._side_hint.setObjectName("Muted")
+        self._side_hint.setWordWrap(True)
+        self._side_hint.setMinimumWidth(320)
+        box.addWidget(self._side_hint)
+
+        # 生成期间的状态行（「正在生成侧写…」/ 失败的中文原因）。
+        self._side_status = QLabel("")
+        self._side_status.setObjectName("Muted")
+        self._side_status.setWordWrap(True)
+        self._side_status.setMinimumWidth(320)
+        box.addWidget(self._side_status)
+
+        self._side_text = QTextEdit()
+        self._side_text.setObjectName("Outline")
+        # ★ **可编辑**（任务书 5）：生成或读回来的正文都要能让辅导员改，
+        #   改完「保存」才写回 ProfileStore。生成期间临时置只读。
+        self._side_text.setReadOnly(False)
+        self._side_text.setMinimumHeight(150)
+        self._side_text.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self._side_text.textChanged.connect(self._on_side_text_changed)
+        box.addWidget(self._side_text)
+        return card
+
+    def _section(self, title: str, hint: str) -> QWidget:
+        holder = QWidget()
+        box = QHBoxLayout(holder)
+        box.setContentsMargins(0, 8, 0, 0)
+        box.setSpacing(8)
+        label = QLabel(title)
+        label.setObjectName("H3")
+        box.addWidget(label)
+        note = QLabel(hint)
+        note.setObjectName("Muted")
+        box.addWidget(note)
+        box.addStretch(1)
+        return holder
+
+    def _build_intention(self) -> QFrame:
+        card = make_card()
+        box = QVBoxLayout(card)
+        box.setContentsMargins(20, 16, 20, 16)
+        box.setSpacing(8)
+
+        title = QLabel("发展意愿")
+        title.setObjectName("H2")
+        box.addWidget(title)
+
+        note = QLabel("选完立即存进本地加密文件；下次打开这名学生还在。")
+        note.setObjectName("Muted")
+        box.addWidget(note)
+
+        #: 没学号时的警告条（有学号时藏起来）
+        self._id_warn = QLabel("")
+        self._id_warn.setObjectName("Warn")
+        self._id_warn.setWordWrap(True)
+        box.addWidget(self._id_warn)
+        self._id_warn.hide()
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self._intent_group = QButtonGroup(self)
+        self._intent_group.setExclusive(True)
+        self._intent_buttons: dict[str, QRadioButton] = {}
+        for option in INTENTION_OPTIONS:
+            radio = QRadioButton(option)
+            radio.toggled.connect(
+                lambda checked, name=option: self._on_intention(name) if checked else None
+            )
+            self._intent_group.addButton(radio)
+            self._intent_buttons[option] = radio
+            row.addWidget(radio)
+        row.addStretch(1)
+        box.addLayout(row)
+
+        self._intent_status = QLabel("")
+        self._intent_status.setObjectName("Muted")
+        self._intent_status.setWordWrap(True)
+        box.addWidget(self._intent_status)
+        return card
+
+    def _build_outline(self) -> QFrame:
+        card = make_card()
+        box = QVBoxLayout(card)
+        box.setContentsMargins(20, 16, 20, 16)
+        box.setSpacing(10)
+
+        head = QHBoxLayout()
+        title = QLabel("辅导提纲")
+        title.setObjectName("H2")
+        head.addWidget(title)
+        # ★ 任务书 4.1：这条提示在 1268 宽的窗口里会被裁掉半截 —— 必须换行，
+        # 并且给一个够宽的最小宽度，否则它会把整行撑开、切页时窗口横向跳动。
+        self._outline_note = QLabel("本地规则拼出来的，不联网、不调 AI")
+        self._outline_note.setObjectName("Muted")
+        self._outline_note.setWordWrap(True)
+        self._outline_note.setMinimumWidth(200)
+        head.addWidget(self._outline_note, 1)
+
+        self._copy_btn = QPushButton("一键复制")
+        self._copy_btn.setObjectName("Ghost")
+        self._copy_btn.setMinimumHeight(36)
+        self._copy_btn.clicked.connect(self._do_copy)
+        head.addWidget(self._copy_btn)
+        box.addLayout(head)
+
+        self._outline = QTextEdit()
+        self._outline.setObjectName("Outline")
+        self._outline.setReadOnly(True)
+        self._outline.setMinimumHeight(210)
+        self._outline.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        box.addWidget(self._outline)
+        return card
+
+    def _migrate_name_keys(self) -> None:
+        """把老的"裸姓名"意愿迁到学号上（**只在指代唯一时才迁**）。
+
+        上一版按姓名存意愿（``name:张三``）。现在有了学号，如果全班只有**一个**
+        张三，那这份意愿指的一定是他 —— 迁过去，用户不用重选。
+        有两个及以上同名时**不猜**，原样留在 ``name:`` 键上。
+        """
+        if not self._username or not self._roster:
+            return
+        by_name: dict[str, list[Any]] = {}
+        for row in self._roster:
+            by_name.setdefault(row.student, []).append(row)
+
+        moved = 0
+        for name, rows in by_name.items():
+            if len(rows) != 1:
+                continue
+            row = rows[0]
+            if not row.has_id:
+                continue
+            old_key = f"{KEY_PREFIX_NAME}{name}"
+            if old_key not in self._intentions:
+                continue
+            value = self._intentions.pop(old_key)
+            self._intentions[row.key] = value
+            try:
+                save_intention(self._store, self._username, old_key, "")
+                save_intention(self._store, self._username, row.key, value)
+            except (CryptoError, ValueError):
+                continue
+            moved += 1
+        if moved:
+            print(f"[ProfilePage] 已把 {moved} 条按姓名的意愿迁移到学号键上。")
+
     def _history(self) -> Any:
         """``GradeHistoryDB`` 懒建（库坏了 / 没登录时返回 ``None``）。"""
         if self._grade_db is None:
@@ -1957,7 +2304,7 @@ class ProfilePage(QWidget):
         if db is None or not key:
             return []
         try:
-            return [dict(row) for row in db.rows() if row.get("student_id") == key]
+            return [dict(row) for row in db.rows() if same_student_id(row.get("student_id"), key)]
         except Exception:  # noqa: BLE001 - 明细读不出来不该拦住整页
             logger.exception("读取成绩历史失败（%s）", key)
             return []
@@ -2010,7 +2357,7 @@ class ProfilePage(QWidget):
 
         visible_terms = [term for term, _courses in grouped if term not in self._hidden_terms]
         if not visible_terms:
-            note = "还没有这名学生的成绩明细。先在「📊 智育分析」导入他的成绩表。"
+            note = "还没有这名学生的成绩明细。先在「智育分析」导入他的成绩表。"
             if grouped:
                 note += "（本页显示的学期已被「同时删除学期记录」移除）"
         else:
@@ -2022,7 +2369,6 @@ class ProfilePage(QWidget):
         if hasattr(self, "_grades_note"):
             self._grades_note.setText(note)
 
-    # ------------------------------------------------- 标签页 1（单条删除）
     def on_grade_action(self, item: Any) -> bool:
         """点「操作」列里那个「删除」：确认后删掉这一条成绩。
 
@@ -2061,6 +2407,9 @@ class ProfilePage(QWidget):
             if answer == QMessageBox.StandardButton.Yes:
                 self._hidden_terms.add(term)
                 self._delete_history_term(term)
+                # ★ 学期记录既然删了，这个学期的侧写也一起清掉
+                #   （档案快照里的该学期条目已由 _remove_grade_row 删掉）。
+                self._delete_semester_side_file(term)
 
         self._render()
         return True
@@ -2218,6 +2567,22 @@ class ProfilePage(QWidget):
             logger.exception("从成绩历史表删除学期失败（%s / %s）", student_id, term)
             return 0
 
+    def _delete_semester_side_file(self, term: str) -> bool:
+        """删学期记录时，把该生这个学期的侧写也清掉（任务书 4.1 的追加要求）。
+
+        学期侧写有两个落点（ProfileStore 的学期侧写表 + ``semester_side`` 文件），
+        :func:`ui.pages.profile_shared.delete_semester_side` 已经两处一起清。
+        删不掉只警告 —— 成绩已经删了，不能因为侧写文件让整条流程报错。
+        """
+        student_id = _bare_sid(str((self._payload or {}).get("student_id") or ""))
+        if not student_id or not term:
+            return False
+        try:
+            return bool(delete_semester_side(self._store, self._username, student_id, term))
+        except Exception:  # noqa: BLE001 - 侧写删不掉不影响成绩删除
+            logger.warning("删除学期侧写失败（%s / %s）", student_id, term, exc_info=True)
+            return False
+
     def _save_archive(self) -> None:
         """把改过的归档写回（写不进去只记日志，界面照样刷新）。"""
         payload = self._payload or {}
@@ -2229,7 +2594,6 @@ class ProfilePage(QWidget):
         except Exception:  # noqa: BLE001 - 存不下不该把界面带崩
             logger.exception("保存归档失败（删除之后）")
 
-    # ------------------------------------------------- 标签页 1（德育分一行）
     def _render_moral(self, key: str) -> None:
         value = self._student_moral(key) if key else None
         if hasattr(self, "_moral_row"):
@@ -2292,7 +2656,6 @@ class ProfilePage(QWidget):
                 return False
         return True
 
-    # ------------------------------------------------- 标签页 2（AI 侧写）
     def _side_store(self) -> Any:
         """``ProfileStore`` 懒建：库坏了 / 没登录不该让页面开不起来。"""
         if self._profile_store is None:
@@ -2526,7 +2889,6 @@ class ProfilePage(QWidget):
         self._render_side_text(key)
         return True
 
-    # ------------------------------------------------- 标签页 3（AI 辅导）
     def set_chat_engine(self, engine: Any) -> None:
         """注入一个引擎（**测试用**：给了它就绝不加载真模型）。"""
         self._chat_engine = engine
@@ -2651,7 +3013,6 @@ class ProfilePage(QWidget):
         self._chat_student_json = student_json
         return build_chat_system_prompt(student_json)
 
-    # -- 谈话记录（**只走应用级加密库**，磁盘上只有 .enc）-------------------
     def _chat_file(self, key: str) -> str:
         """这名学生的谈话记录文件名（``cache/chat_history_<学号>.json.enc``）。
 
@@ -2751,7 +3112,6 @@ class ProfilePage(QWidget):
         self._chat_view.setTextCursor(cursor)
         self._chat_view.ensureCursorVisible()
 
-    # -- 可用状态（两级降级，文案都是中文）---------------------------------
     def _refresh_chat_availability(self) -> None:
         """刷新状态行 + 输入区状态。**一次都不弹窗。**
 
@@ -2854,7 +3214,6 @@ class ProfilePage(QWidget):
             raise InferenceUnavailable(friendly_error(exc)) from exc
         return self._chat_engine
 
-    # -- 发送 / 流式 ---------------------------------------------------------
     def _on_chat_send_clicked(self) -> None:
         text = self._chat_input.text().strip()
         if not text:
@@ -2974,7 +3333,6 @@ class ProfilePage(QWidget):
 
         worker.finished.connect(_drop)
 
-    # -- 模型中心（懒 import + try/except）----------------------------------
     def _open_model_center(self) -> None:
         """打开模型中心。拿不到就用中文提示兜底，**绝不抛异常**。
 
@@ -3000,19 +3358,6 @@ class ProfilePage(QWidget):
             self._scan_chat_models()
         self._chat_model = None
         self._refresh_chat_availability()
-
-    def closeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
-        """关页：停掉还在跑的生成、放开引擎占的内存（1~3 GB）。"""
-        self._stop_chat_worker()
-        engine = self._chat_engine
-        self._chat_engine = None
-        unload = getattr(engine, "unload", None)
-        if callable(unload):
-            try:
-                unload()
-            except Exception:  # noqa: BLE001 - 释放失败不该拦住关窗
-                logger.exception("释放本地推理引擎失败")
-        super().closeEvent(event)
 
     def _compute_rescues(self, payload: dict[str, Any]) -> list[tuple[str, float, float, float]]:
         """算出"提至 85 能拉多少"。
@@ -3053,7 +3398,6 @@ class ProfilePage(QWidget):
         out.sort(key=lambda row: row[3], reverse=True)
         return out[:MAX_RESCUE]
 
-    # ---------------------------------------------------------------- 提纲
     def _on_tab_changed(self, index: int) -> None:
         """切标签页：记住位置（没有别的副作用，切页不做任何重新计算）。"""
         self._active_tab = int(index)
@@ -3175,7 +3519,6 @@ class ProfilePage(QWidget):
 
         return "\n\n".join((paragraph1, paragraph2, paragraph3))
 
-    # ---------------------------------------------------------------- 动作
     def _on_intention(self, option: str) -> None:
         payload = self._payload
         if payload is None:
@@ -3205,12 +3548,11 @@ class ProfilePage(QWidget):
             QMessageBox.information(self, "还没有内容", "先选一名学生。")
             return
         QApplication.clipboard().setText(text)
-        self._copy_btn.setText("✅  已复制")
+        self._copy_btn.setText("已复制")
         from PySide6.QtCore import QTimer
 
-        QTimer.singleShot(1600, lambda: self._copy_btn.setText("📋  一键复制"))
+        QTimer.singleShot(1600, lambda: self._copy_btn.setText("一键复制"))
 
-    # ---------------------------------------------------------------- 杂项
     @staticmethod
     def _tagged(text: str, tag: str) -> QLabel:
         label = QLabel(text)
@@ -3222,6 +3564,7 @@ class ProfilePage(QWidget):
     def _repolish(widget: QWidget) -> None:
         widget.style().unpolish(widget)
         widget.style().polish(widget)
+
 
 
 # ---------------------------------------------------------------------------

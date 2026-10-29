@@ -1203,10 +1203,14 @@ class AnalysisPage(QWidget):
 
             self._set_flag_cell(i)
 
+            # ★ v1.9.2：这里**只发信号**，不再自己弹任何侧写窗口 ——
+            #   主窗收到 student_selected 后切到成绩档案页，由那一页负责
+            #   选学期、再打开学期侧写（AGENTS §37）。
             button = QPushButton("侧写")
             button.setObjectName("RowAction")
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.setMinimumHeight(_ROW_BUTTON_HEIGHT)
+            button.setToolTip("在成绩档案页查看该生的学期侧写")
             button.clicked.connect(lambda _=False, idx=i: self._emit_student(idx))
             holder = QWidget()
             holder_box = QHBoxLayout(holder)

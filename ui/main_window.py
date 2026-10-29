@@ -40,9 +40,10 @@
 
 from __future__ import annotations
 
+import logging
 import traceback
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QFrame,
@@ -78,6 +79,9 @@ from ui.pages import (
 
 __all__ = ["APP_NAME", "MainWindow", "NAV_ITEMS", "PROFILE_NAV_KEY", "TOPBAR_HEIGHT"]
 
+#: 本模块的日志器。补档失败**只记 warning**，绝不影响导入结果、绝不弹窗。
+_log = logging.getLogger(__name__)
+
 #: 程序名（侧栏顶部）
 APP_NAME = "成绩单透镜"
 
@@ -105,6 +109,13 @@ NAV_ITEMS: tuple[tuple[str, str], ...] = (
 
 #: 侧写辅导那一页的键（点它只落名单，不替你挑学生）
 PROFILE_NAV_KEY = "profile"
+
+#: 侧写辅导页在 ``NAV_ITEMS`` 里的下标（从同一张表推导，不另写死数字）
+PROFILE_PAGE_INDEX = next(
+    position
+    for position, (key, _title) in enumerate(NAV_ITEMS)
+    if key == PROFILE_NAV_KEY
+)
 
 #: 默认落在哪一页（Spec 四：默认首页 = 智育分析）
 DEFAULT_PAGE = 0
@@ -281,10 +292,10 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- 接线
     def _wire(self) -> None:
-        # 智育分析页双击/点「侧写」→ 带着学生数据跳到侧写辅导
+        # 智育分析页双击/点「侧写」→ 切到成绩档案页，由它选学期、再开学期侧写
         self.analysis_page.student_selected.connect(self._open_profile)
-        # 名单推给侧写页（它靠这个建左侧列表）
-        self.analysis_page.roster_changed.connect(self.profile_page.set_roster)
+        # 名单推给侧写页（它靠这个建左侧列表）；★ v1.9.2 顺手补进学生主档
+        self.analysis_page.roster_changed.connect(self._on_roster_changed)
         # 侧写页按行号取原料 —— 不复制数据，两个页面看的是同一份结果
         self.profile_page.set_payload_provider(self.analysis_page.payload_at)
         # 个人中心「切换账号」
@@ -342,9 +353,19 @@ class MainWindow(QMainWindow):
             profile_rows: 删掉了几份侧写。
             files: 删掉了几个文件。
         """
+        # ★ v1.9.2：档案页是两级视图（详情页 / 学期侧写页）。清库后优先用
+        #   ``reset_view()`` 把**两级都复位**，否则用户切回详情页还能看到上一个
+        #   学生的学期侧写。组件还没落地时退回 ``show_no_data()``。
+        profile_reset = getattr(self.profile_page, "reset_view", None)
+        if not callable(profile_reset):
+            profile_reset = getattr(self.profile_page, "show_no_data", None)
+        if callable(profile_reset):
+            try:
+                profile_reset()
+            except Exception:  # noqa: BLE001 - 刷新失败只打日志（§18）
+                traceback.print_exc()
+
         for target, method in (
-            # 名单在内存里，**必须**显式清空，reload 也救不回来
-            (self.profile_page, "show_no_data"),
             # 这两个是"重新从库里读一遍"，清库之后读出来自然是空的
             (self.archive_page, "reload"),
             (self.scholarship_page, "reload_classes"),
@@ -392,12 +413,71 @@ class MainWindow(QMainWindow):
             self.profile_page.focus_list()
 
     def _open_profile(self, payload: dict) -> None:
-        """从智育分析页跳侧写辅导 —— 这一次是**明确指定了人**，就该选中他。"""
+        """从智育分析页跳成绩档案页 —— 这一次是**明确指定了人**，就该选中他。
+
+        ★ v1.9.2：档案页变成两级视图（详情页 / 学期侧写页）。导入页的
+          「侧写」按钮只把 payload 交过来，**选哪个学期由用户在档案页里选**
+          （``ProfilePage.ask_semester_and_open``）—— 这里不再自己弹任何侧写窗口。
+
+        ★ 顺序：先把页切过去 → 再落学生 → 最后**延后一拍**弹学期选择。
+          切页动画还没落位就弹模态框，会把动画卡在半路（AGENTS §11 / §4k）。
+        """
+        self._nav_to(PROFILE_PAGE_INDEX)
         self.profile_page.show_student(payload)
-        index = next(
-            i for i, (key, _t) in enumerate(NAV_ITEMS) if key == PROFILE_NAV_KEY
-        )
-        self._switcher.switch(index)
+        ask = getattr(self.profile_page, "ask_semester_and_open", None)
+        if callable(ask):
+            QTimer.singleShot(0, lambda: self._ask_semester_and_open(ask, payload))
+
+    def _ask_semester_and_open(self, ask, payload: dict) -> None:
+        """``ProfilePage.ask_semester_and_open`` 的延后调用。
+
+        ★ 用 ``getattr`` 探测过才排这一拍（组件可能还没落地）；
+          这里再包一层 try/except —— 弹窗出错**只打日志**，不许冒到事件循环里。
+        """
+        try:
+            ask(payload)
+        except Exception:  # noqa: BLE001 - 弹窗失败只打日志
+            traceback.print_exc()
+
+    def _on_roster_changed(self, rows: list) -> None:
+        """导入完成后把全班名单推给侧写页，并**顺手补进学生主档**。
+
+        ★ v1.9.2：``students.json.enc`` 是学生主档，唯一写入口是
+          :class:`core.database.StudentStore`；导入时在这里自动补档，
+          **不另立第二份名单**（AGENTS §37）。
+        """
+        self.profile_page.set_roster(rows)
+        self._upsert_student_roster(rows)
+
+    def _upsert_student_roster(self, rows: list) -> None:
+        """把名单里每个**有学号**的学生补进学生主档。
+
+        ★ 失败只记 ``logging.warning``：成绩已经存进去了，主档漏一个人是
+          显示问题，不许影响导入结果、更不许弹窗（AGENTS §18 同源）。
+        """
+        try:
+            from core.database import StudentStore  # noqa: PLC0415 - 晚绑定，组件可能还没落地
+        except Exception:  # noqa: BLE001 - 还没落地就跳过补档，界面照常
+            _log.debug("StudentStore 还没落地，这次跳过学生主档补档")
+            return
+        try:
+            store = StudentStore()
+        except Exception:  # noqa: BLE001 - 打不开主档也只记日志
+            _log.warning("学生主档打不开，这次跳过补档", exc_info=True)
+            return
+        try:
+            class_name = str(self.analysis_page.class_name or "").strip()
+        except Exception:  # noqa: BLE001 - 班级号读不到就留空，不许断链
+            class_name = ""
+        for row in rows or ():
+            student_id = str(getattr(row, "student_id", "") or "").strip()
+            if not student_id:
+                continue
+            name = str(getattr(row, "student", "") or "").strip()
+            try:
+                store.upsert_import(student_id, name, class_name)
+            except Exception:  # noqa: BLE001 - 单个学生失败不中断整批
+                _log.warning("学生主档补档失败：%s", student_id, exc_info=True)
 
     def _sync_nav(self, index: int) -> None:
         """把侧栏选中态和顶部标题对齐到当前页。"""
