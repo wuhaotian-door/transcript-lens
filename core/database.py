@@ -93,11 +93,21 @@ __all__ = [
     "USE_SKIP",
     "ConflictChooser",
     "ConflictQuestion",
+    "STUDENTS_FILE",
+    "STUDENT_FIELDS",
+    "STUDENT_OPS",
+    "STUDENT_SOURCES",
+    "AUDIT_DETAIL_MAX",
+    "TABLE_STUDENTS",
+    "DuplicateStudentError",
     "GradeAuditLog",
     "GradeHistoryDB",
     "ProfileStore",
+    "StudentMigrationReport",
+    "StudentStore",
     "clear_library",
     "library_inventory",
+    "migrate_student_id",
     "resolve_uid",
 ]
 
@@ -114,6 +124,25 @@ TABLE_STUDENT_PROFILES = "student_profiles"
 GRADE_HISTORY_FILE = "grade_history.json.enc"
 PROFILE_FILE = "student_profiles.json.enc"
 
+#: 学生主档表名（v1.9.2 新增）—— 一行 = 一个学生，唯一键是**学号**
+TABLE_STUDENTS = "students"
+#: 学生主档的文件名（应用级加密，**必须以 ``.enc`` 结尾**）
+STUDENTS_FILE = "students.json.enc"
+#: 学生主档的字段（顺序即落盘顺序）
+STUDENT_FIELDS = (
+    "student_id",
+    "name",
+    "class_name",
+    "note",
+    "archived",
+    "source",
+    "created_at",
+    "updated_at",
+)
+
+#: 学生主档允许的 ``source`` 取值（manual = 手工建档 / import = 导入时补档）
+STUDENT_SOURCES = ("manual", "import")
+
 #: 审计日志表名
 TABLE_GRADE_AUDIT = "grade_audit"
 #: 审计日志所在子目录（相对用户目录）
@@ -122,13 +151,31 @@ AUDIT_DIR = "audit"
 AUDIT_FILE = f"{AUDIT_DIR}/grade_changes.json.enc"
 #: 每个用户最多留多少条（超了从**最旧的**开始丢，日志不能无限长大）
 AUDIT_MAX_ENTRIES = 2000
+#: 审计行 ``detail`` 最多留多少字（只写操作说明，**绝不写分数**）
+AUDIT_DETAIL_MAX = 200
 
 #: 审计日志的操作类型（任务书：新增 insert / 覆盖 overwrite / 删除 delete）
 OP_INSERT = "insert"
 OP_OVERWRITE = "overwrite"
 OP_DELETE = "delete"
+#: 学生主档的审计操作（v1.9.2；同样**只记变动、不记分数**）
+OP_STUDENT_ADD = "student_add"
+OP_STUDENT_EDIT = "student_edit"
+OP_STUDENT_ARCHIVE = "student_archive"
+OP_STUDENT_RESTORE = "student_restore"
+OP_STUDENT_DELETE = "student_delete"
+OP_STUDENT_MIGRATE = "student_migrate"
+#: 学生主档相关的全部操作类型
+STUDENT_OPS = (
+    OP_STUDENT_ADD,
+    OP_STUDENT_EDIT,
+    OP_STUDENT_ARCHIVE,
+    OP_STUDENT_RESTORE,
+    OP_STUDENT_DELETE,
+    OP_STUDENT_MIGRATE,
+)
 #: 允许出现在日志里的操作类型（别的一律丢弃，防日志被写脏）
-AUDIT_OPERATIONS = (OP_INSERT, OP_OVERWRITE, OP_DELETE)
+AUDIT_OPERATIONS = (OP_INSERT, OP_OVERWRITE, OP_DELETE) + STUDENT_OPS
 
 #: grade_history 的字段（顺序即落盘顺序，方便人肉看密文结构）
 GRADE_HISTORY_FIELDS = (
@@ -199,6 +246,15 @@ def _is_blank(value: Any) -> bool:
 
 def _clean_text(value: Any) -> str:
     return "" if value is None else str(value).strip()
+
+
+def _detail_text(value: Any) -> str:
+    """审计 ``detail`` 的清洗：去首尾空白、最多 :data:`AUDIT_DETAIL_MAX` 字。
+
+    ★ 它只是给人看的操作说明（"学号 2023001 → 2023002；成绩 3 条"），
+      **绝不写分数** —— 审计日志不是第二份成绩库。
+    """
+    return _clean_text(value)[:AUDIT_DETAIL_MAX]
 
 
 def _optional_number(value: Any) -> float | None:
@@ -536,6 +592,69 @@ class GradeHistoryDB:
             self._audit_record(OP_DELETE, student_id=sid, semester=term, count=removed)
         return removed
 
+    def rekey_student(self, old_id: str, new_id: str) -> tuple[int, int]:
+        """把一个人的全部成绩行改挂到新学号上（v1.9.2「改学号」迁移的成绩部分）。
+
+        ★ 只管 ``grade_history``；侧写 / 学期侧写 / 聊天历史 / 德育分 / 意愿标签
+          由 :func:`migrate_student_id` 统一处理 —— 少迁一样就是静默丢数据。
+
+        ★ 撞主键时的取舍：新学号上**已经有** ``(学期, 课程名)`` 那一行时，保留
+          新学号原有的那条、丢弃旧学号的重复记录（不让旧数据覆盖新数据），
+          并计入第二个返回值。**绝不把同一条成绩存两份。**
+
+        Returns:
+            ``(改挂过去的行数, 因主键重复而丢弃的行数)``
+        """
+        old = _clean_text(old_id)
+        new = _clean_text(new_id)
+        if not (old and new):
+            raise ValueError("old_id / new_id 都不能为空")
+        if old == new:
+            return (0, 0)
+        rows = self._raw_rows()
+        existing = {_rest_key(row) for row in rows
+                    if _rest_key(row)[0] == new}
+        moved = 0
+        dropped = 0
+        kept: list[dict[str, Any]] = []
+        for row in rows:
+            if _rest_key(row)[0] != old:
+                kept.append(row)
+                continue
+            key = (new, _rest_key(row)[1], _rest_key(row)[2])
+            if key in existing:
+                dropped += 1
+                continue
+            rewritten = dict(row)
+            rewritten["student_id"] = new
+            kept.append(rewritten)
+            existing.add(key)
+            moved += 1
+        if moved or dropped:
+            self._write(kept)
+            self._audit_record(OP_STUDENT_MIGRATE, student_id=new, count=moved,
+                               detail=f"学号 {old} → {new}；成绩 {moved} 条"
+                                      + (f"，撞键丢弃 {dropped} 条" if dropped else ""))
+        return (moved, dropped)
+
+    def rename_student(self, old_id: str, new_id: str) -> int:
+        """把某人的成绩行改挂到新学号（任务书 v1.9.2 的公开名字）。
+
+        :meth:`rekey_student` 的薄封装，只返回实际改挂的行数（撞主键被丢弃的不算）。
+
+        Args:
+            old_id: 旧学号（``2023001`` / ``sid:2023001`` 都行）
+            new_id: 新学号（同上）
+
+        Returns:
+            实际改挂到新学号下的行数；旧学号本来没有成绩 → ``0``。
+
+        Raises:
+            ValueError: 新旧学号有空串时。
+        """
+        moved, _dropped = self.rekey_student(old_id, new_id)
+        return moved
+
     # -- 审计日志 -----------------------------------------------------------
     def audit(self) -> "GradeAuditLog":
         """这张表的审计日志（同一个用户）。只读查询走它。"""
@@ -547,10 +666,11 @@ class GradeHistoryDB:
         return self.audit().changes(student_id=student_id, semester=semester, limit=limit)
 
     def _audit_record(self, operation: str, *, student_id: str = "", semester: str = "",
-                      course_name: str = "", count: int = 1) -> None:
+                      course_name: str = "", count: int = 1,
+                      detail: str = "") -> None:
         """记一条变更日志（**失败只警告，绝不把写入带崩**）。"""
         self.audit().record(operation, student_id=student_id, semester=semester,
-                            course_name=course_name, count=count)
+                            course_name=course_name, count=count, detail=detail)
 
     def _log_changes(self, order: list[str], term: str,
                      per_overwritten: dict[str, int],
@@ -705,16 +825,42 @@ class GradeAuditLog:
 
     # -- 写 -----------------------------------------------------------------
     def record(self, operation: str, *, student_id: str = "", semester: str = "",
-               course_name: str = "", count: int = 1) -> dict[str, Any] | None:
-        """记一条。返回真正写进去的那一条；写不进去返回 ``None``（**不抛**）。"""
+               course_name: str = "", count: int = 1,
+               detail: str = "") -> dict[str, Any] | None:
+        """记一条。返回真正写进去的那一条；写不进去返回 ``None``（**不抛**）。
+
+        ``detail`` 是给人看的补充说明（v1.9.2 起，例如改学号时的旧学号与
+        迁移了几类数据）。★ **绝不写分数** —— 它只是操作说明。
+        """
         written = self.record_many([{
             "operation": operation,
             "student_id": student_id,
             "semester": semester,
             "course_name": course_name,
             "count": count,
+            "detail": detail,
         }])
         return written[0] if written else None
+
+    def record_student(self, operation: str, *, student_id: str = "",
+                       detail: str = "", count: int = 1) -> dict[str, Any] | None:
+        """记一条**学生主档**操作（内部走 :meth:`record_many`）。
+
+        Args:
+            operation: 只认 :data:`STUDENT_OPS`（student_add / student_edit /
+                student_archive / student_restore / student_delete / student_migrate）
+            student_id: 学生键（``sid:<学号>``）
+            detail: 操作说明（最多 :data:`AUDIT_DETAIL_MAX` 字，**严禁写分数**）
+            count: 这一次动了几条
+
+        Returns:
+            写进去的那一条；类型不认识或写盘失败 → ``None``（**不抛**）。
+        """
+        if _clean_text(operation) not in STUDENT_OPS:
+            _LOGGER.warning("学生审计操作类型不认识（已忽略）：%s", operation)
+            return None
+        return self.record(operation, student_id=student_id, detail=detail,
+                           count=count)
 
     def record_many(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """一次写盘记多条（一批导入几百个学生时别反复读写同一个文件）。
@@ -735,6 +881,7 @@ class GradeAuditLog:
                 "semester": _clean_text(entry.get("semester")),
                 "course_name": _clean_text(entry.get("course_name")),
                 "count": _count_of(entry.get("count")),
+                "detail": _detail_text(entry.get("detail")),
             })
         if not rows:
             return []
@@ -811,6 +958,7 @@ class GradeAuditLog:
                 "semester": _clean_text(entry.get("semester")),
                 "course_name": _clean_text(entry.get("course_name")),
                 "count": _count_of(entry.get("count")),
+                "detail": _detail_text(entry.get("detail")),
             })
         return rows
 
@@ -915,6 +1063,99 @@ class ProfileStore:
         self._write(rows)
         return True
 
+    # -- 学期侧写（v1.9.2） ---------------------------------------------------
+    def semester_sides(self, student_id: str) -> dict[str, str]:
+        """一个学生的**按学期**侧写（``{学期: 正文}``；没有就是空 dict）。"""
+        row = self._cache.get(_clean_text(student_id))
+        if not isinstance(row, dict):
+            return {}
+        stored = row.get("semester_side")
+        if not isinstance(stored, dict):
+            return {}
+        return {str(term): "" if text is None else str(text)
+                for term, text in stored.items() if str(text or "")}
+
+    def semester_side_text(self, student_id: str, semester: str) -> str:
+        """该生某学期的侧写正文；没有存过就是 ``""``。"""
+        term = _clean_text(semester)
+        if not term:
+            return ""
+        return self.semester_sides(student_id).get(term, "")
+
+    def save_semester_side_text(self, student_id: str, semester: str, text: str) -> None:
+        """写该生某学期的侧写正文（先写盘、成功了才更新内存）。"""
+        sid = _clean_text(student_id)
+        term = _clean_text(semester)
+        if not sid:
+            raise ValueError("student_id 不能为空")
+        if not term:
+            raise ValueError("semester 不能为空")
+        rows = self._rows_copy()
+        row = dict(rows.get(sid) or {})
+        stored = dict(row.get("semester_side") or {}) if isinstance(
+            row.get("semester_side"), dict) else {}
+        stored[term] = "" if text is None else str(text)
+        row.update({
+            "student_id": sid,
+            "semester_side": stored,
+            "updated_at": _now(),
+        })
+        rows[sid] = row
+        self._write(rows)
+
+    def move_student(self, old_id: str, new_id: str) -> bool:
+        """把一个人的侧写（含学期侧写）改挂到新学号上（v1.9.2 改学号迁移）。
+
+        ★ 新学号上**已经有侧写正文**时保留新的、不覆盖（合并时只补空的那一半）。
+
+        Returns:
+            ``True`` 表示真动过；``False`` 表示旧学号本来就没有侧写。
+        """
+        old = _clean_text(old_id)
+        new = _clean_text(new_id)
+        if not (old and new) or old == new:
+            return False
+        source = self._cache.get(old)
+        if not isinstance(source, dict):
+            return False
+        rows = self._rows_copy()
+        target = dict(rows.get(new) or {})
+        if not str(target.get("side_text") or ""):
+            target["side_text"] = str(source.get("side_text") or "")
+        merged = dict(target.get("semester_side") or {}) if isinstance(
+            target.get("semester_side"), dict) else {}
+        for term, text in (source.get("semester_side") or {}).items():
+            if isinstance(source.get("semester_side"), dict) and not merged.get(term):
+                merged[str(term)] = str(text or "")
+        if merged:
+            target["semester_side"] = merged
+        target["student_id"] = new
+        target["updated_at"] = _now()
+        rows[new] = target
+        rows.pop(old, None)
+        self._write(rows)
+        return True
+
+    def rename_student(self, old_id: str, new_id: str) -> bool:
+        """把某个人的侧写（含学期侧写）改挂到新学号（任务书 v1.9.2 的公开名字）。
+
+        :meth:`move_student` 的薄封装；新学号已有侧写正文时保留新的那份。
+
+        Returns:
+            ``True`` = 旧学号本来有侧写、已处理；``False`` = 旧学号没有侧写。
+        """
+        return self.move_student(old_id, new_id)
+
+    def remove(self, student_id: str) -> bool:
+        """删掉一个学生的整行侧写（含学期侧写）。彻底删除学生时用。"""
+        sid = _clean_text(student_id)
+        if not sid or sid not in self._cache:
+            return False
+        rows = self._rows_copy()
+        rows.pop(sid, None)
+        self._write(rows)
+        return True
+
     def clear_all(self) -> int:
         """清空整张表（**这是"删除成绩库"里那个可选勾选的落点** —— 删用户数据必须由用户点过）。
 
@@ -990,6 +1231,34 @@ def _class_payload_names(store: CryptoStore, username: str) -> list[str]:
     ]
 
 
+#: AI 谈话记录的子目录（相对用户目录）—— 按学生一个文件
+CHAT_CACHE_DIR = "cache"
+#: 聊天缓存文件名前缀（``chat_history_<学号>.json.enc``）
+CHAT_CACHE_PREFIX = "chat_history_"
+
+
+def _chat_cache_names(store: CryptoStore, username: str) -> list[str]:
+    """该用户目录下 ``cache/chat_history_*.json.enc`` 的**相对文件名**列表。
+
+    ★ 这些文件不在 ``list_user_json`` 的扫描面上（那个只看顶层），但它们是
+      "这个学生的谈话记录"，**删成绩库时必须一起清掉**（v1.9.2 遗留修复 ④）：
+      否则界面上成绩没了、AI 辅导里还留着整段谈话。
+    """
+    base = _user_dir(store, username)
+    if base is None:
+        return []
+    folder = base / CHAT_CACHE_DIR
+    if not folder.is_dir():
+        return []
+    try:
+        paths = sorted(p for p in folder.iterdir()
+                       if p.is_file() and p.name.startswith(CHAT_CACHE_PREFIX)
+                       and p.name.endswith(".json.enc"))
+    except OSError:                          # 目录读不了就当没有
+        return []
+    return [f"{CHAT_CACHE_DIR}/{p.name}" for p in paths]
+
+
 def library_inventory(store: CryptoStore | None = None, username: str = "") -> dict[str, Any]:
     """**只读**盘点：这个账户的"成绩库"里到底有些什么。
 
@@ -1013,6 +1282,8 @@ def library_inventory(store: CryptoStore | None = None, username: str = "") -> d
         "account": False,
         "grade_rows": 0,
         "profile_rows": 0,
+        "student_rows": 0,
+        "chat_files": 0,
         "legacy_files": [],
         "class_files": [],
         "archive": False,
@@ -1037,6 +1308,7 @@ def library_inventory(store: CryptoStore | None = None, username: str = "") -> d
         path = user_file(vault, username, name)
         return bool(path is not None and path.exists())
 
+    chat_names = _chat_cache_names(vault, username)
     legacy = [name for name in LEGACY_GRADE_FILES if present(name)]
     classes = [name for name in _class_payload_names(vault, username) if present(name)]
     archive = present(ARCHIVE_PAYLOAD_FILE)
@@ -1046,6 +1318,7 @@ def library_inventory(store: CryptoStore | None = None, username: str = "") -> d
     #   只是 0 行），把它们列进来会让"下次进来还有数据"永远成立 ——
     #   那正是这次要修的那类 bug（拿文件在不在当判据）。
     files: list[str] = []
+    files.extend(name for name in chat_names if name not in files)
     if archive:
         files.append(ARCHIVE_PAYLOAD_FILE)
     files.extend(name for name in classes if name not in files)
@@ -1055,6 +1328,10 @@ def library_inventory(store: CryptoStore | None = None, username: str = "") -> d
         "account": vault.load_users().find(username) is not None,
         "grade_rows": grade_rows,
         "profile_rows": profile_rows,
+        # ★ 学生主档**不算"成绩库"**（AGENTS §37：主档是学生本身，成绩库是成绩）：
+        #   只报个数给界面显示，clear_library 不碰它。
+        "student_rows": _student_rows(vault, username),
+        "chat_files": len(chat_names),
         "legacy_files": legacy,
         "class_files": classes,
         "archive": archive,
@@ -1116,7 +1393,11 @@ def clear_library(store: CryptoStore | None = None, username: str = "",
     for name in before["files"]:
         if name in (GRADE_HISTORY_FILE, PROFILE_FILE):
             continue                        # 上面已经按表清过了（清在表上，不在文件上）
-        if name == ARCHIVE_PAYLOAD_FILE or name.startswith("class_"):
+        if name.startswith(f"{CHAT_CACHE_DIR}/"):
+            # 谈话记录属于"侧写那类辅助数据"：勾了清侧写才清它
+            if not with_profiles:
+                continue
+        elif name == ARCHIVE_PAYLOAD_FILE or name.startswith("class_"):
             if not with_generated:
                 continue
         targets.append(name)
@@ -1136,6 +1417,669 @@ def clear_library(store: CryptoStore | None = None, username: str = "",
     if report["grade_rows"] == 0 and (report["profile_rows"] or report["files"]):
         db.audit().record(OP_DELETE,
                           count=report["profile_rows"] + len(report["files"]))
+
+    # ★ 报告里的 inventory 是"删完之后"的盘点（键名与 library_inventory 完全一致，
+    #   grade_rows 在这里变成 0）—— 界面拿它再判一次"还有没有数据"才不会误报。
+    try:
+        report["inventory"] = library_inventory(vault, username)
+    except Exception as exc:  # noqa: BLE001 - 盘点失败不许让"已删除"变成异常
+        _LOGGER.warning("清库后的盘点失败（沿用删除前的快照）：%s: %s",
+                        type(exc).__name__, exc)
+    return report
+
+
+# ---------------------------------------------------------------------------
+# 学生主档（v1.9.2）
+# ---------------------------------------------------------------------------
+
+
+class DuplicateStudentError(ValueError):
+    """学号重复（主档的唯一键是学号，不许两个学生共用一个学号）。"""
+
+
+def _student_id_of(value: Any) -> str:
+    """把 ``sid:2023001`` / ``2023001`` / ``name:张三`` 归一成一个键。
+
+    * 带 ``sid:`` / ``name:`` 前缀的原样保留（那是 :func:`ui.intentions.student_key`
+      的约定，本模块不解析它）；
+    * 纯数字/字母的学号补上 ``sid:`` 前缀 —— 档案页、聊天文件名都按这个约定存。
+    """
+    text = _clean_text(value)
+    if not text:
+        return ""
+    if text.startswith(("sid:", "name:")):
+        return text
+    return f"sid:{text}"
+
+
+def _bare_student_id(value: Any) -> str:
+    """取学号的"裸"部分（聊天文件名用；``name:`` 那种没有学号，返回空串）。"""
+    text = _student_id_of(value)
+    if text.startswith("sid:"):
+        return text[4:].strip()
+    return ""
+
+
+def _user_dir(store: CryptoStore, username: str) -> Any:
+    """这个用户的密文目录（``u_<uid>/``）。
+
+    ★ ``user_file()`` 是按文件名算路径的，拿一个不会被用到的名字探出目录 ——
+      聊天历史在 ``cache/`` 子目录里，本模块没有别的办法拿到它。
+    """
+    path = user_file(store, username, "__user_dir__.json.enc")
+    return None if path is None else path.parent
+
+
+def _chat_file(store: CryptoStore, username: str, student_id: str) -> Any:
+    """该生的 AI 谈话记录文件（``<user_dir>/cache/chat_history_<学号>.json.enc``）。"""
+    bare = _bare_student_id(student_id)
+    base = _user_dir(store, username)
+    if not bare or base is None:
+        return None
+    return base / "cache" / f"chat_history_{bare}.json.enc"
+
+
+def _student_rows(store: CryptoStore, username: str) -> int:
+    """主档里有几个学生（**盘点失败当 0，不能把"删除成绩库"按钮打崩**）。"""
+    try:
+        return StudentStore(username=username, store=store).count()
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.warning("盘点学生主档失败（按 0 算）：%s: %s", type(exc).__name__, exc)
+        return 0
+
+
+class StudentStore:
+    """``students`` 表：**学生主档**（v1.9.2）。
+    落盘位置：``<user_dir>/students.json.enc``（应用级加密）。
+
+    一行 = 一个学生::
+
+        {"student_id": "sid:2023001", "name": "张三", "class_name": "计科2301",
+         "note": "", "archived": false, "source": "import", "updated_at": "..."}
+
+    ★ **主档是唯一的学生名单**（AGENTS §37）：成绩历史 / 侧写 / 聊天都按学号挂在这
+      里，**不许另立第二份名单**（分析页的名单是导入结果，不是主档）。
+    ★ 学号唯一：重复添加抛 :class:`DuplicateStudentError`，绝不静默并入。
+    ★ 归档 = 隐藏，不删数据；彻底删除才动关联数据（见 :func:`migrate_student_id`
+      与 :meth:`StudentStore.remove` 的说明）。
+    """
+
+    #: 表名
+    table = TABLE_STUDENTS
+    #: 载荷文件名
+    filename = STUDENTS_FILE
+
+    def __init__(self, *, username: str | None = None, uid: str | None = None,
+                 store: CryptoStore | None = None) -> None:
+        self._store = store if store is not None else CryptoStore()
+        self._username = username or current_username()
+        self._uid = uid if uid is not None else resolve_uid(self._store, self._username)
+
+    # -- 身份 ---------------------------------------------------------------
+    @property
+    def store(self) -> CryptoStore:
+        return self._store
+
+    @property
+    def username(self) -> str:
+        return self._username
+
+    @property
+    def uid(self) -> str | None:
+        return self._uid
+
+    # -- 读 -----------------------------------------------------------------
+    def all_rows(self) -> list[dict[str, Any]]:
+        """整张表（**含归档**），按学号排序。"""
+        rows = [dict(row) for row in self._load().values()]
+        rows.sort(key=lambda row: (str(row.get("student_id") or ""), str(row.get("name") or "")))
+        return rows
+
+    def rows(self, *, include_archived: bool = True) -> list[dict[str, Any]]:
+        """学生列表，按 ``(archived, class_name, student_id)`` 排好。
+
+        Args:
+            include_archived: ``True``（默认）= 连归档的一起返回；
+                ``False`` = 只返回在册的（界面常规视图传它）
+
+        Returns:
+            行副本列表：在册的在前，归档的排最后、同班的排在一起。
+        """
+        rows = self.all_rows()
+        rows.sort(key=lambda row: (bool(row.get("archived")),
+                                   str(row.get("class_name") or ""),
+                                   str(row.get("student_id") or "")))
+        if include_archived:
+            return rows
+        return [row for row in rows if not row.get("archived")]
+
+    def get(self, student_id: str) -> dict[str, Any] | None:
+        """按学号取一行（**找得到就返回副本**，改它不影响库里的内容）。"""
+        key = _student_id_of(student_id)
+        row = self._load().get(key)
+        return None if row is None else dict(row)
+
+    def has(self, student_id: str) -> bool:
+        """这个学号在不在主档里。"""
+        return _student_id_of(student_id) in self._load()
+
+    def count(self, *, include_archived: bool = True) -> int:
+        """主档里有几个学生。"""
+        return len(self.rows(include_archived=include_archived))
+
+    def names(self) -> dict[str, str]:
+        """``{学号键: 姓名}``（界面上"这个名字是哪个学号"用）。"""
+        return {key: str(row.get("name") or "")
+                for key, row in self._load().items() if isinstance(row, dict)}
+
+    def search(self, query: str = "", *, include_archived: bool = False,
+               archived_only: bool = False,
+               limit: int | None = None) -> list[dict[str, Any]]:
+        """搜索学生：姓名**模糊**、学号**前缀**、班级**模糊**，命中任一即算。
+
+        Args:
+            query: 关键词；**空串返回全部**（严格按归档过滤）
+            include_archived: 是否连归档的一起搜（默认 ``False``）
+            archived_only: 只看归档的（传了它就不看 ``include_archived``）
+            limit: 最多返回几条；``None`` = 全部
+
+        Returns:
+            命中的行（副本），排序同 :meth:`rows`。
+
+        ★ 关键词以「已归档」/「归档」开头时，等价于 ``archived_only=True``，
+          并把这几个字从关键词里去掉（可以写成「已归档 张」= 归档里搜张）。
+          单独写「已归档」= 列出全部归档的，不会一条都搜不到。
+        ★ 大小写不敏感；学号按**前缀**匹配（``2023`` 能搜出 ``2023001``）。
+        ★ 归档的学生**默认搜不到** —— 这是"归档 = 从列表拿掉、数据还在"的唯一入口。
+        """
+        text = _clean_text(query)
+        for prefix in ("已归档", "归档"):
+            if text.startswith(prefix):
+                archived_only = True
+                text = text[len(prefix):].strip()
+                break
+        needle = text.casefold()
+        rows = self.rows(include_archived=True)
+        if archived_only:
+            rows = [row for row in rows if row.get("archived")]
+        elif not include_archived:
+            rows = [row for row in rows if not row.get("archived")]
+        if not needle:
+            found = rows
+        else:
+            found = []
+            for row in rows:
+                sid = str(row.get("student_id") or "")
+                bare = _bare_student_id(sid).casefold()
+                name = str(row.get("name") or "").casefold()
+                klass = str(row.get("class_name") or "").casefold()
+                if (needle in name or bare.startswith(needle)
+                        or needle in klass or needle in sid.casefold()):
+                    found.append(row)
+        if limit is not None:
+            found = found[:max(0, int(limit))]
+        return found
+
+    def add(self, student_id: str = "", name: str = "", class_name: str = "",
+            note: str = "", *, source: str = "manual",
+            archived: bool = False) -> dict[str, Any]:
+        """新建一个学生（**学号与姓名都必填**），学号重复抛 :class:`DuplicateStudentError`。
+
+        Args:
+            student_id: 学号（``2023001`` / ``sid:2023001`` 都行）
+            name: 姓名
+            class_name: 班级号（可空）
+            note: 备注（可空）
+            source: 来源，见 :data:`STUDENT_SOURCES`（默认 ``manual``）
+            archived: 建档时就归档（默认不归档）
+
+        Returns:
+            新建成的那一行（副本）。
+
+        Raises:
+            ValueError: 学号或姓名为空（中文提示）。
+            DuplicateStudentError: 学号已经在主档里。
+        """
+        key = _student_id_of(student_id)
+        clean_name = _clean_text(name)
+        if not key:
+            raise ValueError("学号不能为空")
+        if not clean_name:
+            raise ValueError("姓名不能为空")
+        rows = self._load()
+        if key in rows:
+            existing = rows[key]
+            raise DuplicateStudentError(
+                f"学号 {_bare_student_id(key) or key} 已经存在"
+                f"（{existing.get('name') or '未填姓名'}）")
+        stamp = _now()
+        row = {
+            "student_id": key,
+            "name": clean_name,
+            "class_name": _clean_text(class_name),
+            "note": _clean_text(note),
+            "archived": bool(archived),
+            "source": _clean_text(source) or "manual",
+            "created_at": stamp,
+            "updated_at": stamp,
+        }
+        rows[key] = row
+        self._write(rows)
+        self._audit(OP_STUDENT_ADD, key, f"新建学生 {clean_name}")
+        return dict(row)
+
+    def update(self, sid: str, *, _record: bool = True,
+               **changes: Any) -> dict[str, Any]:
+        """改一个学生的字段：**只改传进来的那几个**（``None`` 一律视为"没传"）。
+
+        可改：``name`` / ``class_name`` / ``note`` / ``archived`` / ``source``。
+
+        Args:
+            student_id: 学号
+            _record: 内部用 —— 归档/恢复要记自己的操作类型，别多记一条"修改"
+            changes: 要改的字段
+
+        Returns:
+            改完的那一行（副本）；一个字段都没变时返回原行（不写盘、不记日志）。
+
+        Raises:
+            KeyError: 主档里没有这个学号。
+            ValueError: 想借这里改学号（请走 :func:`migrate_student_id`）。
+        """
+        key = _student_id_of(sid)
+        rows = self._load()
+        row = rows.get(key)
+        if row is None:
+            raise KeyError(f"主档里没有学号 {key}")
+        if changes.get("student_id") is not None \
+                and _student_id_of(changes["student_id"]) != key:
+            raise ValueError("改学号请调用 migrate_student_id()，它会把关联数据一起迁走")
+        updated = dict(row)
+        for field in ("name", "class_name", "note", "source"):
+            value = changes.get(field)
+            if value is None:
+                continue
+            text = _clean_text(value)
+            if field in ("name", "source") and not text:
+                continue                        # 姓名 / 来源不许被空值抹掉
+            updated[field] = text
+        if changes.get("archived") is not None:
+            updated["archived"] = bool(changes["archived"])
+        updated["updated_at"] = _now()
+        if updated == row:
+            return dict(row)
+        rows[key] = updated
+        self._write(rows)
+        if _record:
+            self._audit(OP_STUDENT_EDIT, key, "修改学生信息")
+        return dict(updated)
+
+    def upsert_import(self, student_id: str = "", name: str = "", class_name: str = "",
+                      *, source: str = "import") -> dict[str, Any]:
+        """导入成绩时**补档**：没有就建；有就**只补空字段**。
+
+        ★ 不改备注、不改归档状态、不改 ``created_at``；已有非空的姓名 / 班级
+          **保留原值**（导入的名单不是主档的权威，手工改过的名字不许被覆盖）。
+        ★ ``source`` 只在新建 / 原值为空时写，已有来源保持不变。
+
+        Args:
+            student_id: 学号（空 → ``ValueError``）
+            name: 姓名
+            class_name: 班级号
+            source: 新建时的来源（默认 ``import``）
+
+        Returns:
+            补档之后的那一行（副本）。
+
+        Raises:
+            ValueError: 学号为空。
+        """
+        key = _student_id_of(student_id)
+        if not key:
+            raise ValueError("学号不能为空")
+        rows = self._load()
+        row = rows.get(key)
+        if row is None:
+            return self.add(student_id=key, name=name, class_name=class_name,
+                            source=source)
+        updated = dict(row)
+        if not _clean_text(updated.get("name")) and _clean_text(name):
+            updated["name"] = _clean_text(name)
+        if not _clean_text(updated.get("class_name")) and _clean_text(class_name):
+            updated["class_name"] = _clean_text(class_name)
+        if not _clean_text(updated.get("source")):
+            updated["source"] = _clean_text(source) or "import"
+        if updated == row:
+            return dict(row)
+        updated["updated_at"] = _now()
+        rows[key] = updated
+        self._write(rows)
+        return dict(updated)
+
+    def archive(self, student_id: str, archived: bool = True) -> dict[str, Any]:
+        """归档 = 从列表里拿掉（**一条数据都不删**）；``archived=False`` = 恢复。
+
+        Args:
+            student_id: 学号
+            archived: ``True`` 归档 / ``False`` 取消归档
+
+        Returns:
+            改完的那一行（副本）。
+
+        Raises:
+            KeyError: 主档里没有这个学号。
+        """
+        row = self.update(student_id, _record=False, archived=bool(archived))
+        self._audit(OP_STUDENT_ARCHIVE if archived else OP_STUDENT_RESTORE,
+                    row["student_id"], "归档隐藏" if archived else "取消归档")
+        return row
+
+    def restore(self, student_id: str) -> dict[str, Any]:
+        """把归档的学生放回列表（等价于 ``archive(student_id, archived=False)``）。"""
+        return self.archive(student_id, archived=False)
+
+    def rename(self, old_id: str, new_id: str, *, name: str | None = None) -> dict[str, Any]:
+        """改主档里的学号（**只动主档这一行**；关联数据见 :func:`migrate_student_id`）。"""
+        old = _student_id_of(old_id)
+        new = _student_id_of(new_id)
+        if not new:
+            raise ValueError("新学号不能为空")
+        rows = self._load()
+        row = rows.get(old)
+        if row is None:
+            raise KeyError(f"主档里没有学号 {old}")
+        if new != old and new in rows:
+            raise DuplicateStudentError(f"学号 {_bare_student_id(new) or new} 已经存在")
+        updated = dict(row)
+        updated["student_id"] = new
+        if name is not None and _clean_text(name):
+            updated["name"] = _clean_text(name)
+        updated["updated_at"] = _now()
+        if new != old:
+            rows.pop(old, None)
+        rows[new] = updated
+        self._write(rows)
+        return dict(updated)
+
+    def remove(self, student_id: str) -> bool:
+        """从主档里删掉一行（**只删这一行**）。
+
+        ★ 界面上的「彻底删除」要**先**清掉这个人的成绩/侧写/聊天/德育分/意愿，
+          再调这里 —— 否则就留下一堆没有主人的数据。
+        """
+        key = _student_id_of(student_id)
+        rows = self._load()
+        row = rows.pop(key, None)
+        if row is None:
+            return False
+        self._write(rows)
+        self._audit(OP_STUDENT_DELETE, key, f"删除学生 {row.get('name') or ''}".strip())
+        return True
+
+    def clear(self) -> int:
+        """清空主档（**只在"删库"这类用户明确点过的场景用**）。"""
+        rows = self._load()
+        removed = len(rows)
+        if removed:
+            self._write({})
+        return removed
+
+    # -- 内部 ---------------------------------------------------------------
+    def _audit(self, operation: str, student_id: str, detail: str = "") -> None:
+        try:
+            GradeAuditLog(username=self._username, uid=self._uid,
+                          store=self._store).record(
+                operation, student_id=student_id, count=1, detail=detail)
+        except Exception as exc:  # noqa: BLE001 - 日志失败不许拦住主流程
+            _LOGGER.warning("学生主档审计日志没写进去（已忽略）：%s: %s",
+                            type(exc).__name__, exc)
+
+    def _load(self) -> dict[str, dict[str, Any]]:
+        payload = load_user_json(self._store, self._username, self.filename, None)
+        if not isinstance(payload, dict):
+            return {}
+        stored = payload.get("rows")
+        if isinstance(stored, dict):
+            return {str(key): dict(row) for key, row in stored.items()
+                    if isinstance(row, dict)}
+        if isinstance(stored, list):          # 容忍早期写成列表的载荷
+            out: dict[str, dict[str, Any]] = {}
+            for row in stored:
+                if isinstance(row, dict):
+                    key = _student_id_of(row.get("student_id"))
+                    if key:
+                        out[key] = dict(row)
+            return out
+        return {}
+
+    def _write(self, rows: dict[str, dict[str, Any]]) -> None:
+        save_user_json(self._store, self._username, self.filename, {
+            "table": self.table,
+            "version": 1,
+            "rows": rows,
+        })
+
+
+class StudentMigrationReport:
+    """改学号迁移的结果（``as_text()`` 直接给界面弹窗用）。
+
+    Attributes:
+        student / grades / profiles / chats / moral / intentions: 各类数据迁了几条
+            （``student`` 是 0/1，主档只可能迁一份）
+        files: 因撞名而**改名保留**的旧文件（``...bak``），不删用户数据
+        grade_dropped: 旧成绩与新学号已有记录撞主键而丢弃的条数
+    """
+
+    def __init__(self, *, old_id: str, new_id: str, student: int = 0,
+                 grades: int = 0, grade_dropped: int = 0, profiles: int = 0,
+                 chats: int = 0, moral: int = 0, intentions: int = 0,
+                 files: list[str] | None = None) -> None:
+        self.old_id = old_id
+        self.new_id = new_id
+        self.student = int(student)
+        self.grades = int(grades)
+        self.grade_dropped = int(grade_dropped)
+        self.profiles = int(profiles)
+        self.chats = int(chats)
+        self.moral = int(moral)
+        self.intentions = int(intentions)
+        self.files = list(files or [])
+
+    def total(self) -> int:
+        """一共迁了多少项（成绩按条算，其余按"类"算）。"""
+        return self.student + self.grades + self.profiles + self.chats \
+            + self.moral + self.intentions
+
+    def as_text(self) -> str:
+        """中文一句话（界面弹窗直接用；**不含** Markdown 记号、不含分数）。
+
+        Returns:
+            形如「学号 2023001 → 2023099；已迁移：成绩 12 条、侧写 1 份、聊天 1 份、
+            德育分 2 个班、意愿 1 条」。
+        """
+        old = _bare_student_id(self.old_id) or self.old_id
+        new = _bare_student_id(self.new_id) or self.new_id
+        moved: list[str] = []
+        if self.student:
+            moved.append("学生主档")
+        if self.grades:
+            moved.append(f"成绩 {self.grades} 条")
+        if self.profiles:
+            moved.append("侧写 1 份")
+        if self.chats:
+            moved.append(f"聊天 {self.chats} 份")
+        if self.moral:
+            moved.append(f"德育分 {self.moral} 个班")
+        if self.intentions:
+            moved.append("意愿 1 条")
+        text = f"学号 {old} → {new}；已迁移：" + (
+            "、".join(moved) if moved else "无关联数据")
+        if self.grade_dropped:
+            text += f"；另有 {self.grade_dropped} 条旧成绩与新学号重复，已保留新学号那份"
+        if self.files:
+            text += "；旧文件已改名保留：" + "、".join(self.files)
+        return text
+
+
+def _rename_key(payload: dict[str, Any], old_key: str, new_key: str) -> bool:
+    """把 ``{key: value}`` 表里的键改掉（新键已有值时不覆盖，保留新的那份）。"""
+    if old_key not in payload:
+        return False
+    if new_key in payload:
+        return False
+    payload[new_key] = payload.pop(old_key)
+    return True
+
+
+def _rename_nested(payload: Any, field: str, old_key: str, new_key: str) -> bool:
+    """把 ``{field: {key: value}}`` 载荷里那一层的键改掉（德育分 / 意愿都是这个形状）。
+
+    ★ 真源的形状写在 :func:`core.scholarship.save_moral`（``{"scores": …}``）与
+      :func:`ui.intentions.load_intentions`（``{"intentions": …}``）里 ——
+      **别在顶层找键**，那样永远迁不动，而且不报错。
+    """
+    if not isinstance(payload, dict):
+        return False
+    table = payload.get(field)
+    if not isinstance(table, dict):
+        return False
+    if not _rename_key(table, old_key, new_key):
+        return False
+    payload[field] = table
+    return True
+
+
+def migrate_student_id(old_id: str, new_id: str, *, store: CryptoStore | None = None,
+                       username: str = "", uid: str | None = None,
+                       migrate_histories: bool = True
+                       ) -> StudentMigrationReport:
+    """改学号：**主档 + 成绩 + 侧写/学期侧写 + 聊天记录 + 德育分 + 意愿标签**一起迁。
+
+    ★ 少迁一样就是静默丢数据（AGENTS §37）—— 所以这个函数把六处一次做完，
+      任何一处失败**只记警告、继续往下迁**，最后用 :meth:`StudentMigrationReport.as_text`
+      如实汇报；返回值只反映**真迁成功**的部分。
+
+    ★ 撞键的取舍：新学号上已有的数据**优先保留**，旧的那份丢弃（成绩计入
+      ``grade_dropped``），绝不把同一条数据存两份。
+    ★ 聊天历史文件撞名时不删旧文件：**改名成 ``<原名>.bak`` 留在同目录**并记进
+      ``report.files`` —— 用户的数据一个字节都不许凭空消失。
+
+    Args:
+        old_id: 旧学号（``2023001`` / ``sid:2023001`` 都行）
+        new_id: 新学号（同上；归一后与旧学号相同 → 什么都不做）
+        store: 加密库；``None`` = 默认库
+        username: 用户名；空串 = :func:`current_username`
+        uid: 用户 uid（省一次查表）；``None`` = 由用户名解析
+        migrate_histories: ``False`` 时跳过**成绩历史**；默认 ``True``。
+            生产路径不要传 ``False``。
+
+    Returns:
+        :class:`StudentMigrationReport`。
+
+    Raises:
+        ValueError: 新旧学号有一个是空串。
+    """
+    vault = store if store is not None else CryptoStore()
+    user = username or current_username()
+    report = StudentMigrationReport(old_id=_student_id_of(old_id),
+                                    new_id=_student_id_of(new_id))
+    if not report.old_id or not report.new_id:
+        raise ValueError("新旧学号都不能为空")
+    if report.old_id == report.new_id:
+        return report
+
+    # 1) 学生主档（旧档不存在就跳过；新档已存在则保留新的，不动）
+    try:
+        students = StudentStore(username=user, uid=uid, store=vault)
+        if students.has(report.old_id) and not students.has(report.new_id):
+            students.rename(report.old_id, report.new_id)
+            report.student = 1
+        elif students.has(report.new_id):
+            _LOGGER.warning("改学号：主档里已经有 %s，旧档 %s 不合并",
+                            report.new_id, report.old_id)
+    except Exception as exc:  # noqa: BLE001 - 一步失败不中断后面的步骤
+        _LOGGER.warning("改学号：学生主档没迁成（继续）：%s: %s", type(exc).__name__, exc)
+
+    # 2) 成绩历史
+    if migrate_histories:
+        try:
+            moved, dropped = GradeHistoryDB(username=user, uid=uid,
+                                            store=vault).rekey_student(
+                report.old_id, report.new_id)
+            report.grades = moved
+            report.grade_dropped = dropped
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("改学号：成绩历史没迁成（继续）：%s: %s",
+                            type(exc).__name__, exc)
+
+    # 3) 侧写（含学期侧写）
+    try:
+        report.profiles = int(ProfileStore(username=user, uid=uid,
+                                           store=vault).move_student(
+            report.old_id, report.new_id))
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.warning("改学号：侧写没迁成（继续）：%s: %s", type(exc).__name__, exc)
+
+    # 4) AI 谈话记录（按学生一个文件，在 <user_dir>/cache/ 下）
+    old_chat = _chat_file(vault, user, report.old_id)
+    new_chat = _chat_file(vault, user, report.new_id)
+    if old_chat is not None and new_chat is not None and old_chat.exists():
+        try:
+            new_chat.parent.mkdir(parents=True, exist_ok=True)
+            if new_chat.exists():
+                # ★ 目标已有记录：保留目标，旧文件改名成 .bak 留在同目录（不删数据）
+                backup = old_chat.with_name(old_chat.name + ".bak")
+                if backup.exists():
+                    stamp = _now().replace(":", "").replace(" ", "_")
+                    backup = old_chat.with_name(f"{old_chat.name}.{stamp}.bak")
+                old_chat.replace(backup)
+                report.files.append(backup.name)
+            else:
+                old_chat.replace(new_chat)
+                report.chats = 1
+        except OSError as exc:
+            _LOGGER.warning("改学号：聊天记录没迁成（继续）：%s", exc)
+
+    # 5) 德育分（键是 sid:<学号>，一个班一个文件；走 scholarship 的公开 API）
+    try:
+        from core import scholarship  # noqa: PLC0415 - 晚绑定，避免 import 环
+
+        classes: list[str] = []
+        for record in scholarship.list_classes(vault, user):
+            class_name = str(getattr(record, "class_name", "") or "")
+            if class_name and class_name not in classes:
+                classes.append(class_name)
+        # ★ 兜底：只有德育分文件、没有班级快照的班（list_classes 扫不到）也要迁 ——
+        #   否则"这个班的德育分静默不迁"，而它恰恰是用户手录、丢了就没法复原的数据。
+        for name in list_user_json(vault, user, "_moral.json.enc"):
+            stem = name.rsplit("_moral.json.enc", 1)[0]
+            class_name = stem[len("class_"):] if stem.startswith("class_") else ""
+            if class_name and class_name not in classes:
+                classes.append(class_name)
+        for class_name in classes:
+            scores = dict(scholarship.load_moral(vault, user, class_name) or {})
+            if _rename_key(scores, report.old_id, report.new_id):
+                scholarship.save_moral(vault, user, class_name, scores)
+                report.moral += 1
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.warning("改学号：德育分没迁成（继续）：%s: %s", type(exc).__name__, exc)
+
+    # 6) 意愿标签（{"intentions": {"sid:<学号>": "考研"}}）
+    try:
+        payload = load_user_json(vault, user, "intentions.json.enc", None)
+        if _rename_nested(payload, "intentions", report.old_id, report.new_id):
+            save_user_json(vault, user, "intentions.json.enc", payload)
+            report.intentions = 1
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.warning("改学号：意愿标签没迁成（继续）：%s: %s", type(exc).__name__, exc)
+
+    # 7) 审计：改学号本身留一条（detail 只说迁了哪几类，**不写分数**）
+    try:
+        GradeAuditLog(username=user, uid=uid, store=vault).record_student(
+            OP_STUDENT_MIGRATE, student_id=report.new_id,
+            detail=report.as_text(), count=report.total())
+    except Exception:  # noqa: BLE001 - 日志失败不许拦住迁移结果
+        _LOGGER.warning("改学号：审计日志没写进去（已忽略）", exc_info=True)
     return report
 
 

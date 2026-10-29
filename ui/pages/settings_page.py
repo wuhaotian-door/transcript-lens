@@ -107,6 +107,10 @@ def clear_confirm_text(inventory: dict[str, Any]) -> str:
         lines.append("· 磁盘上的加密文件 " + str(len(files)) + " 个")
     if not lines:
         return "没有找到可删除的数据。"
+    # ★ v1.9.2：聊天缓存（u_<uid>/cache/chat_history_<学号>.json.enc）由
+    #   core.database.clear_library 一并清掉 —— 确认弹窗必须如实写出来，
+    #   不能删了用户不知道（AGENTS §34：聊天历史按学生落盘）。
+    lines.append("· 该生的 AI 聊天缓存也会一并清除")
     return "将删除本账户的下列数据：\n" + "\n".join(dict.fromkeys(lines))
 
 
@@ -168,6 +172,35 @@ class SettingsPage(QWidget):
 
     def set_export_provider(self, provider: Callable[[], list[dict[str, Any]]]) -> None:
         self._export_provider = provider
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt 的命名
+        """每次切到设置页都顺手刷新「删除成绩库」的状态。
+
+        ★ v1.9.2：清完库再切回设置页时，这里必须已经写着「没有成绩库」——
+          判据是 ``grade_history`` 表为空。**只改状态文案**，不动任何数据。
+        """
+        super().showEvent(event)
+        self._refresh_clear_status()
+
+    def _refresh_clear_status(self) -> None:
+        """按 ``grade_history`` 表把「删除成绩库」的状态文案对齐。
+
+        读不到库时**一个字都不改**（页面还没登录 / 还没解锁都属正常）。
+        """
+        label = getattr(self, "_clr_status", None)
+        if label is None or not self._username:
+            return
+        try:
+            inventory = library_inventory(self._store, self._username)
+        except Exception:  # noqa: BLE001 - 只是状态文案，读不到就维持原样
+            return
+        if not inventory.get("account"):
+            return
+        if int(inventory.get("grade_rows") or 0):
+            # 有新成绩了 —— 把上一次"已删除 / 已取消"的旧状态清掉，别让它说谎
+            label.setText("")
+        else:
+            label.setText("没有成绩库：本账户还没有导入过成绩。")
 
     # ---------------------------------------------------------------- 搭界面
     def _build(self) -> None:
@@ -1042,8 +1075,13 @@ class SettingsPage(QWidget):
           于是导入完成绩点这个按钮，界面说"库里本来就是空的"，
           而成长档案页明明有一整份名单。
 
-        ★ 现在的判据只有一条：:func:`core.database.library_inventory` 里
-          ``has_data``（表里真有没有记录 / 侧写 / 生成物）。
+        ★ 现在的判据只有一条：``library_inventory()`` 里 ``grade_rows`` 为空
+          （= **``grade_history`` 表为空**）。
+
+        ★ v1.9.2 再把判据收紧到「成绩历史表为空」：清完库之后即使磁盘上还
+          残留快照文件，这里也必须说「没有成绩库」—— 否则就是那个旧 bug：
+          界面说有名单、设置页说没数据。**聊天缓存**由
+          :func:`core.database.clear_library` 一并清掉（确认弹窗已如实写明）。
 
         ★ 删除动作全在 :func:`core.database.clear_library` 里（数据层，可单测），
           这里只做三件事：问用户、调它、报结果。
@@ -1056,8 +1094,10 @@ class SettingsPage(QWidget):
         if not inventory.get("account"):
             QMessageBox.warning(self, "找不到账户", f"本机没有「{self._username}」。")
             return
-        if not inventory.get("has_data"):
-            # 到这里才是真的"没有成绩库"：表里 0 条、侧写 0 份、没有任何快照。
+        if not int(inventory.get("grade_rows") or 0):
+            # ★ v1.9.2：判据 = ``grade_history`` 表为空（**不是**"磁盘上有没有
+            #   文件"，也不是侧写/快照还剩几份）。清完库再点进设置页必须走到
+            #   这里，不许再出现"界面说有名单、设置页说没数据"。
             self._clr_status.setText("没有成绩库：本账户还没有导入过成绩。")
             QMessageBox.information(
                 self, "没有成绩库",

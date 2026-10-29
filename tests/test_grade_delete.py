@@ -265,7 +265,7 @@ def test_apply_logs_insert_per_student_without_scores(db: GradeHistoryDB,
     assert entry["at"], "没记操作时间"
     # ★ 一行一条的字段集合：**没有 score / credit**（审计日志不是第二份成绩库）
     assert set(entry) == {"at", "operation", "student_id", "semester",
-                          "course_name", "count"}
+                          "course_name", "count", "detail"}
 
     payload = user_file(store, USER, AUDIT_FILE).read_bytes()
     assert b"87.5" not in payload, "分数泄进审计日志了"
@@ -925,3 +925,44 @@ def test_settings_gpa_combo_shows_only_scheme_one_as_usable(store: CryptoStore) 
     page._on_gpa_scheme_changed(0)
     assert load_scheme(store, USER) == DEFAULT_SCHEME
     assert user_file(store, USER, GPA_SETTINGS_FILE).exists()
+
+# ---------------------------------------------------------------------------
+# v1.9.2：AI 谈话记录（cache/chat_history_<学号>.json.enc）也要随"删除成绩库"清掉
+# ---------------------------------------------------------------------------
+
+
+def _chat_file(store: CryptoStore, bare: str):
+    base = user_file(store, USER, "__probe__.json.enc")
+    assert base is not None
+    return base.parent / "cache" / f"chat_history_{bare}.json.enc"
+
+
+def _seed_chat(store: CryptoStore, bare: str = "20230101") -> object:
+    path = _chat_file(store, bare)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"encrypted-chat")
+    return path
+
+
+def test_盘点会列出聊天缓存(store: CryptoStore) -> None:
+    _seed_chat(store)
+    inv = library_inventory(store, USER)
+    assert inv["chat_files"] == 1
+    assert any(name.startswith("cache/chat_history_") for name in inv["files"])
+
+
+def test_清库会把聊天缓存一起删(store: CryptoStore) -> None:
+    path = _seed_chat(store)
+    report = clear_library(store, USER)
+    assert report["found"] is True
+    assert not path.exists(), "聊天缓存没被清掉"
+    assert any(name.startswith("cache/chat_history_") for name in report["files"])
+
+
+def test_不勾清侧写时保留聊天缓存(store: CryptoStore) -> None:
+    path = _seed_chat(store)
+    report = clear_library(store, USER, with_profiles=False)
+    assert path.exists(), "没勾清侧写却把谈话记录删了"
+    assert not any(name.startswith("cache/chat_history_") for name in report["files"])
+    assert report["found"] is True
+
