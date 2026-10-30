@@ -38,6 +38,15 @@
       同样条件下一个 8MB 的 hello-world 单文件 exe 也会以同样的方式失败。
       沙箱内请用 ``-Target debug``（onedir，不需要自解包，可完整验证）；
       单文件包请在沙箱外双击验证，或加 ``-SkipSelfCheck`` 只产出不验证。
+
+      ★ 实测补充（2026-10-30，本机）：这条限制**不只发生在沙箱里**。用计划任务以当前用户
+      身份运行单文件 exe，仍报 ``[PYI-xxxx:ERROR] Could not create temporary directory!``；
+      连一个 8MB 的 hello-world 单文件 exe 也一样（同样的报错、同样的退出码 -1）。
+      把 TEMP 指到**本项目目录树内**（如 ``dist\_tmp``）就正常（自检 ALL OK，退出码 0），
+      指到 %TEMP%、桌面、用户目录根一律失败。结论：**本机安全软件/沙箱策略在拦**，
+      不是打包配置问题。本机验证请用 ``dist\launch.bat``（自动把 TEMP 设到 dist\_tmp）
+      或 ``-Target debug`` 的 onedir 产物。
+
 #>
 param(
     [ValidateSet('debug', 'release')]
