@@ -2367,3 +2367,130 @@ v1.9.1 **不新增业务能力** —— 它把 v1.9 上线后暴露的七个问�
   （`install()` vs `BackendInstallThread` + `backend_status()`），最后靠主控裁决保留一套、
   并让 `ui/model_center_dialog.py` 用 `try/except` 探测两端 —— 这种"探测兜底"只能是过渡，
   版本发布前必须收敛成单一契约（本版已收敛到 `runtime_setup`）。
+
+## 二十七、v1.9.3：启动可靠性（日志 / 备份 / 登录 / 淡入 / 单文件解包）
+
+v1.9.2 发出去之后，现场报回来四个症状。四个都不是"功能没做"，而是
+**出错的时候不吭声**：程序要么卡在某个中间态，要么弹一句用户看不懂的英文。
+所以这一版的主题只有一个 —— **把"静默失败"改成"要么成功，要么说清为什么"**。
+
+### 27.1 四个症状与根因
+
+| 症状（用户原话） | 根因 | 修法 |
+|---|---|---|
+| 「输入账户密码无法进入程序只会显示正在校验密码 PBKDF2 派生中」 | `_do_login` 只 `except` 了 `CryptoError` 家族；密码通过之后 `_handle_remember` / `_leave` 里任何别的异常都从按钮槽里**冒出去**。`--windowed` 的 exe 没有 stderr，Qt 那行 traceback 等于丢进黑洞，界面就永久停在「PBKDF2 派生中」 | 密码通过之后的每一步整体 `except Exception`：落日志（含完整 traceback）+ 弹窗 + 状态改回 + **解锁 `_leaving` 允许重试** |
+| 「密码错误倒是可以正常显示」 | 同上 —— 错密码走的是 `WrongPasswordError` 分支，本来就有文案。**这条反而证明程序没崩，是"对的那条路"缺兜底** | —— |
+| 「旧版迁移数据报异常但不影响程序打开」 | `backup_vault()` 对整个数据目录 `copytree`，而现场有 1.1 GB 模型 + 两份 GB 级历史备份；拷贝期间被占用就整次迁移失败（旧数据没坏，所以程序照常打开） | 备份**跳过** `models` / `runtime` / `logs` / `cache`（都可重建），并给出"备份了什么、为什么快"的说明 |
+| 「点击运行 exe 显示 cannot create tempdirctor」 | PyInstaller 单文件启动器要先把自己解包到 `%TEMP%\`；本机的安全策略拦这一步（同一个 hello-world 单文件包同样失败） | 打包加 `--runtime-tmpdir "."`：**解到 exe 自己所在目录**，不碰 `%TEMP%` |
+| 「登录界面有多余线条」 | 未定位（见 27.6 的说明） | 圆角半径按"父级描边 1px → 子级小 1px"统一；**需要用户截图才能精准修** |
+
+### 27.2 运行期日志：`core/applog.py`
+
+零依赖、不联网，只做四件事：
+
+* `write(tag, message)` —— 关键步骤各写一行（`boot` / `login` / `flow` / `migrate` / `prewarm` / `crash`）。
+* `install_excepthook()` —— 未捕获异常先落盘，**再**交给原来的钩子（开发时照样看得见栈）。
+* `install_faulthandler()` —— 线程栈 dump 到 `logs/fault.log`，真卡死时能取证。
+* `tail(lines)` —— 错误弹窗里直接给用户看最后几行。
+
+★ 三条硬约束：
+
+1. **日志永远不许抛**。写不进去（目录只读、磁盘满、路径是个文件）一律 `except Exception: pass` ——
+   日志把程序搞崩就荒唐了。
+2. 位置固定在 `<数据根>/logs/app.log`（默认 `%LOCALAPPDATA%\SGMS\logs\`），超过 512 KB 滚成 `.1`。
+3. **不进备份**（见 27.3）—— 它是恢复过程里最该被覆盖的东西之一。
+
+### 27.3 迁移备份：可重建的目录不该拖慢甚至拖死迁移
+
+`backup_vault()` 原来只跳过"已有的备份"和 `*.tmp`。现场数据目录里：
+
+* `models/` 1.1 GB（一个 1.5B 的 gguf）；
+* 每个历史备份各 1.1 GB（`backup_v1.8.1_*` / `backup_v1.9_*`）。
+
+于是"点一次迁移"要拷 GB 级数据，几十秒起步，中途被杀软扫一下就可能失败。
+现在 `SKIP_DIR_NAMES = {"models", "runtime", "logs", "cache"}` 一律不进备份 ——
+它们**都能重建**（重新下载模型 / 重装后端 / 日志本来就可丢 / 缓存随时可清），
+而真正不可再生的 `users.json`、`app.salt`、`u_*/`（成绩、档案、侧写、主档）一个字都不省。
+
+★ 判据：`tests/test_startup_robustness.py::test_备份跳过可重建的大目录` 造一个"像真的"
+数据目录（五个目录各放一个 payload），断言备份里**没有**这四个目录、而核心密文**逐字节相同**。
+
+### 27.4 登录：密码对了也必须能进得去
+
+`ui/login_window._do_login()` 现在的结构：
+
+```
+校验密码 → [三种 CryptoError 分支：原有文案]
+        → 密码通过：写一行登录日志
+        → try: _handle_remember() + _leave()
+          except Exception: 落完整 traceback + 状态改红 + 弹窗（附日志路径）+ 解锁重试
+```
+
+另外 `_leave()` 里挂了 `LEAVE_FAILSAFE_MS = 1600` 的看门狗：淡出动画如果因为任何原因
+不回调（窗口被隐藏、显示器休眠、动画对象被回收），`_force_leave()` 会把 `logged_in` **补发一次**
+（且只发一次 —— `_left` 标志位保证幂等）。
+
+★ 判据（`tests/test_startup_robustness.py`，5 条）：密码通过后人为让 `_handle_remember` 抛
+`RuntimeError` → 不许发 `logged_in`、`_leaving` 必须复位、状态行与弹窗都要有、日志里要有 traceback；
+错密码的既有行为不许被改坏；正常路径发一次；看门狗在"动画不回调"时补发一次、在正常路径上不重复发。
+
+### 27.5 主窗淡入：透明度卡在 0 也是"进不去"
+
+`ui/main_window` 构造时 `setWindowOpacity(0.0)`，靠 `show_and_fade_in()` 的 200ms 动画拉回 1。
+动画被任何东西打断（最小化、远程桌面、合成器抽风），窗口就是**"已显示但全透明"** ——
+用户看到的是"点了登录，程序没出来"。
+
+现在多了一个 `FADE_IN_FAILSAFE_MS = 900` 的看门狗：到点 `windowOpacity() < 0.99` 就直接补成 1，
+并写一行 `flow` 日志（"淡入看门狗介入：opacity=0.00"）。900ms 是动画时长的 4 倍多，正常路径碰不到。
+
+### 27.6 单文件 exe 解包失败：`--runtime-tmpdir` 的实测结论
+
+现场：双击 `dist\transcript-lens.exe` 弹一个标题为 **Error** 的原生对话框，进程随即消失。
+用控制台版单文件包（`-ShowConsole`）接住 stderr，逐字是：
+
+```
+[PYI-19100:ERROR] Could not create temporary directory!
+```
+
+★ 这是 **PyInstaller 启动器**在 Python 起来之前报的错，应用层完全插不上手 ——
+所以要修的是"解包到哪"。
+
+实测矩阵（同一个 exe，只改 TEMP / 解包根）：
+
+| 解包位置 | 结果 |
+|---|---|
+| `%TEMP%\` | ✗ `Could not create temporary directory!`（exit -1） |
+| 用户目录根、桌面、`AppData\Local\*` | ✗ 同上 |
+| **项目目录树内**（`dist\_tmp`、`<repo>\_MEI*`） | ✓ 正常（exit 0） |
+| **`--runtime-tmpdir "."`（解到 exe 所在目录）** | ✓ **在 `%TEMP%` 和用户目录根都是 exit 0** |
+
+对照组：同样条件下一个 8 MB 的 hello-world 单文件 exe 报**一模一样**的错 ——
+与本项目代码、打包参数无关，是本机策略在拦"未签名程序在常见目录创建解包目录"。
+
+所以 `build_exe.ps1` 的 release / console 目标现在固定带 `--runtime-tmpdir $RuntimeTmpDir`
+（默认 `"."`，见脚本 `.NOTES`）。★ 两个边界必须记住：
+
+1. 参数里的相对路径是相对**启动时的工作目录**。双击时 CWD 就是 exe 所在目录（Explorer 的行为），
+   所以正常双击没问题；但从别的目录命令行启动、或快捷方式把"起始位置"改到别处，就会落到那个目录。
+2. **不支持环境变量**（写 `%TEMP%` 会被当字面量），而且**上级目录必须已存在** ——
+   指 `_tmp` 这种不存在的子目录会直接失败（实测）。
+
+### 27.7 判据清单
+
+| 文件 | 覆盖 |
+|---|---|
+| `tests/test_startup_robustness.py`（10 条） | 日志落盘/读回/不可写不炸/滚动；备份跳过四目录且核心密文逐字节一致；登录口令通过后异常被兜住、错密码行为不变、看门狗补发且幂等 |
+| `tests/test_version_migration.py` | 版本链 `1.0 → 1.9.3` 九跳齐全 |
+| `main.py --selfcheck` | `core.applog` 已进 `CHECK_MODULES`（50 个），docs 白名单 5 份 |
+| `build_exe.ps1 -Both` + exe `--selfcheck` / `--bootcheck` | 打包与启动时序 |
+
+### 27.8 未完成 / 待用户确认
+
+* **登录界面「多余线条」没有定位到**。离屏渲染在 100% 和 150% DPI 下都拍过：
+  深色品牌区、1px `#E2E8F0` 描边、14px 阴影留白、分隔线（248px 宽 1px）都正常，
+  四角只有"描边 + 投影"两层。**只有真机上合成器参与时才可能出现**那类线，
+  需要用户截一张图（或指一下位置：窗口四角？标题栏下面？输入框上下？）。
+  已顺手按 AGENTS §4e 第 2 条把"与父级共用同一个圆"的子控件半径统一成 `父级 - 1px`
+  （`#WindowTitleBar` / `#LoginBrand` / `#Sidebar` / `#TopBar`），但它不是已证实的修复。
+* 主界面 6 页的接触表（`%TEMP%\tl_main_pages.png`）在 100% DPI 下没有看到杂线，
+  但 50% 缩放会把 1px 线抹掉，同样需要 150% DPI 的真机截图才能定论。
