@@ -1,37 +1,154 @@
-# 成绩单透镜
+<div align="center">
 
-#### 介绍
-简单的开源桌面工具，主要是针对学生在校绩点评估，和未来出路的部分参考分析，暂时处于开发状态
+# 成绩单透镜 · transcript-lens
 
-#### 软件架构
-软件架构说明
+**给高校辅导员用的成绩与德育分桌面工具**
 
+导入教务系统导出的 Excel，本地算三档加权、排奖学金、攒成长档案，
+再用本机的 AI 模型生成学生侧写与谈话提纲 —— 全程离线，数据不出这台电脑。
 
-#### 安装教程
+</div>
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+## 它解决什么问题
 
-#### 使用说明
+辅导员手里通常有三样东西：教务处导出的成绩表、自己维护的德育分表、
+以及一堆说不清来源的排名与奖助评定。它们分散在多个 Excel 里，
+每次评奖学金都要重新拉表、手算加权、再对一遍人数。
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+成绩单透镜把这条链路收进一个桌面程序：**导入一次，之后所有统计都从加密库里取**，
+口径（必修 / 必修+限选 / 全部）固定、可复现，换台电脑就带一个数据目录即可。
 
-#### 参与贡献
+## 功能
 
-1.  Fork 本仓库
-2.  新建 Feat_xxx 分支
-3.  提交代码
-4.  新建 Pull Request
+### 智育分析
+- 导入 `.xlsx` / `.xls`（按文件魔数自动选引擎，教务系统的"假 xlsx"也能读）
+- 课程类别、学分、锚点校验三重人工确认，**导入前就能发现错行**
+- 三档加权口径随时切换：仅必修 / 必修+限选 / 全部（默认必修+限选，选修默认剔除）
+- 逐行预警：挂科、缺考、分数越界、学分异常
 
+### 侧写辅导
+- 学生名单 + 发展意愿（保研 / 考研 / 就业 / 考公 / 留学）+ 本地规则拼出的辅导提纲
+- **AI 辅导**：把该生成绩、德育分、已有侧写打包进系统提示，本地模型流式作答
 
-#### 特技
+### 成长档案
+- 按学期累加的历史趋势，Δ 涨跌一目了然
+- 单条记录可删（成绩 / 德育 / 侧写），删光一学期会提示是否同时删学期记录
+- 学期侧写：按学期生成、可编辑、可保存
 
-1.  使用 Readme\_XXX.md 来支持不同的语言，例如 Readme\_en.md, Readme\_zh.md
-2.  Gitee 官方博客 [blog.gitee.com](https://blog.gitee.com)
-3.  你可以 [https://gitee.com/explore](https://gitee.com/explore) 这个地址来了解 Gitee 上的优秀开源项目
-4.  [GVP](https://gitee.com/gvp) 全称是 Gitee 最有价值开源项目，是综合评定出的优秀开源项目
-5.  Gitee 官方提供的使用手册 [https://gitee.com/help](https://gitee.com/help)
-6.  Gitee 封面人物是一档用来展示 Gitee 会员风采的栏目 [https://gitee.com/gitee-stars/](https://gitee.com/gitee-stars/)
+### 奖学金测算
+- `最终分 = 智育加权（全口径）× 0.7 + 德育分 × 0.3`
+- 一 / 二 / 三等名额逐班配置；特等奖（前 X 名且每门 ≥ 90）不占名额、默认不叠加
+- 德育分未录入按 0 计，但会明确备注，**不会假装有分**
+
+### 模型中心
+- 从 Gitee 清单拉取 GGUF 模型，按本机内存 / 显存标注 **轻松 / 勉强 / 困难**
+- 一键下载（断点续传 + SHA256 校验）、安装、卸载；下载失败给「复制链接」兜底
+- 宽松档才默认勾选，困难行直接置灰
+
+### 其他
+- 双层加密本地存储、批量导入德育分、删除成绩库（带盘点与二次确认）、
+  成绩变更审计日志、GPA（标准 4.0 对照表）、在线更新与分片发布
+
+## 隐私与安全
+
+| 项 | 做法 |
+|---|---|
+| 存储位置 | `%LOCALAPPDATA%\SGMS\`，**不在仓库、不在程序目录** |
+| 落盘 | 只写 `.enc` 密文；**明文成绩任何时候都不落盘** |
+| 加密 | 密码级（成绩）+ 应用级（德育分 / 档案 / 侧写 / 聊天记录）两层 |
+| 身份 | 一律用学号做键（`sid:<学号>`），同名不串号 |
+| 联网 | 只有四个口子：找回密码的 SMTP、在线更新检查、用户点过确认的下载（exe / 模型） |
+| 大模型 | 只走本机 GGUF 推理，**没有云端 API**，断网可用 |
+
+仓库里不含任何真实成绩、真实凭据；测试数据全部是 `tests/fixtures/fake_*.xlsx`。
+
+## 快速开始
+
+### 方式一：下载安装包
+
+到 [Releases](https://gitee.com/wuhaotiansystem/transcript-lens/releases) 下载。
+发布包超过单文件上限时会切成多个分片，Windows 下用命令行合并即可：
+
+```bat
+copy /b transcript-lens-v1.8.1.exe.part1+transcript-lens-v1.8.1.exe.part2+transcript-lens-v1.8.1.exe.part3 transcript-lens.exe
+```
+
+> 当前源码版本是 **1.9.2**，对应的安装包尚未发布；Releases 里能下到的是 1.8.1。
+
+### 方式二：从源码运行
+
+需要 **Windows 10/11 + Python 3.13**：
+
+```bat
+git clone https://gitee.com/wuhaotiansystem/transcript-lens.git
+cd transcript-lens
+pip install -r requirements.txt
+python main.py
+```
+
+AI 辅导要额外装本地推理引擎（可选，不装不影响其他功能）：
+
+```bat
+pip install llama-cpp-python
+```
+
+或直接在程序里打开**模型中心**，点「安装推理后端」由程序帮你装。
+模型文件请放在 `%LOCALAPPDATA%\SGMS\models\<名字>\*.gguf`，模型中心会自动识别。
+
+### 自己打包
+
+```bat
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build_exe.ps1 -Both
+```
+
+产物在 `dist\`：`transcript-lens.exe`（单文件，给别人用）与
+`transcript-lens-debug\`（目录版，带控制台，排错用）。
+
+单文件版启动时要先把自己解包到临时目录，个别机器的安全软件会拦这一步，报
+`[PYI-xxxx:ERROR] Could not create temporary directory!`。遇到时改用目录版，
+或先 `set TEMP=<一个可写目录>` 再启动。
+
+## 使用流程
+
+1. **智育分析** → 选学期、选班级、导入成绩表
+2. 核对课程类别与学分 → 确认锚点校验 → 落库
+3. 左侧名单按口径看加权、预警；导出分析表
+4. **奖学金测算** → 导入德育分（可批量）→ 配额 → 出结果
+5. **侧写辅导 / 成长档案** → 发展意愿、辅导提纲、AI 侧写与谈话
+6. **设置** → 在线更新、GPA 方案、删除成绩库（会先盘点并二次确认）
+
+## 项目结构
+
+```
+core/        解析、校验、加权、加密存储、逻辑表 API、更新器、本地推理
+ui/          PySide6 界面（无边框窗口、页面、对话框、样式）
+ai/          本地模板与云端适配骨架（默认不启用）
+tests/       单元测试与假数据（865+ 用例）
+tools/       分片发布等辅助脚本
+update/      版本清单与模型清单（Gitee raw 读取）
+docs/        开发总纲、更新手册、分发与发布 SOP
+main.py      入口（GUI / --selfcheck / --bootcheck / --mailcheck）
+```
+
+## 开发
+
+```bat
+python -m pytest tests -q          :: 全量测试
+python main.py --selfcheck         :: 源码自检（封板哈希、闸门、清单一致性）
+dist\transcript-lens.exe --bootcheck
+```
+
+改动前请先读 `AGENTS.md`（施工细则，§0–§37 共 38 节硬规则）与 `docs/DEV_SUMMARY.md`（开发总纲）。
+版本号只改 `core/version.py` 的 `CURRENT_VERSION`，且必须同时给 `core/migrator.py` 补一跳迁移。
+
+## 已知限制（记录，不是待办）
+
+- GPA 目前只实现**方案 1（标准 4.0 对照表）**，其余方案留了位置
+- 德育分没录入按 0 参与测算，但会备注；表格里是空白不是 0
+- 空值 ≠ 0：没选的课不进分母，缺考的数字 `0` 进分母
+- 分数 > 100 会掉出加权分母（仍留在明细里），界面上给强制确认
+- 欢迎页停留 1.5 s 是文档定义值，不是卡顿
+
+## 许可
+
+[MIT License](LICENSE) © 2026 wuhaotian
