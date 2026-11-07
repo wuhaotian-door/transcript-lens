@@ -70,10 +70,11 @@
 发布包超过单文件上限时会切成多个分片，Windows 下用命令行合并即可：
 
 ```bat
-copy /b transcript-lens-v1.8.1.exe.part1+transcript-lens-v1.8.1.exe.part2+transcript-lens-v1.8.1.exe.part3 transcript-lens.exe
+copy /b transcript-lens-v1.9.2.exe.part1+transcript-lens-v1.9.2.exe.part2+transcript-lens-v1.9.2.exe.part3 transcript-lens.exe
 ```
 
-> 当前源码版本是 **1.9.2**，对应的安装包尚未发布；Releases 里能下到的是 1.8.1。
+> 三片合并后是 **240,387,480 字节**（约 229 MB）。合并完直接双击即可，
+> 第一次启动会自动把上一版的数据迁移到 1.9.2。
 
 ### 方式二：从源码运行
 

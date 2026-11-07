@@ -72,11 +72,11 @@ No real grade sheets or credentials are in this repository — test data is limi
 Large builds are split into parts; concatenate them on Windows:
 
 ```bat
-copy /b transcript-lens-v1.8.1.exe.part1+transcript-lens-v1.8.1.exe.part2+transcript-lens-v1.8.1.exe.part3 transcript-lens.exe
+copy /b transcript-lens-v1.9.2.exe.part1+transcript-lens-v1.9.2.exe.part2+transcript-lens-v1.9.2.exe.part3 transcript-lens.exe
 ```
 
-> Source is at **1.9.2**; the matching installer has not been published yet — Releases
-> still carries 1.8.1.
+> The three parts concatenate to **240,387,480 bytes** (~229 MB). Just double-click the
+> result: on first launch it migrates data from the previous version automatically.
 
 **From source** (Windows 10/11, Python 3.13):
 
