@@ -97,6 +97,10 @@ TOPBAR_HEIGHT = 54
 #: 而这两段传达的是同一件事（"换界面了"）。200ms 足够看清是淡入而不是闪现。
 WINDOW_FADE_IN_MS = 200
 
+#: 淡入看门狗的时限（见 :meth:`MainWindow.show_and_fade_in`）。
+#: 比动画（200ms）长 4 倍多，正常路径永远碰不到它。
+FADE_IN_FAILSAFE_MS = 900
+
 #: 导航项：``(键, 图标+文字)``。顺序即侧栏顺序。
 NAV_ITEMS: tuple[tuple[str, str], ...] = (
     ("analysis", "📊  智育分析"),
@@ -394,12 +398,30 @@ class MainWindow(QMainWindow):
         ★ 窗口可能**已经被 `AppFlow._prewarm_main` 提前 show 过**（透明度 0）。
           那种情况下这里的 ``show()`` 是空操作，只剩一次 opacity 0→1 ——
           这正是预热想要的结果，不用特判。
+
+        ★ **兜底**：``__init__`` 里把透明度设成 0 了，如果这一跳的动画因为任何
+          原因没跑起来（被最小化、被别的窗口挡住、远程桌面、驱动抽风），窗口就
+          永远是"全透明但已显示"—— 用户看到的是"点了登录，程序没出来"。
+          真出现过这种现场，所以挂一个 ``FADE_IN_FAILSAFE_MS`` 的看门狗：
+          到点透明度还不到 0.99，就直接补成 1。
         """
         self.set_user(username)
         self._stack.setCurrentIndex(DEFAULT_PAGE)
         self._sync_nav(DEFAULT_PAGE)
         self.show()
         window_fade_in(self, WINDOW_FADE_IN_MS)
+        QTimer.singleShot(FADE_IN_FAILSAFE_MS, self, self._ensure_opaque)
+
+    def _ensure_opaque(self) -> None:
+        """淡入看门狗：**只在明显没到位时**兜底，正常动画不去碰它。"""
+        if self.windowOpacity() < 0.99:
+            from core import applog
+
+            applog.write(
+                "flow",
+                f"淡入看门狗介入：opacity={self.windowOpacity():.2f}",
+            )
+            self.setWindowOpacity(1.0)
 
     # ---------------------------------------------------------------- 内部
     def _nav_to(self, index: int) -> None:

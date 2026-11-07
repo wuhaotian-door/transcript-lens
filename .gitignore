@@ -51,3 +51,6 @@ transcript-lens-selfcheck.txt
 transcript-lens-bootcheck.txt
 transcript-lens-bootcheck.png
 release/
+
+# 单文件 exe 的解包目录（--runtime-tmpdir "." 会在 exe 旁边建一个 _MEIxxxxxx）
+_MEI*/

@@ -42,7 +42,9 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+import traceback
+
+from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -64,6 +66,7 @@ from core.crypto_store import (
     UnknownUserError,
     WrongPasswordError,
 )
+from core import applog
 from core.email_recovery import send_recovery_mail, send_verification_mail
 from core.recovery import (
     EMAIL_CODE_LENGTH,
@@ -105,6 +108,9 @@ SLOGAN = "把成绩单，变成能坐下来谈的东西"
 #: 密码最短长度（本地单机工具，不做复杂度评分）
 MIN_PASSWORD_LENGTH = 8
 
+#: 淡出看门狗的时限：到点还没走完就直接接管转场（见 _force_leave）
+LEAVE_FAILSAFE_MS = 1600
+
 _BRAND_WIDTH = 300
 
 
@@ -135,6 +141,8 @@ class LoginWindow(QWidget):
         self.setWindowOpacity(0.0)
         #: 防止淡出过程中被再次触发登录
         self._leaving = False
+        #: 已经发出过 ``logged_in``（淡出完成或看门狗接管，二者只允许其一）
+        self._left = False
 
         self._build()
         install_chrome(self, self._card, corners=[self._title_bar, self._brand])
@@ -481,6 +489,7 @@ class LoginWindow(QWidget):
             return
 
         self._set_status("正在校验密码（PBKDF2 派生中，约 0.3 秒）…")
+        applog.write("login", f"开始校验：{name}", root=self._data_root)
         try:
             session = self._store.login(name, password)
         except UnknownUserError:
@@ -506,8 +515,33 @@ class LoginWindow(QWidget):
             self._set_status(f"登录失败：{exc}", error=True)
             return
 
-        self._handle_remember(session.username)
-        self._leave(session.username)
+        # ★ 密码校验通过之后的每一步都可能抛**非 CryptoError**（磁盘写保护、
+        #   杀软锁文件、属性名写错……）。以前这些异常会直接从按钮槽里冒出去：
+        #   Qt 只往 stderr 打一行（windowed exe 等于丢进黑洞），界面就永远
+        #   停在「PBKDF2 派生中」上 —— 用户看到的是"点了没反应"。
+        #   现在一律兜住：落日志 + 弹窗 + 把状态改回来，而且**不锁死**
+        #   ``self._leaving``，用户可以直接再点一次。
+        applog.write("login", f"密码通过：{session.username}", root=self._data_root)
+        try:
+            self._handle_remember(session.username)
+            self._leave(session.username)
+        except Exception as exc:  # noqa: BLE001 - 兜底就是本函数的职责
+            applog.write(
+                "login",
+                "进入主界面前出错：" + "".join(
+                    traceback.format_exception(type(exc), exc, exc.__traceback__)
+                ).replace("\n", "\n    "),
+                root=self._data_root,
+            )
+            self._leaving = False
+            self._set_status(f"进入主界面失败：{exc}", error=True)
+            QMessageBox.critical(
+                self,
+                "进不去主界面",
+                f"密码是对的，但进入主界面这一步出错了：\n\n{exc}\n\n"
+                f"详细日志：{applog.log_path(self._data_root)}\n"
+                "可以直接再点一次「登录」。",
+            )
 
     def _handle_remember(self, username: str) -> None:
         """记 / 不记自动登录。失败不拦登录 —— 那只是便利功能。"""
@@ -530,15 +564,37 @@ class LoginWindow(QWidget):
 
         ★ 先淡出再让位：直接 ``hide()`` 会"啪"地一下消失，
           而 Spec 要求登录窗淡出 + 主窗淡入的连贯转场。
+
+        ★ **兜底**：淡出动画靠 ``windowOpacity`` 走 ``finished``，而某些环境
+          （远程桌面、被别的窗口挡住、显卡驱动抽风）动画可能永远不结束；
+          那样 ``logged_in`` 就发不出去，用户看到的是"点完登录，窗口还在，
+          也不报错"。所以再挂一个 ``LEAVE_FAILSAFE_MS`` 的看门狗：
+          到点还没走就直接接管这一次转场。
         """
         self._leaving = True
         self._set_status(f"欢迎回来，{username}。正在进入…")
+        applog.write("login", f"准备进入主界面：{username}", root=self._data_root)
 
         def _after() -> None:
+            if self._left:
+                return
+            self._left = True
+            applog.write("login", "淡出完成，发 logged_in", root=self._data_root)
             self.hide()
             self.logged_in.emit(username)
 
+        QTimer.singleShot(LEAVE_FAILSAFE_MS, self, self._force_leave)
         window_fade_out(self, 220, _after)
+
+    def _force_leave(self) -> None:
+        """看门狗：淡出没走完也把这次登录推出去（**只推一次**）。"""
+        if not self._leaving or self._left:
+            return
+        applog.write("login", "淡出看门狗接管", root=self._data_root)
+        self._left = True
+        self.setWindowOpacity(1.0)
+        self.hide()
+        self.logged_in.emit(self._user_box.currentText().strip())
 
     # ------------------------------------------------------------ 发送验证码
     def _do_send_code(self) -> None:

@@ -37,6 +37,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
@@ -70,6 +71,13 @@ __all__ = [
 
 #: 备份目录名前缀（charter 8.2：``backup_v{old}_{timestamp}``）
 BACKUP_PREFIX = "backup_v"
+
+#: 备份时**不抄**的顶层目录：体积大、且丢了能重建（重新下载 / 重装 / 本来就是日志）。
+#: 真正不可再生的数据（``users.json`` / ``app.salt`` / ``u_*``）一个字都不省。
+#:
+#: ★ 只按**顶层**判（``backup_vault._skip`` 用 :func:`_dir_key` 比层级）—— 同名的
+#:   ``u_<uid>/cache/`` 里是删了就回不来的聊天历史，不能跟着被跳过。
+SKIP_DIR_NAMES = frozenset({"models", "runtime", "logs", "cache"})
 
 #: 时间戳格式：``YYYYMMDD_HHMMSS``
 STAMP_FORMAT = "%Y%m%d_%H%M%S"
@@ -186,6 +194,21 @@ def _lift_1_9_1_to_1_9_2(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def _lift_1_9_2_to_1_9_3(data: dict[str, Any]) -> dict[str, Any]:
+    """1.9.2 → 1.9.3：**没有数据结构变化**，只多了"可以不备份哪些目录"。
+
+    v1.9.3 全部是启动可靠性修复：
+
+    * ``logs/app.log`` —— 新增运行期日志（以前 windowed exe 出问题完全没痕迹）；
+    * 备份改为**跳过** ``models`` / ``runtime`` / ``logs`` / ``cache``
+      （见 :data:`SKIP_DIR_NAMES`）—— 备份里少几个可重建的目录，不影响老库读取；
+    * 单文件包改成解到 exe 所在目录（打包参数，与数据无关）。
+
+    老库原样读得动，所以这一跳只抬标记。
+    """
+    return data
+
+
 #: 版本链：``(起点, 终点, 变换函数)``。
 #:
 #: ★ 这是"未来版本在此添加分支"的那张表（任务书 2.3）。加一跳只需要
@@ -198,6 +221,7 @@ _STEPS: tuple[tuple[str, str, Callable[[dict[str, Any]], dict[str, Any]]], ...] 
     ("1.8.1", "1.9", _lift_1_8_1_to_1_9),
     ("1.9", "1.9.1", _lift_1_9_to_1_9_1),
     ("1.9.1", "1.9.2", _lift_1_9_1_to_1_9_2),
+    ("1.9.2", "1.9.3", _lift_1_9_2_to_1_9_3),
 )
 
 
@@ -272,6 +296,19 @@ def _unique_dir(parent: Path, name: str) -> Path:
     return candidate
 
 
+def _dir_key(path: str | Path) -> str:
+    """目录的**归一化比较键**（大小写、结尾分隔符、``.`` 段都不敏感）。
+
+    ``copytree`` 的 ``ignore`` 回调把目录当字符串给出来（可能是 ``"C:\\\\x\\\\y"``
+    也可能是 ``"C:/x/y"``），直接和 ``Path`` 比会假不等 —— 那样"只在顶层跳过"
+    就会变成"每一层都跳过"，而 ``u_<uid>/cache/`` 里存的是不可重建的聊天历史。
+    """
+    try:
+        return os.path.normcase(os.path.realpath(str(path)))
+    except OSError:  # pragma: no cover - 真出不来就退回字符串比较
+        return os.path.normcase(str(path))
+
+
 def backup_vault(vault_path: str | Path, old_version: str = "") -> Path:
     """把整个加密库目录复制一份，返回备份目录。
 
@@ -292,12 +329,30 @@ def backup_vault(vault_path: str | Path, old_version: str = "") -> Path:
 
     version = normalize_version(old_version) or _version_from_disk(source)
 
-    def _skip(_dir: str, names: list[str]) -> set[str]:
-        # 跳过已有的备份（否则套娃）和临时文件
+    root_key = _dir_key(source)
+
+    def _skip(directory: str, names: list[str]) -> set[str]:
+        # 跳过已有的备份（否则套娃）、临时文件，以及**可重建的大目录**。
+        #
+        # ★ 为什么必须跳过 models / runtime / logs：
+        #   本地模型动辄 1~5 GB，抄一份要几十秒到几分钟。v1.9.2 的现场就是
+        #   「点迁移 → 拷贝 1.1 GB 期间被占用 → 抛异常 → 迁移没做成」，
+        #   而每次都还多留一份 GB 级备份。这三类目录丢了都能重建
+        #   （models 重新下载、runtime 重装引擎、logs 本来就是日志），
+        #   真正不能丢的是 users.json / app.salt / u_*/ —— 那些照旧全备。
+        #
+        # ★★ 只在**数据根目录这一层**跳（v1.9.3 修）：``u_<uid>/cache/`` 里放的是
+        #   按学生分开的 AI 辅导聊天历史（``chat_history_<学号>.json.enc``），
+        #   那是**删了就再也长不回来**的用户数据，不能因为目录名叫 cache 就被
+        #   备份漏掉。copytree 的 ignore 会在每一层目录被调用，所以必须自己判层级。
+        if _dir_key(directory) != root_key:
+            return {name for name in names if name.startswith(BACKUP_PREFIX) or name.endswith(".tmp")}
         return {
             name
             for name in names
-            if name.startswith(BACKUP_PREFIX) or name.endswith(".tmp")
+            if name.startswith(BACKUP_PREFIX)
+            or name.endswith(".tmp")
+            or name in SKIP_DIR_NAMES
         }
 
     target = _unique_dir(source, f"{BACKUP_PREFIX}{version}_{_stamp()}")

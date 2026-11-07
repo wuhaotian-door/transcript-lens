@@ -108,6 +108,7 @@ CHECK_MODULES: tuple[str, ...] = (
     "core.archival",
     "core.crypto_store",
     "core.user_store",
+    "core.applog",
     "core.import_workers",
     "core.scholarship",
     "core.database",
@@ -2169,7 +2170,15 @@ class AppFlow:
             window.show()
         except Exception:  # noqa: BLE001 - 优化失败不能拦住启动
             import traceback as _tb
+            from core import applog
 
+            # ★ 以前这里只 print_exc() —— windowed exe 没有 stderr，
+            #   于是"预热失败"在现场完全不可见，用户只看到转场卡住。
+            applog.write(
+                "prewarm",
+                _tb.format_exc().replace("\n", "\n    "),
+                root=self.root,
+            )
             _tb.print_exc()
             self.main = None
             return
@@ -2222,8 +2231,27 @@ class AppFlow:
 
     def _on_logged_in(self, username: str) -> None:
         """登录窗已经自己淡出并 hide 了，这里接欢迎页，再让主窗口淡入。"""
+        from core import applog
+
+        applog.write("flow", f"收到 logged_in：{username}", root=self.root)
         self.login = None
-        self.greet_then_main(username)
+        try:
+            self.greet_then_main(username)
+        except Exception as exc:  # noqa: BLE001 - 登录后卡死比崩溃更难查
+            import traceback as _tb
+            from PySide6.QtWidgets import QMessageBox
+
+            applog.write(
+                "flow",
+                "进入主界面失败：" + _tb.format_exc().replace("\n", "\n    "),
+                root=self.root,
+            )
+            QMessageBox.critical(
+                None,
+                "进不去主界面",
+                f"{exc}\n\n详细日志：{applog.log_path(self.root)}\n"
+                "程序没有退出，可以关掉重新打开。",
+            )
 
 
 def _any_visible_splash(app) -> bool:
@@ -2497,16 +2525,72 @@ def run_startup_migration(root: str | None = None) -> None:
         return
 
     store = CryptoStore(_Path(root) if root else None)
+    from core import applog as _applog
+
+    _applog.write(
+        "migrate", f"开始迁移 {status.version} → {_CUR}（先整目录备份）", root=root
+    )
     try:
         outcome = migrate_store(store)
     except MigrationError as exc:
+        _applog.write("migrate", f"迁移失败：{exc}", root=root)
+        latest = _latest_backup_hint(root)
         QMessageBox.critical(
             None,
             "迁移失败",
-            f"{exc}\n\n旧数据没有被改动，程序仍可继续使用。",
+            f"{exc}\n\n旧数据没有被改动，程序仍可继续使用。"
+            + (f"\n\n{latest}" if latest else "")
+            + f"\n\n详细日志：{_applog.log_path(root)}",
         )
         return
+    _applog.write("migrate", f"迁移完成：{outcome.detail}", root=root)
     QMessageBox.information(None, "迁移完成", outcome.detail)
+
+
+def _latest_backup_hint(root: str | None) -> str:
+    """给迁移失败弹窗补一句"哪些目录没被备份"的说明（拿不到就返回空串）。"""
+    try:
+        from pathlib import Path as _Path
+
+        base = _Path(root) if root else None
+        if base is None:
+            from core.crypto_store import default_root
+
+            base = _Path(default_root())
+        free = _free_gb(base)
+        skipped = "models / runtime / logs / cache"
+        size = _dir_gb(base / "models")
+        if size <= 0:
+            return ""
+        return (
+            f"提示：{skipped} 这些目录不参与备份（体积大且可重建），"
+            f"所以备份快很多；数据目录里 models 约占 {size:.1f} GB。"
+            + (f" 当前磁盘剩余 {free:.1f} GB。" if free > 0 else "")
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _dir_gb(path) -> float:
+    try:
+        if not path.is_dir():
+            return 0.0
+        total = 0
+        for item in path.rglob("*"):
+            if item.is_file():
+                total += item.stat().st_size
+        return total / (1024**3)
+    except OSError:
+        return 0.0
+
+
+def _free_gb(path) -> float:
+    try:
+        import shutil
+
+        return shutil.disk_usage(str(path)).free / (1024**3)
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 def run_pending_update(root: str | None = None) -> bool:
@@ -2592,6 +2676,20 @@ def main(argv: list[str] | None = None) -> int:
 
     app = make_app([sys.argv[0], *args])
     flow = AppFlow(app)
+
+    # ★ 日志钩子要在**任何业务之前**装好：下面两步（更新交接 / 迁移）
+    #   都可能抛异常，而 `--windowed` 的 exe 没有 stderr 可以看。
+    from core import applog
+    from core.version import CURRENT_VERSION as _VERSION
+
+    applog.install_excepthook(flow.root)
+    applog.install_faulthandler(flow.root)
+    applog.write(
+        "boot",
+        f"启动 v{_VERSION} · frozen={bool(getattr(sys, 'frozen', False))} · "
+        f"root={flow.root or '(默认)'}",
+        root=flow.root,
+    )
 
     # ★ 次序有讲究，两步都不许挪到开屏后面：
     #
