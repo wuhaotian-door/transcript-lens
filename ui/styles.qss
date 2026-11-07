@@ -50,8 +50,8 @@ QFrame#WindowTitleBar {
     background: #F8FAFC;
     border: none;
     border-bottom: 1px solid #E2E8F0;
-    border-top-left-radius: 12px;
-    border-top-right-radius: 12px;
+    border-top-left-radius: 11px;
+    border-top-right-radius: 11px;
 }
 QFrame#WindowTitleBar[tlMaximized="true"] {
     border-top-left-radius: 0;
@@ -145,8 +145,8 @@ QFrame#CardFlat {
 QFrame#Sidebar {
     background: #1E293B;
     border: none;
-    border-top-left-radius: 12px;
-    border-bottom-left-radius: 12px;
+    border-top-left-radius: 11px;
+    border-bottom-left-radius: 11px;
 }
 QFrame#Sidebar[tlMaximized="true"] {
     border-top-left-radius: 0;
@@ -193,7 +193,7 @@ QFrame#TopBar {
     background: #FFFFFF;
     border: none;
     border-bottom: 1px solid #E2E8F0;
-    border-top-right-radius: 12px;
+    border-top-right-radius: 11px;
 }
 QFrame#TopBar[tlMaximized="true"] {
     border-top-right-radius: 0;
@@ -449,7 +449,7 @@ QFrame#LoginCard {
 QFrame#LoginBrand {
     background: #1E293B;
     border: none;
-    border-bottom-left-radius: 12px;
+    border-bottom-left-radius: 11px;
 }
 QFrame#LoginBrand[tlMaximized="true"] {
     border-bottom-left-radius: 0;
