@@ -44,8 +44,22 @@
       连一个 8MB 的 hello-world 单文件 exe 也一样（同样的报错、同样的退出码 -1）。
       把 TEMP 指到**本项目目录树内**（如 ``dist\_tmp``）就正常（自检 ALL OK，退出码 0），
       指到 %TEMP%、桌面、用户目录根一律失败。结论：**本机安全软件/沙箱策略在拦**，
-      不是打包配置问题。本机验证请用 ``dist\launch.bat``（自动把 TEMP 设到 dist\_tmp）
-      或 ``-Target debug`` 的 onedir 产物。
+      不是打包配置问题。
+
+      ★★ 根治办法（2026-11-07 实测）：给单文件包加 ``--runtime-tmpdir``，让启动器
+      **解到 exe 自己所在的目录**，根本不碰 %TEMP%。验证方式：同一个 hello-world
+      单文件包，默认版本在 %TEMP% 和用户目录根都报 ``Could not create temporary
+      directory!``，加了 ``--runtime-tmpdir "."`` 之后**两处都是 exit 0**。
+      所以 release 目标固定带 ``--runtime-tmpdir $RuntimeTmpDir``（默认 ``"."``）。
+
+      ⚠️ 两个必须知道的边界：
+        1. ``--runtime-tmpdir`` 里的相对路径是相对**启动时的工作目录（CWD）**，
+           不是 exe 所在目录。双击启动时 CWD 就是 exe 所在目录（Explorer 的行为），
+           所以正常双击没问题；但从别的目录用命令行启动、或快捷方式把"起始位置"
+           改到别的目录时，解包会落在那个目录里 —— 那里不可写就会失败。
+           交互式排查用 ``dist\launch.bat``（它顺手把 TEMP 指到 dist\_tmp）。
+        2. 路径**不支持环境变量**（写 ``%TEMP%`` 会被当成字面量），
+           而且上级目录必须**已经存在** —— 指 ``_tmp`` 这种不存在的子目录会直接失败。
 
 #>
 param(
@@ -54,7 +68,9 @@ param(
     [switch]$Both,
     #: release 也带控制台（产物叫 transcript-lens-console.exe），用来查启动崩溃
     [switch]$ShowConsole,
-    [switch]$SkipSelfCheck
+    [switch]$SkipSelfCheck,
+    #: 单文件版的解包根目录。**默认 "."：解到 exe 自己所在目录**（见文件头 NOTES）
+    [string]$RuntimeTmpDir = '.'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -270,11 +286,11 @@ function Build-One {
     elseif ($ShowConsole) {
         # 诊断用：单文件但不隐藏控制台，启动期的报错能直接看见
         $name = 'transcript-lens-console'
-        $extra = @('--onefile', '--console')
+        $extra = @('--onefile', '--console', '--runtime-tmpdir', $RuntimeTmpDir)
     }
     else {
         $name = 'transcript-lens'
-        $extra = @('--onefile', '--windowed')
+        $extra = @('--onefile', '--windowed', '--runtime-tmpdir', $RuntimeTmpDir)
     }
 
     Write-Host "`n=== 打包 $Kind -> dist\$name$(if ($Kind -eq 'release') { '.exe' }) ===" -ForegroundColor Cyan
