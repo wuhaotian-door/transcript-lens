@@ -52,6 +52,10 @@ comes out of an encrypted local store** with fixed, reproducible definitions.
 - One-click download (resume + SHA256), install, uninstall; failed downloads fall back to
   "copy link"
 
+**Diagnostics**
+- Every critical error dialog has a **Copy error info** button that puts the full
+  traceback, log path, and log tail on the clipboard
+
 ## Privacy and security
 
 | | |
@@ -72,10 +76,10 @@ No real grade sheets or credentials are in this repository — test data is limi
 Large builds are split into parts; concatenate them on Windows:
 
 ```bat
-copy /b transcript-lens-v1.9.2.exe.part1+transcript-lens-v1.9.2.exe.part2+transcript-lens-v1.9.2.exe.part3 transcript-lens.exe
+copy /b transcript-lens-v1.9.3.exe.part1+transcript-lens-v1.9.3.exe.part2+transcript-lens-v1.9.3.exe.part3 transcript-lens.exe
 ```
 
-> The three parts concatenate to **240,387,480 bytes** (~229 MB). Just double-click the
+> The three parts concatenate to **240,408,108 bytes** (~229 MB). Just double-click the
 > result: on first launch it migrates data from the previous version automatically.
 
 **From source** (Windows 10/11, Python 3.13):
@@ -124,7 +128,7 @@ use the onedir build or `set TEMP=<writable dir>` before launching.
 core/        parsing, validation, weighting, encrypted storage, logical-table API, updater, inference
 ui/          PySide6 interface (frameless windows, pages, dialogs, stylesheet)
 ai/          local templates and a disabled cloud adapter skeleton
-tests/       unit tests and fake fixtures (865+ cases)
+tests/       unit tests and fake fixtures (887+ cases)
 tools/       release helpers (part splitting)
 update/      version and model manifests (read from Gitee raw)
 docs/        developer handbook, update guide, distribution and release SOP

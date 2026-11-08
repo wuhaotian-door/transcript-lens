@@ -1,7 +1,7 @@
 {
   "schema": 1,
-  "version": "1.9.2",
-  "published": "2026-11-07",
+  "version": "1.9.3",
+  "published": "2026-11-09",
   "_doc": [
     "程序更新清单。v1.9 起 core/updater.check_for_update() 先读这份文件（GITEE_RAW_MANIFEST），读不到才退回解析 Gitee 发行版正文（老路子，已标 deprecated）。",
     "★ 结构必须是**顶层 app** 段 —— 2026-10-10 踩过一次：写成 `files.app` 那种嵌套结构时 parse_manifest() 直接给 (None, '清单里没有 app 段')，清单路线**静默失效**、退回老路线，而界面上看不出任何异常。判据：tests/test_manifest.py::test_仓库清单只允许空模板或完全填好（**半填也不许**）。",
@@ -14,24 +14,24 @@
   ],
   "app": {
     "url": "",
-    "size": 240387480,
-    "sha256": "dff34dbb79d04e46d4342cc2ad96857b64313be784f031eccd8767d266680cb0",
-    "notes": "v1.9.2：学生主档与档案页二级视图、推理后端一键安装、模型中心卡片流、成绩审计与 GPA 方案 1、清库连带清理 AI 聊天缓存；累计包含 v1.9 / v1.9.1 全部改动。",
+    "size": 240408108,
+    "sha256": "107d5fa252d9df6a7ebcd74cf37eb967b4ba78d85d5f0c416dd641db643c3775",
+    "notes": "v1.9.3：启动可靠性（运行期日志 / 登录兜底与看门狗 / 迁移备份跳过可重建目录 / 单文件解包修复）+ 错误弹窗一键复制 traceback 与日志路径；累计包含 v1.9 / v1.9.1 / v1.9.2 全部改动。",
     "parts": [
       {
-        "url": "https://gitee.com/wuhaotiansystem/transcript-lens/releases/download/1.9.2/transcript-lens-v1.9.2.exe.part1",
-        "size": 80129160,
-        "sha256": "4b7c38394d7b9b5adcb836144a28e4104fa7bd0970e92a267ef98440e05c617e"
+        "url": "https://gitee.com/wuhaotiansystem/transcript-lens/releases/download/1.9.3/transcript-lens-v1.9.3.exe.part1",
+        "size": 80136036,
+        "sha256": "b5444e5cd331613c4b75ffae8db501083ce6d2de97065b48c1b8e7bcc6f886b8"
       },
       {
-        "url": "https://gitee.com/wuhaotiansystem/transcript-lens/releases/download/1.9.2/transcript-lens-v1.9.2.exe.part2",
-        "size": 80129160,
-        "sha256": "5a98a950fc4da5fc0f506c02c8cbe57ebc040d55c5cc5701ed2e7bdd7c765c8a"
+        "url": "https://gitee.com/wuhaotiansystem/transcript-lens/releases/download/1.9.3/transcript-lens-v1.9.3.exe.part2",
+        "size": 80136036,
+        "sha256": "5217267a300fe3a1d7f4b7e2e0d156485ef65b11e5a3252f9cab14426f090198"
       },
       {
-        "url": "https://gitee.com/wuhaotiansystem/transcript-lens/releases/download/1.9.2/transcript-lens-v1.9.2.exe.part3",
-        "size": 80129160,
-        "sha256": "6078dfebf3409eeb0df65fae5c182674404aa3ed15d99213361dcbe782efea66"
+        "url": "https://gitee.com/wuhaotiansystem/transcript-lens/releases/download/1.9.3/transcript-lens-v1.9.3.exe.part3",
+        "size": 80136036,
+        "sha256": "05b24d5c7e682395825038e0a70346522b83095cbf9253b00f17f5ba8919bcd2"
       }
     ]
   }

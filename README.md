@@ -46,6 +46,7 @@
 - 宽松档才默认勾选，困难行直接置灰
 
 ### 其他
+- 报错弹窗自带「复制错误信息」：一键把 traceback、日志路径和日志末尾放进剪贴板
 - 双层加密本地存储、批量导入德育分、删除成绩库（带盘点与二次确认）、
   成绩变更审计日志、GPA（标准 4.0 对照表）、在线更新与分片发布
 
@@ -70,11 +71,11 @@
 发布包超过单文件上限时会切成多个分片，Windows 下用命令行合并即可：
 
 ```bat
-copy /b transcript-lens-v1.9.2.exe.part1+transcript-lens-v1.9.2.exe.part2+transcript-lens-v1.9.2.exe.part3 transcript-lens.exe
+copy /b transcript-lens-v1.9.3.exe.part1+transcript-lens-v1.9.3.exe.part2+transcript-lens-v1.9.3.exe.part3 transcript-lens.exe
 ```
 
-> 三片合并后是 **240,387,480 字节**（约 229 MB）。合并完直接双击即可，
-> 第一次启动会自动把上一版的数据迁移到 1.9.2。
+> 三片合并后是 **240,408,108 字节**（约 229 MB）。合并完直接双击即可，
+> 第一次启动会自动把上一版的数据迁移到 1.9.3。
 
 ### 方式二：从源码运行
 
@@ -124,7 +125,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build_exe.ps1 -Both
 core/        解析、校验、加权、加密存储、逻辑表 API、更新器、本地推理
 ui/          PySide6 界面（无边框窗口、页面、对话框、样式）
 ai/          本地模板与云端适配骨架（默认不启用）
-tests/       单元测试与假数据（865+ 用例）
+tests/       单元测试与假数据（887+ 用例）
 tools/       分片发布等辅助脚本
 update/      版本清单与模型清单（Gitee raw 读取）
 docs/        开发总纲、更新手册、分发与发布 SOP
