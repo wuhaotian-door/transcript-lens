@@ -54,3 +54,16 @@ release/
 
 # 单文件 exe 的解包目录（--runtime-tmpdir "." 会在 exe 旁边建一个 _MEIxxxxxx）
 _MEI*/
+
+# ============ 开发日志：绝不入库 ============
+# DSH 会话导出（用户放过来的 zip / 解出来的 jsonl），只用于开发上下文，
+# 不是项目产物。推送前必须确认它们没有被 git add。
+开发日志/
+开发日志*.zip
+开发日志*.7z
+开发日志*.jsonl
+session.v4.jsonl
+subagents/
+
+# 本地临时探针目录（selfcheck / pytest 用）
+.tl_tmp/

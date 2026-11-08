@@ -114,3 +114,21 @@ SKIP_DIR_NAMES = frozenset({"models", "runtime", "logs", "cache"})
   交互式排查用 `dist\launch.bat`（它顺手把 `TEMP` 指到 `dist\_tmp`）。
 - 登录界面「多余线条」仍未定位（见第六节）。
 - 模型下载失败后的「复制链接」兜底、GPA 方案 2/3/4 等 v1.9.2 的"未纳入"项不变。
+
+## 九、v1.9.3 补充：错误弹窗「复制错误信息」
+
+**现场诉求**：报错时只能截图或手打一句"报错了"，没有 traceback、没有日志路径。
+
+- 新增 `ui/error_report.py`：
+  - `install_error_copy(app, root)` 在 QApplication 上装事件过滤器，任何 **Critical
+    图标**的 `QMessageBox` 自动多一个「复制错误信息」按钮；
+  - 点按钮把 **traceback + 日志路径 + 最近 40 行日志** 写进剪贴板，窗口不关；
+  - `install_crash_handler(root)` 接管未捕获异常：先由 `core.applog` 落盘，再在主线程
+    弹带完整 traceback 的错误框（PySide6 槽函数异常会走 `sys.excepthook`，实测）。
+- ★ 按钮不能用 `QMessageBox.addButton()`：实测任何 role 都会触发 `done()` 关窗；
+  现在是普通 `QPushButton` 塞进 `QDialogButtonBox` 的布局。
+- `main()` 的安装次序：`install_error_copy` → `applog.install_excepthook` →
+  `install_crash_handler` → `install_faulthandler`。
+- 判据：`tests/test_error_report.py`（9 条，离屏，桩掉剪贴板，点完不关窗）+
+  `main._error_report_gate_report()`；全量 `pytest` **887 passed**；
+  `--selfcheck` / `--bootcheck` 全绿。

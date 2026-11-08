@@ -1017,3 +1017,16 @@ v1.9.2 之后连着报了四个现场：登录卡住、迁移报错、exe 起不
 没能复现用户说的杂线。★ 规矩：① 先把能查的查干净（像素级、逐层拆）；
 ② **没有被证据指到的改动不要当成"修复"上报**；③ 直接请用户截一张图 —— 这比猜三轮快。
 （已按 §4e 第 2 条统一了子控件圆角半径，但那只是"顺手对齐规矩"，不是修复。）
+
+## 39. ★ 错误弹窗必须能一键复制（v1.9.3 补充）
+
+现场反馈常常只有"报错了"三个字，没有 traceback、没有日志路径。`ui/error_report.py`：
+
+* `install_error_copy(app, root)` 在 QApplication 上装事件过滤器：所有 **Critical 图标**
+  的 QMessageBox 自动多一个「复制错误信息」按钮，点它把 **traceback + 日志路径 + 日志末尾**
+  写进剪贴板。★ **不要改回 `box.addButton()`** —— QMessageBox 会把它当"确定"关窗；
+  现在用普通 QPushButton 塞进 `QDialogButtonBox` 布局，点完窗口留着，复制失败也看得见。
+* `install_crash_handler(root)` 包住 `sys.excepthook`：先让 `core.applog` 落日志，
+  再在主线程弹带完整 traceback 的错误框。`main()` 里两行都必须有，且过滤器在钩子之前装。
+* 判据：`tests/test_error_report.py`（9 条，离屏；点完不关窗、不碰真剪贴板）+
+  `main._error_report_gate_report()`。日志/凭据仍遵守铁律 2，报告里不许出现密码。

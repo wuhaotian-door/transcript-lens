@@ -90,6 +90,7 @@ CHECK_MODULES: tuple[str, ...] = (
     "ui.moral_import_dialog",
     "ui.model_center_dialog",
     "ui.chat_dialog",
+    "ui.error_report",
     "ui.pages",
     "ui.pages.analysis_page",
     "ui.pages.profile_page",
@@ -374,6 +375,12 @@ def _selfcheck_report() -> tuple[bool, str]:
         if line.startswith("FAIL"):
             failures.append("版本迁移检查")
 
+    # --- v1.9.3 补充：错误信息一键复制（traceback + 日志路径）----------------
+    for line in _error_report_gate_report():
+        lines.append(line)
+        if line.startswith("FAIL"):
+            failures.append("错误信息一键复制检查")
+
     # --- 所有模块能否 import（不创建窗口）----------------------------------
     for name in CHECK_MODULES:
         step(f"import {name}", lambda n=name: "ok" if __import__(n) else "ok")
@@ -595,6 +602,94 @@ def _version_migration_report() -> list[str]:
         lines.append(f"FAIL  版本迁移自检抛异常 {exc.__class__.__name__}: {exc}")
     finally:
         shutil.rmtree(work, ignore_errors=True)
+    return lines
+
+
+def _error_report_gate_report() -> list[str]:
+    """v1.9.3 补充：错误弹窗的「复制错误信息」按钮必须真的能拼出完整报告。
+
+    这里**不创建 QApplication、不弹任何窗口**（自检要能无窗口跑），
+    只验三件机械事实：
+
+    1. 按钮文案逐字是「复制错误信息」；
+    2. :func:`ui.error_report.build_error_report` 真的把 traceback / 日志路径 /
+       日志末尾 / 版本号拼进同一段文本（自检给的是固定样例）；
+    3. ``main.py`` 真的安装了过滤器与未捕获异常钩子（静态接线）。
+
+    ★ 为什么第 3 条只查字符串：``main()`` 里真的装一遍要 QApplication，
+      而自检明确不建窗口。行为侧的运行时判据在
+      ``tests/test_error_report.py`` 里（离屏 QApplication 真加按钮、真点一次）。
+    """
+    from pathlib import Path as _Path
+
+    lines: list[str] = []
+    try:
+        from ui.error_report import (
+            COPY_BUTTON_TEXT,
+            MAX_REPORT_CHARS,
+            build_error_report,
+            install_crash_handler,
+            install_error_copy,
+        )
+
+        sample = build_error_report(
+            title="自检样例",
+            message="样例错误正文",
+            traceback_text="Traceback (most recent call last):\nRuntimeError: 自检",
+            log_path=r"C:\selfcheck\logs\app.log",
+            log_tail="2026-01-01 00:00:00 [boot] 自检",
+            version="9.9.9",
+            now="2026-01-01 00:00:00",
+        )
+        checks = {
+            "按钮文案": COPY_BUTTON_TEXT == "复制错误信息",
+            "traceback": "RuntimeError: 自检" in sample,
+            "日志路径": r"C:\selfcheck\logs\app.log" in sample,
+            "日志末尾": "[boot] 自检" in sample,
+            "版本号": "v9.9.9" in sample,
+            "两个入口": callable(install_error_copy) and callable(install_crash_handler),
+        }
+        bad = [name for name, ok in checks.items() if not ok]
+        if bad:
+            lines.append("FAIL  错误信息一键复制缺少：" + "、".join(bad))
+        else:
+            lines.append(
+                "ok    错误信息一键复制                    traceback + 日志路径 + 日志末尾"
+            )
+
+        truncated = build_error_report(
+            title="超长样例",
+            message="x" * (MAX_REPORT_CHARS + 100),
+            traceback_text="tb",
+            log_path="p",
+            version="9.9.9",
+            now="2026-01-01 00:00:00",
+        )
+        if "（错误信息过长，已截断）" not in truncated:
+            lines.append("FAIL  超长错误报告没有截断")
+        else:
+            lines.append("ok    超长错误报告会截断                 不把聊天框卡住")
+
+        try:
+            source = _Path(__file__).read_text(encoding="utf-8")
+        except OSError:
+            source = ""
+        if not source:
+            lines.append("ok    main.py 接线检查跳过               打包后读不到入口源码")
+        else:
+            missing = [
+                name
+                for name in ("install_error_copy(", "install_crash_handler(")
+                if name not in source
+            ]
+            if missing:
+                lines.append("FAIL  main.py 没有安装：" + "、".join(missing))
+            else:
+                lines.append(
+                    "ok    main.py 已接线                    错误框过滤器 + 未捕获异常钩子"
+                )
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"FAIL  错误信息一键复制自检抛异常 {type(exc).__name__}: {exc}")
     return lines
 
 
@@ -2681,8 +2776,12 @@ def main(argv: list[str] | None = None) -> int:
     #   都可能抛异常，而 `--windowed` 的 exe 没有 stderr 可以看。
     from core import applog
     from core.version import CURRENT_VERSION as _VERSION
+    from ui.error_report import install_crash_handler, install_error_copy
 
+    # ★ 先装"复制错误信息"过滤器，再装异常钩子：钩子弹出的框也要有那个按钮。
+    install_error_copy(app, flow.root)
     applog.install_excepthook(flow.root)
+    install_crash_handler(flow.root)
     applog.install_faulthandler(flow.root)
     applog.write(
         "boot",

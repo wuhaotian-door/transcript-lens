@@ -11,8 +11,8 @@
 > `SGMS_v1.7_Dev_Charter.md`、`SGMS_v1.8_Dev_Charter.md`、
 > `ACTIVATION_REMOVAL.md`。文末第 20 节有旧引用对照表。
 >
-> 对应版本：**v1.8**（`core/version.py` 的 `CURRENT_VERSION`）
-> 最后更新：2026-09-27
+> 对应版本：**v1.9.3**（`core/version.py` 的 `CURRENT_VERSION`）
+> 最后更新：2026-11-08
 
 ---
 
@@ -853,7 +853,7 @@ v1.9 第二阶段补完**模型中心增强**（负载指示 / 卸载 / 复制�
 
 ## 十八、测试与闸门清单
 
-### 18.1 `--selfcheck` 的 10 条闸门（`main.py`）
+### 18.1 `--selfcheck` 的 11 条闸门（`main.py`）
 
 | 闸门函数 | 管什么 |
 |---|---|
@@ -867,6 +867,7 @@ v1.9 第二阶段补完**模型中心增强**（负载指示 / 卸载 / 复制�
 | `_category_policy_report()` | 必修/限选/选修三类别独立（行为门） |
 | `_version_migration_report()` | 版本标记（两键相等）+ 备份可用性 |
 | `_docs_gate_report()` | **本文档唯一真源**：`docs/` 白名单 + 无死链接 + `AGENTS.md` 指向本文 |
+| `_error_report_gate_report()` | **v1.9.3 补充**：错误弹窗复制报告（traceback / 日志路径 / 截断） |
 
 跑法：`python main.py --selfcheck`；另有 `--bootcheck`（真实启动流程，
 退出码本身就是断言）。
@@ -888,8 +889,9 @@ v1.9 第二阶段补完**模型中心增强**（负载指示 / 卸载 / 复制�
 | `tests/test_manifest.py` | `update/manifest.json` 优先 + 退回旧路线 + **仓库那份清单不许半填** + `app.parts` | 58 |
 | `tests/test_updater_parts.py` | **分片下载与拼接**（逐片校验 / 顺序 / 整体校验 / 取消与续传，只打本机 http.server） | 15 |
 | `tests/test_version_migration.py` | **版本链无断档**（§23b：升版本号必须补一跳）+ 迁移记账 | 19 |
+| `tests/test_error_report.py` | **错误信息一键复制**：报告要素 / 超长截断 / Critical 弹窗长按钮 / 点完不关窗 / 未捕获异常钩子 | 9 |
 
-（v1.8.1 全量实测 **307 passed**。加 `test_version_migration.py` 的原因见下。）
+（v1.9.3 全量实测 **887 passed**。加 `test_version_migration.py` 的原因见下。）
 
 ★ **`tests/test_version_migration.py` 是 2026-10-10 补的**：以前"升版本号要补迁移跳"
 这条只有 `%TEMP%` 里的开发套件守着，而 **`%TEMP%` 会被系统清理** ——
@@ -2494,3 +2496,29 @@ v1.9.2 发出去之后，现场报回来四个症状。四个都不是"功能没
   （`#WindowTitleBar` / `#LoginBrand` / `#Sidebar` / `#TopBar`），但它不是已证实的修复。
 * 主界面 6 页的接触表（`%TEMP%\tl_main_pages.png`）在 100% DPI 下没有看到杂线，
   但 50% 缩放会把 1px 线抹掉，同样需要 150% DPI 的真机截图才能定论。
+
+## 二十八、v1.9.3 补充：错误信息一键复制
+
+**诉求**：报错弹窗里加「复制错误信息」，点一下把 traceback 和日志路径放进剪贴板。
+
+**实现**：`ui/error_report.py`（零依赖 / 不联网）
+
+* `install_error_copy(app, root)`：QApplication 事件过滤器。任何 **Critical 图标**的
+  `QMessageBox` 在 Show 时自动多一个按钮。按钮用普通 `QPushButton` 塞进
+  `QDialogButtonBox` 的布局 —— **不能用 `QMessageBox.addButton()`**：实测任何 role
+  （Action/Help/Reset/Apply/No/Yes）都会触发 `done()` 关窗，复制失败时用户就看不到错误了。
+* 报告 = 时间 / 版本 / 标题 / 正文 / traceback / 日志路径 / 最近 40 行日志，超 20 万字符截断。
+  traceback 在 Show 事件里用 `sys.exc_info()` 抓（此时 `QMessageBox.critical` 还停在
+  调用方的 except 块里，实测拿得到）。
+* `install_crash_handler(root)`：包住 `sys.excepthook`，先让 `core.applog` 落盘，再在主线程
+  用 `QTimer.singleShot(0, ...)` 弹带完整 traceback 的 Critical 框。PySide6 6.9.2 的槽函数
+  异常会走 `sys.excepthook`（实测），所以这条兜住"按钮点下去没反应"。
+* `main()` 的安装次序：`install_error_copy` → `core.applog.install_excepthook` →
+  `install_crash_handler` → `install_faulthandler`。
+
+**判据**：`tests/test_error_report.py`（9 条，离屏，桩掉剪贴板）+
+`main._error_report_gate_report()`（报告要素 / 截断 / main 接线）。全量 `pytest` 887 passed；
+`--selfcheck` 与 `--bootcheck` 全绿。
+
+**边界**：只给 Critical 图标弹窗加按钮；普通提示/警告不加。没有关联 Python 异常的弹窗
+（比如"密码错误"）报告里会如实写"没有 traceback"，但仍带日志路径和日志末尾。
