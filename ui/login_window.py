@@ -552,11 +552,18 @@ class LoginWindow(QWidget):
                 # 没勾就顺手清掉旧的：否则上次的残留会让人
                 # "明明没勾却还是免密码进来"
                 clear_token(self._data_root)
-        except (CryptoError, ValueError) as exc:
+        except (CryptoError, ValueError, OSError) as exc:
+            applog.write("login", f"自动登录设置失败：{type(exc).__name__}", root=self._data_root)
+            detail = (
+                "本次仍然正常登录；未能保存本次自动登录设置。"
+                if self._remember.isChecked()
+                else "本次仍然正常登录，但旧的自动登录凭证可能仍然有效。"
+                     "请在数据目录恢复可写后重试取消自动登录。"
+            )
             QMessageBox.warning(
                 self,
                 "自动登录没能设置",
-                f"{exc}\n\n这次仍然正常登录，只是下次还需要输入密码。",
+                f"{exc}\n\n{detail}",
             )
 
     def _leave(self, username: str) -> None:

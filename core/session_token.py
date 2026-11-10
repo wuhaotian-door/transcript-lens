@@ -88,6 +88,7 @@ def save_token(
 
     Raises:
         ValueError: 用户名为空，或者载荷里混进了白名单之外的字段。
+        CryptoError: 令牌写入失败；调用方应提示后继续本次密码登录。
     """
     name = (username or "").strip()
     if not name:
@@ -103,7 +104,12 @@ def save_token(
     if extra:
         raise ValueError(f"令牌里出现了不该有的字段：{sorted(extra)}")
 
-    save_encrypted(payload, token_path(root), root=root)
+    try:
+        save_encrypted(payload, token_path(root), root=root)
+    except OSError as exc:
+        raise CryptoError(
+            "自动登录凭证未能保存，请检查数据目录写入权限、磁盘空间和文件占用。"
+        ) from exc
     return token_path(root)
 
 
@@ -125,19 +131,24 @@ def token_info(root: str | Path | None = None, *, now: datetime | None = None) -
     """
     path = token_path(root)
     info: dict[str, Any] = {
-        "present": path.exists(),
+        "present": False,
         "valid": False,
         "username": "",
         "issued": "",
         "exp": "",
         "reason": "missing",
     }
+    try:
+        info["present"] = path.exists()
+    except OSError:
+        info["reason"] = "corrupt"
+        return info
     if not info["present"]:
         return info
 
     try:
         payload = load_encrypted(path, root=root)
-    except CryptoError:
+    except (CryptoError, OSError):
         # 令牌坏了**不等于**出事：最坏结果就是"这次要输密码"，
         # 没有任何数据会因此丢失，所以这里不抛，只如实说原因。
         info["reason"] = "corrupt"
@@ -165,7 +176,7 @@ def token_info(root: str | Path | None = None, *, now: datetime | None = None) -
         if CryptoStore(root).load_users().find(username) is None:
             info["reason"] = "unknown_user"
             return info
-    except CryptoError:
+    except (CryptoError, OSError):
         info["reason"] = "corrupt"
         return info
 

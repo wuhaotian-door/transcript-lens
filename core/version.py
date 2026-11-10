@@ -68,7 +68,7 @@ __all__ = [
 #:
 #: ★ 改完这里必须**同时**去 ``core/migrator.py`` 的 ``_STEPS`` 补一跳
 #:   （哪怕只是 ``return data``）—— 见 AGENTS.md §23b，忘了就是老用户启动即报错。
-CURRENT_VERSION = "1.9.3"
+CURRENT_VERSION = "1.9.4"
 
 #: 加密库里存数据版本用的键（charter 8.1）
 VAULT_VERSION_KEY = "__vault_version__"

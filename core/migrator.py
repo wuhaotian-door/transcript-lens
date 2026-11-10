@@ -33,10 +33,14 @@
 备份放在数据目录**里面**（charter 8.2 指定的路径）。那么"备份整个目录"
 就必须跳过已有的 ``backup_*`` —— 否则备份会把自己套娃进去，
 每迁移一次目录就翻一倍。
+
+数据目录不能创建备份时，改用同级或本机 LocalAppData 下的
+``SGMS_backups/<源目录标识>/`` 持久目录；实际位置随迁移结果返回。
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 from dataclasses import dataclass
@@ -44,7 +48,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from core.crypto_store import CryptoStore, UserIndex
+from core.crypto_store import CryptoStore, UserIndex, _atomic_write_bytes
 from core.version import (
     CURRENT_VERSION,
     DEFAULT_VAULT_VERSION,
@@ -209,6 +213,11 @@ def _lift_1_9_2_to_1_9_3(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def _lift_1_9_3_to_1_9_4(data: dict[str, Any]) -> dict[str, Any]:
+    """1.9.3 → 1.9.4：存储容灾修复不改变数据格式，只提升版本标记。"""
+    return data
+
+
 #: 版本链：``(起点, 终点, 变换函数)``。
 #:
 #: ★ 这是"未来版本在此添加分支"的那张表（任务书 2.3）。加一跳只需要
@@ -222,6 +231,7 @@ _STEPS: tuple[tuple[str, str, Callable[[dict[str, Any]], dict[str, Any]]], ...] 
     ("1.9", "1.9.1", _lift_1_9_to_1_9_1),
     ("1.9.1", "1.9.2", _lift_1_9_1_to_1_9_2),
     ("1.9.2", "1.9.3", _lift_1_9_2_to_1_9_3),
+    ("1.9.3", "1.9.4", _lift_1_9_3_to_1_9_4),
 )
 
 
@@ -283,17 +293,20 @@ def _is_backup_dir(path: Path) -> bool:
 
 
 def _unique_dir(parent: Path, name: str) -> Path:
-    """同名目录已存在就加 ``-2`` / ``-3``。
+    """独占创建目录；同名已存在就加 ``-2`` / ``-3``。
 
     同一秒里连迁两次（自动化测试就会）直接 copytree 会**把上一次备份覆盖掉**，
     那是"备份"这两个字最不该有的行为。
     """
     candidate = parent / name
     suffix = 2
-    while candidate.exists():
-        candidate = parent / f"{name}-{suffix}"
-        suffix += 1
-    return candidate
+    while True:
+        try:
+            candidate.mkdir()
+            return candidate
+        except FileExistsError:
+            candidate = parent / f"{name}-{suffix}"
+            suffix += 1
 
 
 def _dir_key(path: str | Path) -> str:
@@ -307,6 +320,50 @@ def _dir_key(path: str | Path) -> str:
         return os.path.normcase(os.path.realpath(str(path)))
     except OSError:  # pragma: no cover - 真出不来就退回字符串比较
         return os.path.normcase(str(path))
+
+
+def _backup_parents(source: Path) -> list[Path]:
+    """保留原路径优先；备用位置用持久目录，避免临时目录清理掉唯一备份。"""
+    identity = hashlib.sha256(_dir_key(source).encode("utf-8")).hexdigest()[:16]
+    local = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    candidates = [source, source.parent / "SGMS_backups" / identity,
+                  local / "SGMS_backups" / identity]
+    result: list[Path] = []
+    for parent in candidates:
+        if any(_dir_key(parent) == _dir_key(item) for item in result):
+            continue
+        # 备用位置不能反过来位于源目录里（含符号链接/自定义环境变量）。
+        if parent != source and Path(_dir_key(parent)).is_relative_to(Path(_dir_key(source))):
+            continue
+        result.append(parent)
+    return result
+
+
+def _backup_inventory(root: Path, skip: Callable[[str, list[str]], set[str]]) -> dict[str, str]:
+    """按同一排除规则核对全部目录和文件；密文只在内存里计算摘要。"""
+    inventory: dict[str, str] = {}
+
+    def visit(directory: Path) -> None:
+        entries = list(directory.iterdir())
+        ignored = skip(str(directory), [entry.name for entry in entries])
+        for entry in entries:
+            if entry.name in ignored:
+                continue
+            if entry.is_symlink() or entry.is_junction():
+                raise MigrationError(f"数据目录中含链接，无法确认备份范围：{entry}。已拒绝迁移。")
+            relative = entry.relative_to(root).as_posix()
+            if entry.is_dir():
+                inventory[relative] = "directory"
+                visit(entry)
+            else:
+                digest = hashlib.sha256()
+                with entry.open("rb") as handle:
+                    for block in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(block)
+                inventory[relative] = digest.hexdigest()
+
+    visit(root)
+    return inventory
 
 
 def backup_vault(vault_path: str | Path, old_version: str = "") -> Path:
@@ -323,7 +380,7 @@ def backup_vault(vault_path: str | Path, old_version: str = "") -> Path:
         MigrationError: 目录不存在、复制失败、或者复制完**核对不上**
             （备份必须可信，宁可拒绝迁移也不能留一份半拉子的备份）。
     """
-    source = Path(vault_path)
+    source = Path(vault_path).resolve()
     if not source.is_dir():
         raise MigrationError(f"数据目录不存在，没法备份：{source}")
 
@@ -355,19 +412,52 @@ def backup_vault(vault_path: str | Path, old_version: str = "") -> Path:
             or name in SKIP_DIR_NAMES
         }
 
-    target = _unique_dir(source, f"{BACKUP_PREFIX}{version}_{_stamp()}")
+    # 先核对源文件可读，源数据读失败不能靠换备份位置掩盖。
     try:
-        shutil.copytree(source, target, ignore=_skip)
-    except (OSError, shutil.Error) as exc:
-        raise MigrationError(f"备份失败（{type(exc).__name__}: {exc}），已拒绝迁移。") from exc
+        expected = _backup_inventory(source, _skip)
+    except OSError as exc:
+        raise MigrationError(
+            f"无法读取完整数据，已拒绝迁移：{exc}。请检查数据目录读取权限和文件占用。"
+        ) from exc
 
-    # --- 核对：原本有什么，备份里就得有什么 -------------------------------
-    users = source / "users.json"
-    if users.exists() and not (target / "users.json").exists():
-        raise MigrationError(f"备份核对不通过：{target} 里没有 users.json，已拒绝迁移。")
-    if (source / "app.salt").exists() and not (target / "app.salt").exists():
-        raise MigrationError(f"备份核对不通过：{target} 里没有 app.salt，已拒绝迁移。")
-    return target
+    errors: list[str] = []
+    last_error: Exception | None = None
+    for parent in _backup_parents(source):
+        target: Path | None = None
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+            target = _unique_dir(parent, f"{BACKUP_PREFIX}{version}_{_stamp()}")
+            shutil.copytree(source, target, ignore=_skip, dirs_exist_ok=True)
+            # 目标顶层也按源顶层的规则处理；用户 cache 始终在清单中。
+            def target_skip(directory: str, names: list[str]) -> set[str]:
+                relative = Path(directory).relative_to(target)
+                return _skip(str(source / relative), names)
+
+            if (_backup_inventory(target, target_skip) != expected
+                    or _backup_inventory(source, _skip) != expected):
+                raise MigrationError(f"备份内容不完整或备份期间数据发生变化：{target}。已拒绝迁移。")
+            return target
+        except (OSError, shutil.Error, MigrationError) as exc:
+            last_error = exc
+            errors.append(f"{parent}：{type(exc).__name__}: {exc}")
+            if target is not None:
+                # 只清理本次独占创建的目录；核对实际路径后才递归删除。
+                try:
+                    if (target.resolve().parent == parent.resolve()
+                            and target.name.startswith(BACKUP_PREFIX)):
+                        shutil.rmtree(target)
+                    else:
+                        errors.append(f"未完成的备份仍在：{target}（请勿用于恢复）")
+                except OSError:
+                    errors.append(f"未完成的备份仍在：{target}（请勿用于恢复）")
+            if isinstance(exc, MigrationError):
+                break
+
+    raise MigrationError(
+        "备份失败，已拒绝迁移，原数据未改动。\n" + "\n".join(errors)
+        + "\n请关闭可能占用文件的程序，检查数据目录与备份目录的权限、磁盘空间，"
+          "以及安全软件的拦截记录后重试。"
+    ) from last_error
 
 
 def _stamp() -> str:
@@ -565,7 +655,7 @@ def _rollback(root: Path, backup: Path) -> str:
     if not source.exists():
         return "（备份里没有 users.json，没能回滚 —— 请手工处理）"
     try:
-        shutil.copy2(source, root / "users.json")
+        _atomic_write_bytes(root / "users.json", source.read_bytes())
     except OSError as exc:
         return f"（回滚也失败了：{type(exc).__name__}: {exc} —— 请手工处理）"
     return "已回滚到迁移前的 users.json。"

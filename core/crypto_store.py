@@ -92,6 +92,8 @@ import hmac
 import json
 import os
 import re
+import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -212,12 +214,34 @@ def _atomic_write_bytes(path: Path, blob: bytes) -> None:
     临时文件里放的也是**密文**，所以磁盘上任何时刻都不会出现明文成绩。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "wb") as handle:
-        handle.write(blob)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
+    tmp: Path | None = None
+    try:
+        # 同目录保证 replace 不跨磁盘；唯一文件名避免残留文件和并发写者撞车。
+        # Windows 必须先关闭临时文件句柄，才能替换目标。
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+        ) as handle:
+            tmp = Path(handle.name)
+            handle.write(blob)
+            handle.flush()
+            os.fsync(handle.fileno())
+        for attempt in range(4):
+            try:
+                os.replace(tmp, path)
+                break
+            except OSError as exc:
+                # 仅重试 Windows 的访问/共享/锁冲突；磁盘满等错误立刻上报。
+                transient = getattr(exc, "winerror", None) in {5, 32, 33}
+                if not transient or attempt == 3:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                # 清理失败不能遮住原始错误，更不能删除旧的目标文件。
+                pass
 
 
 def app_salt_path(root: str | Path | None = None) -> Path:

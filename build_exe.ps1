@@ -343,7 +343,7 @@ function Build-One {
         #   窗口版更只会弹一个标题为 "Error" 的原生对话框 —— 在无人值守的脚本里
         #   那个框永远不会被点掉，脚本就永久卡死（第一次打 release 就卡在这儿，
         #   表现是"进程活着、CPU 0%、什么都不发生"）。
-        $proc = Start-Process -FilePath $exe -ArgumentList '--selfcheck' -PassThru
+        $proc = Start-Process -FilePath $exe -ArgumentList '--selfcheck' -PassThru -WindowStyle Hidden
         $finished = $true
         try { Wait-Process -Id $proc.Id -Timeout 300 -ErrorAction Stop }
         catch { $finished = $false }
@@ -392,7 +392,7 @@ function Build-One {
         Write-Host "=== 打包后：$name.exe --bootcheck（真实启动流程）===" -ForegroundColor Cyan
         $bootReport = Join-Path $exeTmp 'transcript-lens-bootcheck.txt'
         Remove-Item $bootReport -Force -ErrorAction SilentlyContinue
-        $boot = Start-Process -FilePath $exe -ArgumentList '--bootcheck' -PassThru
+        $boot = Start-Process -FilePath $exe -ArgumentList '--bootcheck' -PassThru -WindowStyle Hidden
         $bootDone = $true
         try { Wait-Process -Id $boot.Id -Timeout 180 -ErrorAction Stop }
         catch { $bootDone = $false }
@@ -420,7 +420,12 @@ function Build-One {
         # 收工：临时目录与两个环境变量都还原（否则后面的打包步骤会继续用它）
         $env:TEMP = $savedTemp
         $env:TMP = $savedTmp
-        Remove-Item $exeTmp -Recurse -Force -ErrorAction SilentlyContinue
+        $cleanupRoot = [IO.Path]::GetFullPath((Join-Path $Root 'build')) + [IO.Path]::DirectorySeparatorChar
+        $cleanupTarget = [IO.Path]::GetFullPath($exeTmp)
+        if (-not $cleanupTarget.StartsWith($cleanupRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "自检临时目录不在本次 build 目录内，已停止清理：$cleanupTarget"
+        }
+        Remove-Item -LiteralPath $cleanupTarget -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     return $exe
