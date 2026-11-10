@@ -229,11 +229,7 @@ class SemesterSideProfile(QWidget):
         head.addWidget(self._back_button)
 
         self._title_label = QLabel(self)
-        self._title_label.setObjectName("pageTitle")
-        title_font = self._title_label.font()
-        title_font.setPointSize(max(title_font.pointSize() + 6, 16))
-        title_font.setBold(True)
-        self._title_label.setFont(title_font)
+        self._title_label.setObjectName("H2")
         head.addWidget(self._title_label)
         head.addStretch(1)
 

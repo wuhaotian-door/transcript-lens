@@ -862,11 +862,20 @@ class ProfilePage(QWidget):
 
     # -- 列表 -------------------------------------------------------------
     def _build(self) -> None:
-        root = QHBoxLayout(self)
-        root.setContentsMargins(22, 20, 22, 20)
-        root.setSpacing(14)
-        root.addWidget(self._build_list_pane())
-        root.addWidget(self._build_stack(), 1)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(22, 20, 22, 20)
+        outer.setSpacing(14)
+
+        title = QLabel("🎯  侧写辅导")
+        title.setObjectName("H1")
+        outer.addWidget(title)
+
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(14)
+        body.addWidget(self._build_list_pane())
+        body.addWidget(self._build_stack(), 1)
+        outer.addLayout(body, 1)
 
     def _build_stack(self) -> QWidget:
         self._stack = QStackedWidget()
@@ -884,7 +893,7 @@ class ProfilePage(QWidget):
         box.setSpacing(0)
 
         head = QHBoxLayout()
-        head.setContentsMargins(14, 13, 12, 10)
+        head.setContentsMargins(14, 13, 14, 10)
         head.setSpacing(8)
         title = QLabel("学生名单")
         title.setObjectName("H2")
@@ -897,7 +906,7 @@ class ProfilePage(QWidget):
         box.addLayout(head)
 
         search_holder = QHBoxLayout()
-        search_holder.setContentsMargins(12, 0, 12, 10)
+        search_holder.setContentsMargins(14, 0, 14, 10)
         self._search = QLineEdit()
         self._search.setObjectName("ListSearch")
         self._search.setPlaceholderText("搜索姓名或学号")
@@ -921,11 +930,11 @@ class ProfilePage(QWidget):
         self._list_note = QLabel("")
         self._list_note.setObjectName("ListNote")
         self._list_note.setWordWrap(True)
-        self._list_note.setContentsMargins(14, 8, 12, 10)
+        self._list_note.setContentsMargins(14, 8, 14, 10)
         box.addWidget(self._list_note)
 
         buttons = QHBoxLayout()
-        buttons.setContentsMargins(12, 6, 12, 0)
+        buttons.setContentsMargins(14, 6, 14, 0)
         buttons.setSpacing(6)
         self._new_btn = QPushButton("新建")
         self._new_btn.setObjectName("Ghost")

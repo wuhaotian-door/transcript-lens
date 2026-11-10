@@ -202,11 +202,11 @@ class ScholarshipRow:
 
     @property
     def academic_text(self) -> str:
-        return "—" if self.academic is None else f"{self.academic:.6f}"
+        return "—" if self.academic is None else f"{self.academic:.2f}"
 
     @property
     def final_text(self) -> str:
-        return "—" if self.final is None else f"{self.final:.6f}"
+        return "—" if self.final is None else f"{self.final:.2f}"
 
     @property
     def moral_text(self) -> str:

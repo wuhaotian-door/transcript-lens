@@ -112,11 +112,11 @@ M_ID_COL = 2
 M_ACADEMIC_COL = 3
 M_MORAL_COL = 4
 
-#: 奖项配色（charter 4.5：一等金、二等银、三等铜、特等紫）
+#: 奖项配色（一等金、二等银、三等铜、特等紫）
 _AWARD_STYLE: dict[str, tuple[str, str]] = {
     AWARD_SPECIAL: ("#F3E8FF", "#6B21A8"),   # 紫
     AWARD_FIRST:   ("#FEF3C7", "#92400E"),   # 金
-    AWARD_SECOND:  ("#E5E7EB", "#374151"),   # 银
+    AWARD_SECOND:  ("#E2E8F0", "#475569"),   # 银
     AWARD_THIRD:   ("#FFEDD5", "#9A3412"),   # 铜
 }
 
@@ -403,7 +403,7 @@ class ScholarshipPage(QWidget):
         box.addWidget(self._stack_box)
         box.addStretch(1)
 
-        self._run_btn = QPushButton("③ 开始测算")
+        self._run_btn = QPushButton("开始测算")
         self._run_btn.setObjectName("Primary")
         self._run_btn.setMinimumHeight(38)
         self._run_btn.setMinimumWidth(130)

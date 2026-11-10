@@ -286,7 +286,7 @@ def _read_raw_frame(path: str) -> pd.DataFrame:
 
 
 def _fmt(value: float | None) -> str:
-    return "—" if value is None else f"{value:.6f}"
+    return "—" if value is None else f"{value:.2f}"
 
 
 def out_of_range_scores(parsed: Any, limit: int = 8) -> list[str]:
@@ -620,6 +620,10 @@ class AnalysisPage(QWidget):
         root.setContentsMargins(22, 20, 22, 20)
         root.setSpacing(12)
 
+        title = QLabel("📊  智育分析")
+        title.setObjectName("H1")
+        root.addWidget(title)
+
         head = QHBoxLayout()
         self._import_btn = QPushButton("📂  导入成绩表")
         self._import_btn.setObjectName("Primary")
@@ -677,7 +681,7 @@ class AnalysisPage(QWidget):
             #   按钮上的字是简写（"全部"），气泡里是展开的三类别。
             button.setToolTip(
                 f"计入：{scope_breakdown(scope)}\n"
-                "三档口径是 charter 一节定死的，不新增、不改定义。"
+                "三档口径是固定的，不能自由组合。"
             )
             button.clicked.connect(
                 lambda _=False, s=scope: self._set_scope(s)
@@ -694,6 +698,15 @@ class AnalysisPage(QWidget):
 
         self._table = QTableWidget(0, len(COLUMN_TITLES))
         self._table.setHorizontalHeaderLabels(list(COLUMN_TITLES))
+        for col in range(len(COLUMN_TITLES)):
+            h_item = self._table.horizontalHeaderItem(col)
+            if h_item is not None:
+                if col in (NAME_COLUMN, ID_COLUMN):
+                    h_item.setTextAlignment(int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter))
+                elif FIRST_SCOPE_COLUMN <= col < FIRST_SCOPE_COLUMN + len(SCOPE_COLUMNS):
+                    h_item.setTextAlignment(int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter))
+                else:
+                    h_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
         self._table.setAlternatingRowColors(True)          # Spec：斑马纹
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -1180,11 +1193,15 @@ class AnalysisPage(QWidget):
             i = row.index
 
             name_cell = QTableWidgetItem(row.student)
-            name_cell.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+            name_cell.setTextAlignment(
+                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            )
             self._table.setItem(i, NAME_COLUMN, name_cell)
 
             id_cell = QTableWidgetItem(row.student_id if row.has_id else "—")
-            id_cell.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+            id_cell.setTextAlignment(
+                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            )
             if not row.has_id:
                 id_cell.setToolTip(
                     "表里没有这一行的学号。同名学生会共用同一份意愿，"
@@ -1197,20 +1214,18 @@ class AnalysisPage(QWidget):
                 result = self._result_at(scope, i)
                 cell = QTableWidgetItem(_fmt(result.weighted_average) if result else "—")
                 cell.setTextAlignment(
-                    int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                    int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 )
                 self._table.setItem(i, FIRST_SCOPE_COLUMN + offset, cell)
 
             self._set_flag_cell(i)
 
-            # ★ v1.9.2：这里**只发信号**，不再自己弹任何侧写窗口 ——
-            #   主窗收到 student_selected 后切到成绩档案页，由那一页负责
-            #   选学期、再打开学期侧写（AGENTS §37）。
+            # ★ 这里只发信号，主窗收到 student_selected 后切到成长档案页的二级个人专属侧写
             button = QPushButton("侧写")
             button.setObjectName("RowAction")
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.setMinimumHeight(_ROW_BUTTON_HEIGHT)
-            button.setToolTip("在成绩档案页查看该生的学期侧写")
+            button.setToolTip("在成长档案页查看该生的个人专属侧写")
             button.clicked.connect(lambda _=False, idx=i: self._emit_student(idx))
             holder = QWidget()
             holder_box = QHBoxLayout(holder)

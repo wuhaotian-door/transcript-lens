@@ -298,6 +298,8 @@ class StudentArchive:
             "records": [r.as_dict() for r in self.sorted_records],
         }
 
+    to_dict = as_dict
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "StudentArchive":
         return cls(
@@ -333,6 +335,63 @@ class Archive:
             "students": {k: s.as_dict() for k, s in self.students.items()},
             "imported_terms": {k: sorted(v) for k, v in self.imported_terms.items()},
         }
+
+    to_dict = as_dict
+
+    def rename_student(
+        self, old_id: str, new_id: str, new_name: str = "", old_name: str = ""
+    ) -> bool:
+        """修改学生学号与姓名，同步更新 StudentArchive 及 records。"""
+        target_student = None
+        target_key = None
+        for k, s in self.students.items():
+            if (old_id and s.student_id == old_id) or (k == old_id):
+                target_student = s
+                target_key = k
+                break
+            if not old_id and old_name and s.student == old_name:
+                target_student = s
+                target_key = k
+                break
+
+        if target_student is None or target_key is None:
+            return False
+
+        effective_id = (new_id or target_student.student_id).strip()
+        effective_name = (new_name or target_student.student).strip()
+
+        target_student.student = effective_name
+        for r in target_student.records:
+            if effective_name:
+                r.student = effective_name
+            if effective_id:
+                r.student_id = effective_id
+
+        new_key = archive_key(effective_id, effective_name)
+        if new_key != target_key:
+            target_student.key = new_key
+            self.students.pop(target_key, None)
+            self.students[new_key] = target_student
+            if target_key in self.imported_terms:
+                self.imported_terms[new_key] = self.imported_terms.pop(target_key)
+        return True
+
+    def remove_student(self, student_id: str, name: str = "") -> bool:
+        """从归档中删除学生。"""
+        target_key = None
+        for k, s in list(self.students.items()):
+            if (student_id and s.student_id == student_id) or (k == student_id):
+                target_key = k
+                break
+            if not student_id and name and s.student == name:
+                target_key = k
+                break
+
+        if target_key and target_key in self.students:
+            self.students.pop(target_key, None)
+            self.imported_terms.pop(target_key, None)
+            return True
+        return False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Archive":

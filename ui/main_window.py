@@ -104,22 +104,22 @@ FADE_IN_FAILSAFE_MS = 900
 #: 导航项：``(键, 图标+文字)``。顺序即侧栏顺序。
 NAV_ITEMS: tuple[tuple[str, str], ...] = (
     ("analysis", "📊  智育分析"),
-    ("profile", "🎯  侧写辅导"),
     ("archive", "📈  成长档案"),
     ("scholarship", "💰  奖学金测算"),
     ("settings", "⚙️  设置"),
     ("account", "👤  个人中心"),
 )
 
-#: 侧写辅导那一页的键（点它只落名单，不替你挑学生）
-PROFILE_NAV_KEY = "profile"
-
-#: 侧写辅导页在 ``NAV_ITEMS`` 里的下标（从同一张表推导，不另写死数字）
-PROFILE_PAGE_INDEX = next(
+#: 成长档案页在 ``NAV_ITEMS`` 里的下标
+ARCHIVE_PAGE_INDEX = next(
     position
     for position, (key, _title) in enumerate(NAV_ITEMS)
-    if key == PROFILE_NAV_KEY
+    if key == "archive"
 )
+
+#: 兼容旧代码引用
+PROFILE_NAV_KEY = "archive"
+PROFILE_PAGE_INDEX = ARCHIVE_PAGE_INDEX
 
 #: 默认落在哪一页（Spec 四：默认首页 = 智育分析）
 DEFAULT_PAGE = 0
@@ -177,17 +177,16 @@ class MainWindow(QMainWindow):
         right.addWidget(self._stack, 1)
         body.addLayout(right, 1)
 
-        # --- 六个页面 ---
+        # --- 五个页面 ---
         self.analysis_page = AnalysisPage(self._store)
-        self.profile_page = ProfilePage(self._store)
         self.archive_page = ArchivePage(self._store)
         self.scholarship_page = ScholarshipPage(self._store)
         self.settings_page = SettingsPage(self._store, self._data_root)
         self.account_page = AccountPage(self._store, self._data_root)
+        self.profile_page = None
 
         for page in (
             self.analysis_page,
-            self.profile_page,
             self.archive_page,
             self.scholarship_page,
             self.settings_page,
@@ -270,15 +269,11 @@ class MainWindow(QMainWindow):
         box.setContentsMargins(0, 0, 0, 0)
         box.setSpacing(10)
 
-        self._user_label = QLabel("（未登录）")
-        self._user_label.setObjectName("TopUser")
-        box.addWidget(self._user_label)
-
         box.addStretch(1)
 
-        self._page_title = QLabel("")
-        self._page_title.setObjectName("TopMeta")
-        box.addWidget(self._page_title)
+        self._user_label = QLabel("（未登录）")
+        self._user_label.setObjectName("TopMeta")
+        box.addWidget(self._user_label)
 
         bar = WindowTitleBar(
             "",
@@ -296,12 +291,10 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- 接线
     def _wire(self) -> None:
-        # 智育分析页双击/点「侧写」→ 切到成绩档案页，由它选学期、再开学期侧写
-        self.analysis_page.student_selected.connect(self._open_profile)
-        # 名单推给侧写页（它靠这个建左侧列表）；★ v1.9.2 顺手补进学生主档
+        # 智育分析页双击/点「侧写」→ 切到成长档案页的二级个人专属侧写
+        self.analysis_page.student_selected.connect(self._open_archive_profile)
+        # 名单更新时，顺手补进学生主档
         self.analysis_page.roster_changed.connect(self._on_roster_changed)
-        # 侧写页按行号取原料 —— 不复制数据，两个页面看的是同一份结果
-        self.profile_page.set_payload_provider(self.analysis_page.payload_at)
         # 个人中心「切换账号」
         self.account_page.switch_account.connect(self.switch_account.emit)
         # 设置页导出用的数据来自智育分析页（不复制数据，只给个取值函数）
@@ -315,15 +308,16 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- 对外
     def set_user(self, username: str) -> None:
-        """设置当前用户，并把六个页面各自的用户相关状态刷新一遍。"""
+        """设置当前用户，并把五个页面各自的用户相关状态刷新一遍。"""
         self._username = username or ""
         self._user_label.setText(self._username or "（未登录）")
         self.analysis_page.set_user(self._username)
-        self.profile_page.set_user(self._username)
         self.archive_page.set_user(self._username)
         self.scholarship_page.set_user(self._username)
         self.settings_page.set_user(self._username)
         self.account_page.set_user(self._username)
+        if self.profile_page is not None:
+            self.profile_page.set_user(self._username)
 
     def _on_class_saved(self, class_name: str) -> None:
         """刚导入了一个班 —— 让奖学金页和成长档案页立刻能看到新数据。
@@ -357,15 +351,11 @@ class MainWindow(QMainWindow):
             profile_rows: 删掉了几份侧写。
             files: 删掉了几个文件。
         """
-        # ★ v1.9.2：档案页是两级视图（详情页 / 学期侧写页）。清库后优先用
-        #   ``reset_view()`` 把**两级都复位**，否则用户切回详情页还能看到上一个
-        #   学生的学期侧写。组件还没落地时退回 ``show_no_data()``。
-        profile_reset = getattr(self.profile_page, "reset_view", None)
-        if not callable(profile_reset):
-            profile_reset = getattr(self.profile_page, "show_no_data", None)
-        if callable(profile_reset):
+        # ★ 成长档案页是两级视图（档案概览 / 个人专属侧写二级页）。清库后用 reset_view 把两级都复位
+        archive_reset = getattr(self.archive_page, "reset_view", None)
+        if callable(archive_reset):
             try:
-                profile_reset()
+                archive_reset()
             except Exception:  # noqa: BLE001 - 刷新失败只打日志（§18）
                 traceback.print_exc()
 
@@ -425,50 +415,25 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- 内部
     def _nav_to(self, index: int) -> None:
-        """侧栏点击。
-
-        ★ 「🎯 侧写辅导」只把焦点交给**名单**，**不替你挑学生** ——
-          以前点侧栏会落到上一次那一名学生身上，用户看到的是别人的数据。
-        """
+        """侧栏点击。"""
         self.goto(index)
-        if 0 <= index < len(NAV_ITEMS) and NAV_ITEMS[index][0] == PROFILE_NAV_KEY:
-            self.profile_page.focus_list()
+
+    def _open_archive_profile(self, payload: dict) -> None:
+        """从智育分析页跳成长档案页的个人侧写二级页面。
+
+        ★ 顺序：先把页切过去 → 再由成长档案页打开对应学生和学期的二级侧写。
+        """
+        self._nav_to(ARCHIVE_PAGE_INDEX)
+        self.archive_page.open_student_profile(payload)
 
     def _open_profile(self, payload: dict) -> None:
-        """从智育分析页跳成绩档案页 —— 这一次是**明确指定了人**，就该选中他。
-
-        ★ v1.9.2：档案页变成两级视图（详情页 / 学期侧写页）。导入页的
-          「侧写」按钮只把 payload 交过来，**选哪个学期由用户在档案页里选**
-          （``ProfilePage.ask_semester_and_open``）—— 这里不再自己弹任何侧写窗口。
-
-        ★ 顺序：先把页切过去 → 再落学生 → 最后**延后一拍**弹学期选择。
-          切页动画还没落位就弹模态框，会把动画卡在半路（AGENTS §11 / §4k）。
-        """
-        self._nav_to(PROFILE_PAGE_INDEX)
-        self.profile_page.show_student(payload)
-        ask = getattr(self.profile_page, "ask_semester_and_open", None)
-        if callable(ask):
-            QTimer.singleShot(0, lambda: self._ask_semester_and_open(ask, payload))
-
-    def _ask_semester_and_open(self, ask, payload: dict) -> None:
-        """``ProfilePage.ask_semester_and_open`` 的延后调用。
-
-        ★ 用 ``getattr`` 探测过才排这一拍（组件可能还没落地）；
-          这里再包一层 try/except —— 弹窗出错**只打日志**，不许冒到事件循环里。
-        """
-        try:
-            ask(payload)
-        except Exception:  # noqa: BLE001 - 弹窗失败只打日志
-            traceback.print_exc()
+        """兼容旧调用：统一路由至成长档案页的二级个人专属侧写。"""
+        self._open_archive_profile(payload)
 
     def _on_roster_changed(self, rows: list) -> None:
-        """导入完成后把全班名单推给侧写页，并**顺手补进学生主档**。
-
-        ★ v1.9.2：``students.json.enc`` 是学生主档，唯一写入口是
-          :class:`core.database.StudentStore`；导入时在这里自动补档，
-          **不另立第二份名单**（AGENTS §37）。
-        """
-        self.profile_page.set_roster(rows)
+        """导入完成后把名单补进学生主档。"""
+        if self.profile_page is not None:
+            self.profile_page.set_roster(rows)
         self._upsert_student_roster(rows)
 
     def _upsert_student_roster(self, rows: list) -> None:
@@ -502,11 +467,9 @@ class MainWindow(QMainWindow):
                 _log.warning("学生主档补档失败：%s", student_id, exc_info=True)
 
     def _sync_nav(self, index: int) -> None:
-        """把侧栏选中态和顶部标题对齐到当前页。"""
+        """把侧栏选中态对齐到当前页。"""
         for position, button in enumerate(self._nav_buttons):
             button.setChecked(position == index)
-        if 0 <= index < len(NAV_ITEMS):
-            self._page_title.setText(NAV_ITEMS[index][1].replace("  ", " "))
 
     # ---------------------------------------------------------------- 自检用
     @property

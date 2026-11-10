@@ -118,6 +118,11 @@ QLabel#H3 {
     font-weight: 700;
     color: #334155;
 }
+QLabel#H4 {
+    font-size: 15px;
+    font-weight: 700;
+    color: #1F2430;
+}
 QLabel#Muted {
     color: #64748B;
 }
@@ -130,11 +135,6 @@ QLabel#Success {
 
 /* ------------------------------------------------------------------ 卡片 */
 QFrame#Card {
-    background: #FFFFFF;
-    border: 1px solid #E2E8F0;
-    border-radius: 10px;
-}
-QFrame#CardFlat {
     background: #FFFFFF;
     border: 1px solid #E2E8F0;
     border-radius: 10px;
@@ -203,20 +203,22 @@ QLabel#TopUser {
     font-weight: 700;
 }
 QLabel#TopMeta {
-    color: #94A3B8;
+    color: #64748B;
+    font-size: 13px;
 }
 
 /* ------------------------------------------------------------------ 按钮 */
 QPushButton#Primary {
     background: #3B82F6;
     color: #FFFFFF;
-    border: none;
+    border: 1px solid transparent;
     border-radius: 8px;
-    padding: 9px 18px;
+    padding: 8px 17px;
     font-weight: 700;
 }
 QPushButton#Primary:hover   { background: #2F76E8; }
 QPushButton#Primary:pressed { background: #2563EB; }
+QPushButton#Primary:focus   { border-color: #93C5FD; }
 QPushButton#Primary:disabled {
     background: #BFD3F5;
     color: #EEF4FF;
@@ -224,14 +226,15 @@ QPushButton#Primary:disabled {
 
 QPushButton#Ghost {
     background: #FFFFFF;
-    color: #3B82F6;
-    border: 1px solid #3B82F6;
+    color: #475569;
+    border: 1px solid #CBD5E1;
     border-radius: 8px;
     padding: 8px 17px;
-    font-weight: 700;
+    font-weight: 400;
 }
-QPushButton#Ghost:hover   { background: #EFF6FF; }
-QPushButton#Ghost:pressed { background: #DBEAFE; }
+QPushButton#Ghost:hover   { background: #EFF6FF; border-color: #3B82F6; color: #3B82F6; }
+QPushButton#Ghost:pressed { background: #DBEAFE; border-color: #2563EB; color: #2563EB; }
+QPushButton#Ghost:focus   { border-color: #3B82F6; }
 
 QPushButton#Danger {
     background: #FFFFFF;
@@ -242,16 +245,18 @@ QPushButton#Danger {
     font-weight: 700;
 }
 QPushButton#Danger:hover   { background: #FEF2F2; }
+QPushButton#Danger:focus   { border-color: #EF4444; }
 
 QPushButton#Success {
     background: #22C55E;
     color: #FFFFFF;
-    border: none;
+    border: 1px solid transparent;
     border-radius: 8px;
-    padding: 9px 18px;
+    padding: 8px 17px;
     font-weight: 700;
 }
 QPushButton#Success:hover { background: #1EAE52; }
+QPushButton#Success:focus { border-color: #86EFAC; }
 
 /* 文字按钮（「去注册」「忘记密码？」这类） */
 QPushButton#Link {
@@ -552,4 +557,102 @@ QToolTip {
     border: none;
     padding: 6px 9px;
     border-radius: 6px;
+}
+
+/* ---------------------------------------------------------------- 滚动区 (P0-1) */
+QScrollArea,
+QScrollArea > QWidget > QWidget {
+    background: transparent;
+    border: none;
+}
+
+/* ------------------------------------------------------------ 首页口径三档 (P0-2) */
+QPushButton#FilterToggle {
+    background: #FFFFFF;
+    color: #475569;
+    border: 1px solid #E2E8F0;
+    border-radius: 8px;
+    padding: 6px 14px;
+    font-size: 13px;
+}
+QPushButton#FilterToggle:hover {
+    background: #F8FAFC;
+    border-color: #CBD5E1;
+}
+QPushButton#FilterToggle:checked {
+    background: #EFF6FF;
+    border-color: #3B82F6;
+    color: #1D4ED8;
+    font-weight: 700;
+}
+QPushButton#FilterToggle:checked:hover {
+    background: #DBEAFE;
+}
+QPushButton#FilterToggle:focus {
+    border-color: #3B82F6;
+}
+
+/* -------------------------------------------------------------- 消息弹窗 (P0-5) */
+QMessageBox {
+    background: #FFFFFF;
+}
+QMessageBox QLabel {
+    color: #1F2430;
+    font-size: 13px;
+}
+QMessageBox QPushButton {
+    background: #FFFFFF;
+    color: #475569;
+    border: 1px solid #CBD5E1;
+    border-radius: 8px;
+    padding: 6px 16px;
+    min-width: 72px;
+}
+QMessageBox QPushButton:hover {
+    background: #F8FAFC;
+    border-color: #94A3B8;
+}
+QMessageBox QPushButton:default {
+    background: #3B82F6;
+    color: #FFFFFF;
+    border: none;
+}
+QMessageBox QPushButton:default:hover {
+    background: #2F76E8;
+}
+
+/* ------------------------------------------------------------- 标签页 (P1-2) */
+QTabWidget#ProfileTabs::pane {
+    border: 1px solid #E2E8F0;
+    border-radius: 10px;
+    background: #FFFFFF;
+}
+QTabBar::tab {
+    background: transparent;
+    color: #64748B;
+    padding: 8px 16px;
+    font-weight: 500;
+    border: none;
+    border-bottom: 2px solid transparent;
+}
+QTabBar::tab:hover {
+    color: #1F2430;
+}
+QTabBar::tab:selected {
+    color: #3B82F6;
+    font-weight: 700;
+    border-bottom: 2px solid #3B82F6;
+}
+
+/* ------------------------------------------------------------- 进度条 (P1-3) */
+QProgressBar {
+    background: #E2E8F0;
+    border: none;
+    border-radius: 5px;
+    height: 10px;
+    text-align: center;
+}
+QProgressBar::chunk {
+    background: #3B82F6;
+    border-radius: 5px;
 }
