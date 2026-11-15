@@ -542,6 +542,14 @@ class SettingsPage(QWidget):
         self._model_center_btn.clicked.connect(self._do_open_model_center)
         model_row.addWidget(self._model_center_btn)
 
+        self._backend_setup_btn = QPushButton("下载推理核心")
+        self._backend_setup_btn.setObjectName("Ghost")
+        self._backend_setup_btn.setMinimumHeight(36)
+        self._backend_setup_btn.setMinimumWidth(120)
+        self._backend_setup_btn.setToolTip("安装或检查本地推理核心")
+        self._backend_setup_btn.clicked.connect(self._do_open_backend_setup)
+        model_row.addWidget(self._backend_setup_btn)
+
         self._model_download_btn = QPushButton("下载新模型")
         self._model_download_btn.setObjectName("Ghost")
         self._model_download_btn.setMinimumHeight(36)
@@ -598,6 +606,28 @@ class SettingsPage(QWidget):
             parts.append(f"· {info.name}（{size}）")
         self._models_list.setText("已下载 " + str(len(installed)) + " 个：\n" + "\n".join(parts))
         self._model_delete_btn.setEnabled(True)
+
+        try:
+            from core.ai.runtime_setup import is_backend_available
+            backend_ok = bool(is_backend_available())
+        except Exception:
+            backend_ok = False
+        if hasattr(self, "_backend_setup_btn"):
+            if backend_ok:
+                self._backend_setup_btn.setText("推理核心已就绪")
+                self._backend_setup_btn.setEnabled(False)
+            else:
+                self._backend_setup_btn.setText("下载推理核心")
+                self._backend_setup_btn.setEnabled(True)
+
+    def _do_open_backend_setup(self) -> None:
+        """打开本地推理核心安装窗口。"""
+        try:
+            from ui.widgets.backend_setup import open_backend_setup
+            open_backend_setup(self)
+        except Exception as exc:  # noqa: BLE001
+            self._model_status.setText(f"打开推理核心安装失败：{type(exc).__name__}")
+        self._refresh_models()
 
     def _do_open_model_center(self) -> None:
         """打开模型中心：读远端清单 → 勾选 → 串行下载。

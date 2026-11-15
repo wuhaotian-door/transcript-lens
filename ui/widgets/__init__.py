@@ -12,6 +12,14 @@
 
 from __future__ import annotations
 
-from ui.widgets.backend_setup import BackendSetupCard
+from ui.widgets.backend_setup import (
+    BackendSetupCard,
+    BackendSetupDialog,
+    open_backend_setup,
+)
 
-__all__ = ["BackendSetupCard"]
+__all__ = [
+    "BackendSetupCard",
+    "BackendSetupDialog",
+    "open_backend_setup",
+]

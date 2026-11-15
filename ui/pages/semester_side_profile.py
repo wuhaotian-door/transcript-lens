@@ -206,6 +206,7 @@ class SemesterSideProfile(QWidget):
         self._side_worker: _SemesterSideWorker | None = None
         self._ai_error = ""
         self._text_context: tuple[str, str] | None = None
+        self._setup_card: Any = None
 
         self._build_ui()
         self._refresh_header()
@@ -341,6 +342,19 @@ class SemesterSideProfile(QWidget):
         self._save_button.setObjectName("saveSideButton")
         self._save_button.clicked.connect(self._save_side_text)
         buttons.addWidget(self._save_button)
+
+        self._install_core_btn = QPushButton("下载推理核心", side)
+        self._install_core_btn.setObjectName("installCoreButton")
+        self._install_core_btn.setToolTip("本地未安装推理核心时，点击进行一键安装")
+        self._install_core_btn.clicked.connect(self._on_setup_core_clicked)
+        buttons.addWidget(self._install_core_btn)
+
+        self._model_center_btn = QPushButton("模型中心", side)
+        self._model_center_btn.setObjectName("modelCenterButton")
+        self._model_center_btn.setToolTip("打开模型中心下载离线推理模型")
+        self._model_center_btn.clicked.connect(self._on_model_center_clicked)
+        buttons.addWidget(self._model_center_btn)
+
         buttons.addStretch(1)
         side_box.addLayout(buttons)
         box.addWidget(side, 1)
@@ -521,6 +535,12 @@ class SemesterSideProfile(QWidget):
         self._ai_error = ""
         self._ai_text.clear()
         self._ai_status.setText("尚未生成")
+        try:
+            ready, _ = engine_available()
+            if hasattr(self, "_install_core_btn"):
+                self._install_core_btn.setVisible(not ready)
+        except Exception:
+            pass
         self._load_saved_side_text()
 
     def _store_id(self) -> str:
@@ -605,8 +625,11 @@ class SemesterSideProfile(QWidget):
             QMessageBox.information(self, "本地推理引擎未就绪", f"探测失败：{friendly_error(exc)}")
             return
         if not ready:
+            self._show_setup_card()
+            if hasattr(self, "_install_core_btn"):
+                self._install_core_btn.show()
             QMessageBox.information(
-                self, "本地推理引擎未就绪", str(reason or "本地推理引擎暂时不可用。")
+                self, "本地推理引擎未就绪", f"{reason or '本地推理引擎暂时不可用。'}\n\n已在页面下方展开推理核心安装卡片，您可点击「一键安装」或「下载推理核心」进行安装。"
             )
             return
 
@@ -620,7 +643,9 @@ class SemesterSideProfile(QWidget):
             )
             return
         if not models:
-            QMessageBox.information(self, "AI 侧写", "请先在模型中心下载模型。")
+            if hasattr(self, "_model_center_btn"):
+                self._model_center_btn.show()
+            QMessageBox.information(self, "AI 侧写", "请先在模型中心下载模型。点击「模型中心」即可开始下载。")
             return
 
         model_path = str(getattr(models[0], "path", "") or "")
@@ -734,6 +759,44 @@ class SemesterSideProfile(QWidget):
             QMessageBox.information(self, "保存侧写", "保存失败，侧写正文还留在框里，可以稍后再试。")
             return
         self._ai_status.setText("已保存到本地加密文件。")
+
+    def _show_setup_card(self) -> None:
+        """复用三态安装卡片：没有引擎时把「一键安装」摆到页面上。"""
+        if self._setup_card is None:
+            try:
+                from ui.widgets.backend_setup import BackendSetupCard
+            except Exception:  # noqa: BLE001
+                logger.exception("加载安装卡片失败")
+                return
+            self._setup_card = BackendSetupCard(self)
+            layout = self.layout()
+            if layout is not None:
+                layout.addWidget(self._setup_card)
+        try:
+            self._setup_card.refresh()
+            self._setup_card.show()
+        except Exception:  # noqa: BLE001
+            logger.exception("刷新安装卡片失败")
+
+    def _on_setup_core_clicked(self) -> None:
+        self._show_setup_card()
+        try:
+            from ui.widgets.backend_setup import open_backend_setup
+            if open_backend_setup(self):
+                self._ai_status.setText("推理核心已安装完成，可以重新点击生成。")
+                if hasattr(self, "_install_core_btn"):
+                    self._install_core_btn.hide()
+                if self._setup_card is not None:
+                    self._setup_card.hide()
+        except Exception:
+            logger.exception("打开推理核心安装向导失败")
+
+    def _on_model_center_clicked(self) -> None:
+        try:
+            from ui.model_center_dialog import open_model_center
+            open_model_center(self)
+        except Exception:
+            logger.exception("打开模型中心失败")
 
 
 # ---------------------------------------------------------------------------
@@ -853,6 +916,13 @@ class SemesterSideProfilePage(SemesterSideProfile):
         if not ready:
             self._ai_status.setText(f"本地推理引擎还没装好：{reason}")
             self._show_setup_card()
+            if hasattr(self, "_install_core_btn"):
+                self._install_core_btn.show()
+            QMessageBox.information(
+                self,
+                "本地推理引擎未就绪",
+                f"本地推理引擎还没装好：{reason}\n\n已在页面中展开安装卡片，请点击「一键安装」或「下载推理核心」。",
+            )
             return
         if not self._term_rows():
             self._ai_status.setText("本学期还没有成绩记录，先导入成绩再谈。")
@@ -872,24 +942,6 @@ class SemesterSideProfilePage(SemesterSideProfile):
         except Exception as exc:  # noqa: BLE001
             logger.exception("打开谈话窗口失败")
             self._ai_status.setText(f"谈话窗口打不开：{friendly_error(exc)}")
-
-    def _show_setup_card(self) -> None:
-        """复用三态安装卡片：没有引擎时把「一键安装」摆到页面上。"""
-        if self._setup_card is None:
-            try:
-                from ui.widgets.backend_setup import BackendSetupCard
-            except Exception:  # noqa: BLE001
-                logger.exception("加载安装卡片失败")
-                return
-            self._setup_card = BackendSetupCard(self)
-            layout = self.layout()
-            if layout is not None:
-                layout.addWidget(self._setup_card)
-        try:
-            self._setup_card.refresh()
-            self._setup_card.show()
-        except Exception:  # noqa: BLE001
-            logger.exception("刷新安装卡片失败")
 
     # -- 返回 -------------------------------------------------------------
     def _on_back_clicked(self) -> None:

@@ -28,17 +28,15 @@ comes out of an encrypted local store** with fixed, reproducible definitions.
 - Three weighting scopes at any time: required only / required + limited-elective / all
 - Per-row warnings: failed courses, absences, out-of-range scores, credit anomalies
 
-**Student coaching**
-- Roster, stated intentions (postgraduate recommendation / exam / employment / civil service / abroad),
-  and a rule-based coaching outline
-- **Local AI chat**: the student's grades, moral score and profile are injected as context;
-  streaming answers from an on-device model
+**Growth archive & side profiles**
+- Two-level interactive view: semester side profile directly embedded into archive
+- Full student management: add, edit, delete, or archive; student ID renaming migrates all associated records
+- Per-semester AI profiles that can be edited and saved to local encrypted store
 
-**Semester archive**
-- Accumulated history per semester with visible deltas
-- Delete individual records (grade / moral / profile), with a follow-up prompt when a
-  semester becomes empty
-- Per-semester AI profiles that can be edited and saved
+**Local AI chat & inference core**
+- Redesigned full-width AI assistant UI with multi-line editor, `Enter` to send (`Shift+Enter` for newline)
+- Built-in prompt chips for counseling outlines, failing grade interventions, and development plans
+- Automatic prompt and installation guidance for the local inference core (`llama-cpp-python`) across all AI touchpoints
 
 **Scholarships**
 - `final = weighted average (all categories) × 0.7 + moral score × 0.3`
@@ -85,7 +83,7 @@ copy /b transcript-lens-v1.9.3.exe.part1+transcript-lens-v1.9.3.exe.part2+transc
 **From source** (Windows 10/11, Python 3.13):
 
 ```bat
-git clone https://gitee.com/wuhaotiansystem/transcript-lens.git
+git clone https://github.com/wuhaotian-door/transcript-lens.git
 cd transcript-lens
 pip install -r requirements.txt
 python main.py

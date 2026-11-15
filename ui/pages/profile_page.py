@@ -1980,6 +1980,15 @@ class ProfilePage(QWidget):
         self._model_center_btn.hide()
         box.addWidget(self._model_center_btn)
 
+        # 缺推理核心时的兜底入口
+        self._backend_setup_btn = QPushButton("下载推理核心")
+        self._backend_setup_btn.setObjectName("Ghost")
+        self._backend_setup_btn.setMinimumHeight(32)
+        self._backend_setup_btn.setMaximumWidth(160)
+        self._backend_setup_btn.clicked.connect(self._open_backend_setup)
+        self._backend_setup_btn.hide()
+        box.addWidget(self._backend_setup_btn)
+
         self._chat_view = QTextEdit()
         self._chat_view.setObjectName("Outline")
         self._chat_view.setReadOnly(True)
@@ -3148,6 +3157,7 @@ class ProfilePage(QWidget):
         if not injected and not self._chat_models_given:
             self._scan_chat_models()
         self._chat_model = self._first_usable_chat_model()
+        self._chat_engine_ready = engine_ready
 
         if engine_ready and (injected or self._chat_model is not None):
             self._chat_status.setText("可以开始谈话（本机离线推理）。")
@@ -3172,6 +3182,9 @@ class ProfilePage(QWidget):
         missing_model = self._chat_engine is None and self._chat_model is None
         if hasattr(self, "_model_center_btn"):
             self._model_center_btn.setVisible(bool(missing_model) and bool(self._chat_key))
+        missing_engine = not getattr(self, "_chat_engine_ready", True)
+        if hasattr(self, "_backend_setup_btn"):
+            self._backend_setup_btn.setVisible(bool(missing_engine) and bool(self._chat_key))
 
     def _scan_chat_models(self) -> None:
         """扫磁盘上真的装好了的模型（拿不到清单就是空表，不报错）。"""
@@ -3366,6 +3379,17 @@ class ProfilePage(QWidget):
         if not self._chat_models_given:
             self._scan_chat_models()
         self._chat_model = None
+        self._refresh_chat_availability()
+
+    def _open_backend_setup(self) -> None:
+        """打开本地推理核心安装窗口。"""
+        try:
+            from ui.widgets import backend_setup as module
+            module.open_backend_setup(self)
+        except Exception:
+            logger.exception("打开推理核心安装失败")
+            self._chat_status.setText("推理核心安装向导暂时打不开，请看日志。")
+            return
         self._refresh_chat_availability()
 
     def _compute_rescues(self, payload: dict[str, Any]) -> list[tuple[str, float, float, float]]:

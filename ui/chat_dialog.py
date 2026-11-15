@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -268,6 +269,37 @@ class _ChatWorker(QThread):
 # ---------------------------------------------------------------------------
 
 
+class ChatInputEdit(QTextEdit):
+    """支持多行打字、Enter 快捷发送与 Shift+Enter 换行的聊天输入框。
+
+    兼容 QLineEdit 的调用契约（text / setText / clear / returnPressed）。
+    """
+
+    returnPressed = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setAcceptRichText(False)
+        self.setMinimumHeight(64)
+        self.setMaximumHeight(110)
+
+    def text(self) -> str:
+        return self.toPlainText()
+
+    def setText(self, text: str) -> None:
+        self.setPlainText(text)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if event.modifiers() & Qt.ShiftModifier:
+                super().keyPressEvent(event)
+            else:
+                self.returnPressed.emit()
+                event.accept()
+        else:
+            super().keyPressEvent(event)
+
+
 class ChatDialog(QDialog):
     """AI 谈话助手：左边看记录、右边打字、上面挑模型。
 
@@ -318,6 +350,7 @@ class ChatDialog(QDialog):
         self._last_error = ""
         # 这一轮回答是否已经在记录框里"落笔"了（流式显示时只在第一块写一次说话人）
         self._answer_open = False
+        self._banner_action_btn_connected = False
 
         self._build()
         if models is None:
@@ -331,74 +364,184 @@ class ChatDialog(QDialog):
     # ---------------------------------------------------------------- 搭界面
     def _build(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(20, 18, 20, 18)
+        root.setContentsMargins(20, 16, 20, 16)
         root.setSpacing(10)
+
+        # 顶栏：标题 + 模型下拉框 + 模型中心/推理核心按钮
+        top_bar = QHBoxLayout()
+        top_bar.setSpacing(8)
 
         head = QLabel("AI 谈话助手")
         head.setObjectName("H3")
-        root.addWidget(head)
+        top_bar.addWidget(head)
 
+        top_bar.addStretch(1)
+
+        model_label = QLabel("模型：")
+        top_bar.addWidget(model_label)
+
+        self.model_combo = QComboBox()
+        self.model_combo.setMinimumWidth(260)
+        self.model_combo.currentIndexChanged.connect(self._on_model_changed)
+        top_bar.addWidget(self.model_combo)
+
+        self.model_center_btn = QPushButton("模型中心")
+        self.model_center_btn.setObjectName("Ghost")
+        self.model_center_btn.setMinimumHeight(30)
+        self.model_center_btn.setToolTip("查看可用模型并一键下载")
+        self.model_center_btn.clicked.connect(self._open_model_center)
+        top_bar.addWidget(self.model_center_btn)
+
+        self.backend_setup_btn = QPushButton("下载推理核心")
+        self.backend_setup_btn.setObjectName("Ghost")
+        self.backend_setup_btn.setMinimumHeight(30)
+        self.backend_setup_btn.setToolTip("安装本地推理运行核心")
+        self.backend_setup_btn.clicked.connect(self._open_backend_setup)
+        top_bar.addWidget(self.backend_setup_btn)
+
+        root.addLayout(top_bar)
+
+        # 状态行（测试要求常驻、含指定关键字、无 Markdown 记号）
         self.status_label = QLabel("")
         self.status_label.setObjectName("Muted")
         self.status_label.setWordWrap(True)
-        # ★ 需要换行的 label 必须给宽度约束，否则会把窗口撑宽（AGENTS.md 4c）
         self.status_label.setMinimumWidth(420)
         root.addWidget(self.status_label)
 
-        picker = QHBoxLayout()
-        picker.setSpacing(8)
-        picker.addWidget(QLabel("模型："))
-        self.model_combo = QComboBox()
-        self.model_combo.setMinimumWidth(320)
-        self.model_combo.currentIndexChanged.connect(self._on_model_changed)
-        picker.addWidget(self.model_combo, 1)
-        root.addLayout(picker)
+        # 提示横幅（当未安装推理核心或未下载模型时突出展示，并带一键直达动作按钮）
+        self._banner_card = QFrame()
+        self._banner_card.setObjectName("Card")
+        banner_layout = QHBoxLayout(self._banner_card)
+        banner_layout.setContentsMargins(14, 8, 14, 8)
+        banner_layout.setSpacing(10)
 
-        body = QHBoxLayout()
-        body.setSpacing(14)
+        self._banner_label = QLabel("", self._banner_card)
+        self._banner_label.setWordWrap(True)
+        banner_layout.addWidget(self._banner_label, 1)
 
+        self._banner_mode = "engine"
+        self._banner_action_btn = QPushButton("", self._banner_card)
+        self._banner_action_btn.setObjectName("Primary")
+        self._banner_action_btn.setMinimumHeight(32)
+        self._banner_action_btn.clicked.connect(self._on_banner_action_clicked)
+        banner_layout.addWidget(self._banner_action_btn)
+
+        self._banner_card.hide()
+        root.addWidget(self._banner_card)
+
+        # 中部主体：全宽谈话记录查看区
         self.history_view = QTextEdit()
         self.history_view.setObjectName("Outline")
         self.history_view.setReadOnly(True)
         self.history_view.setMinimumWidth(420)
         self.history_view.setPlaceholderText("这里显示谈话记录。")
-        body.addWidget(self.history_view, 1)
+        root.addWidget(self.history_view, 1)
 
-        side = QVBoxLayout()
-        side.setSpacing(8)
-        # ★ 输入区贴着右侧栏**底部**：最新的记录出现在左边记录框的末尾，
-        # 打字的地方就在同一水平线上（聊天窗的常规排布），不用来回找。
-        side.addStretch(1)
-        side.addWidget(QLabel("输入"))
+        # 快捷提问提纲建议行
+        chips_bar = QHBoxLayout()
+        chips_bar.setSpacing(8)
+        chips_label = QLabel("快捷提纲：")
+        chips_label.setObjectName("Muted")
+        chips_bar.addWidget(chips_label)
 
-        self.input_edit = QLineEdit()
-        self.input_edit.setPlaceholderText("说点什么…（回车发送）")
+        self._chip_buttons = []
+        prompts = [
+            ("学业谈话提纲", "请为该生梳理一份本学期的学业谈话提纲，分点给出建议。"),
+            ("挂科辅导建议", "针对该生存在不及格科目的情况，请给出具体的谈心谈话指导策略。"),
+            ("评语润色修改", "请针对该生的综合表现提供一段温暖、中肯、有针对性的期末评语。"),
+            ("未来发展指导", "请结合该生的成绩分布与学业表现，给出后续发展规划建议。"),
+        ]
+        for title, preset in prompts:
+            btn = QPushButton(title)
+            btn.setObjectName("Ghost")
+            btn.setMinimumHeight(26)
+            btn.clicked.connect(lambda _checked=False, text=preset: self._insert_prompt(text))
+            chips_bar.addWidget(btn)
+            self._chip_buttons.append(btn)
+        chips_bar.addStretch(1)
+        root.addLayout(chips_bar)
+
+        # 底部输入框容器（多行输入 + 操作按钮栏）
+        input_container = QFrame()
+        input_container.setObjectName("Card")
+        input_box = QVBoxLayout(input_container)
+        input_box.setContentsMargins(12, 10, 12, 10)
+        input_box.setSpacing(8)
+
+        self.input_edit = ChatInputEdit(input_container)
+        self.input_edit.setObjectName("chatInputEdit")
+        self.input_edit.setPlaceholderText("说点什么…（回车发送，Shift+回车换行）")
         self.input_edit.returnPressed.connect(self._on_send_clicked)
-        side.addWidget(self.input_edit)
+        input_box.addWidget(self.input_edit)
 
-        self.send_button = QPushButton("发送")
-        self.send_button.setObjectName("Primary")
-        self.send_button.setMinimumHeight(32)
-        self.send_button.clicked.connect(self._on_send_clicked)
-        side.addWidget(self.send_button)
-
-        self.export_button = QPushButton("导出文本")
-        self.export_button.setObjectName("Ghost")
-        self.export_button.setMinimumHeight(30)
-        self.export_button.clicked.connect(self._on_export_clicked)
-        side.addWidget(self.export_button)
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
 
         note = QLabel("谈话记录加密存在本机，不会上传。")
         note.setObjectName("Muted")
         note.setWordWrap(True)
-        note.setFixedWidth(240)
-        side.addWidget(note)
+        action_row.addWidget(note)
+        action_row.addStretch(1)
 
-        holder = QWidget()
-        holder.setLayout(side)
-        holder.setFixedWidth(250)
-        body.addWidget(holder)
-        root.addLayout(body, 1)
+        self.clear_btn = QPushButton("清空输入")
+        self.clear_btn.setObjectName("Ghost")
+        self.clear_btn.setMinimumHeight(32)
+        self.clear_btn.clicked.connect(self.input_edit.clear)
+        action_row.addWidget(self.clear_btn)
+
+        self.export_button = QPushButton("导出文本")
+        self.export_button.setObjectName("Ghost")
+        self.export_button.setMinimumHeight(32)
+        self.export_button.clicked.connect(self._on_export_clicked)
+        action_row.addWidget(self.export_button)
+
+        self.send_button = QPushButton("发送")
+        self.send_button.setObjectName("Primary")
+        self.send_button.setMinimumHeight(32)
+        self.send_button.setMinimumWidth(88)
+        self.send_button.clicked.connect(self._on_send_clicked)
+        action_row.addWidget(self.send_button)
+
+        input_box.addLayout(action_row)
+        root.addWidget(input_container)
+
+    def _insert_prompt(self, text: str) -> None:
+        if not self.input_edit.isEnabled():
+            return
+        current = self.input_edit.text().strip()
+        if current:
+            self.input_edit.setText(f"{current}\n{text}")
+        else:
+            self.input_edit.setText(text)
+        self.input_edit.setFocus()
+
+    def _open_backend_setup(self) -> None:
+        try:
+            from ui.widgets.backend_setup import open_backend_setup
+            open_backend_setup(self)
+        except Exception:
+            pass
+        self._scan_models()
+        self._refresh_availability()
+
+    def _open_model_center(self) -> None:
+        try:
+            from ui.model_center_dialog import open_model_center
+            open_model_center(self, on_installed=self._on_models_installed)
+        except Exception:
+            pass
+        self._scan_models()
+        self._refresh_availability()
+
+    def _on_banner_action_clicked(self) -> None:
+        if getattr(self, "_banner_mode", "engine") == "engine":
+            self._open_backend_setup()
+        else:
+            self._open_model_center()
+
+    def _on_models_installed(self, _downloaded: list[str]) -> None:
+        self._scan_models()
+        self._refresh_availability()
 
     # ------------------------------------------------------------ 模型清单
     def _scan_models(self) -> None:
@@ -524,6 +667,29 @@ class ChatDialog(QDialog):
         # ★ 动态属性只影响 QSS 选择器，改完要重新抛光一次才会重画
         self.status_label.style().unpolish(self.status_label)
         self.status_label.style().polish(self.status_label)
+
+        if not engine_ready:
+            self._banner_mode = "engine"
+            self._banner_card.show()
+            self._banner_label.setText(f"本地推理核心尚未安装：{engine_message}。请点击右侧按钮一键安装。")
+            self._banner_action_btn.setText("一键安装推理核心")
+            self.backend_setup_btn.setText("一键安装推理核心")
+            self.backend_setup_btn.setVisible(True)
+            self.backend_setup_btn.setEnabled(True)
+        elif not self._choices:
+            self._banner_mode = "model"
+            self._banner_card.show()
+            if self._models:
+                self._banner_label.setText("本机已装模型负载偏高，建议在模型中心下载更适配的模型。")
+            else:
+                self._banner_label.setText("本地模型库中暂无可用模型，请在模型中心下载轻量模型。")
+            self._banner_action_btn.setText("前往模型中心下载")
+            self.backend_setup_btn.setText("推理核心已就绪")
+            self.backend_setup_btn.setEnabled(False)
+        else:
+            self._banner_card.hide()
+            self.backend_setup_btn.setText("推理核心已就绪")
+            self.backend_setup_btn.setEnabled(False)
 
         usable = bool(self._choices) and available
         self.input_edit.setEnabled(usable)

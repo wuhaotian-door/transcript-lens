@@ -21,6 +21,7 @@ from typing import List, Optional
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -37,9 +38,11 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "BackendSetupCard",
+    "BackendSetupDialog",
     "COPY_HINT_TEXT",
     "INSTALL_QUESTION",
     "TITLE_TEXT",
+    "open_backend_setup",
 ]
 
 TITLE_TEXT = "本地推理后端"
@@ -418,3 +421,54 @@ class BackendSetupCard(QFrame):
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt 接口名
         self.stop()
         super().closeEvent(event)
+
+
+class BackendSetupDialog(QDialog):
+    """弹出式本地推理后端安装向导窗口。"""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("安装本地推理后端")
+        self.resize(620, 420)
+        self.setMinimumSize(540, 340)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+
+        self.card = BackendSetupCard(self)
+        layout.addWidget(self.card)
+
+        bottom = QHBoxLayout()
+        bottom.addStretch(1)
+        self._close_btn = QPushButton("完成 / 关闭", self)
+        self._close_btn.setObjectName("Ghost")
+        self._close_btn.setMinimumHeight(32)
+        self._close_btn.clicked.connect(self.accept)
+        bottom.addWidget(self._close_btn)
+        layout.addLayout(bottom)
+
+        self.card.ready.connect(self._on_ready)
+        self.card.refresh()
+
+    def _on_ready(self) -> None:
+        self._close_btn.setText("已就绪（点击关闭）")
+        self._close_btn.setObjectName("Primary")
+        self._close_btn.style().unpolish(self._close_btn)
+        self._close_btn.style().polish(self._close_btn)
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self.card.stop()
+        super().closeEvent(event)
+
+
+def open_backend_setup(parent: QWidget | None = None) -> bool:
+    """打开本地推理后端安装窗口。返回是否已就绪。"""
+    dialog = BackendSetupDialog(parent)
+    dialog.exec()
+    try:
+        from core.ai.runtime_setup import is_backend_available
+        return bool(is_backend_available())
+    except Exception:
+        return False
+

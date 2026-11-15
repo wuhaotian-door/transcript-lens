@@ -218,6 +218,11 @@ def _lift_1_9_3_to_1_9_4(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def _lift_1_9_4_to_1_9_5(data: dict[str, Any]) -> dict[str, Any]:
+    """1.9.4 → 1.9.5：个人侧写嵌入成长档案、AI对话UI重构与推理核心一键安装触发完善。"""
+    return data
+
+
 #: 版本链：``(起点, 终点, 变换函数)``。
 #:
 #: ★ 这是"未来版本在此添加分支"的那张表（任务书 2.3）。加一跳只需要
@@ -232,6 +237,7 @@ _STEPS: tuple[tuple[str, str, Callable[[dict[str, Any]], dict[str, Any]]], ...] 
     ("1.9.1", "1.9.2", _lift_1_9_1_to_1_9_2),
     ("1.9.2", "1.9.3", _lift_1_9_2_to_1_9_3),
     ("1.9.3", "1.9.4", _lift_1_9_3_to_1_9_4),
+    ("1.9.4", "1.9.5", _lift_1_9_4_to_1_9_5),
 )
 
 
