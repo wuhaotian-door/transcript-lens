@@ -327,7 +327,7 @@ def enable_recovery(session: UserSession, email: str, *, store: CryptoStore) -> 
     调用方必须立刻把它交给用户 —— 寄到邮箱，或者在屏幕上直接展示让用户抄下来
     （见 v1.9.8 的本地模式）。本地**不留明文**，这次不交出去就永远拿不到了。
 
-    ★ ``email`` 可以为空：v1.9.8 起，本机没有配置发信服务时注册不强制邮箱，
+    ★ ``email`` 可以为空：注册时邮箱选填，
       找回码直接显示在界面上。空邮箱只是"没绑定邮箱"，包裹本身照常工作。
 
     ★ 旧码会被直接覆盖作废（同一个文件只有一个包裹）。
@@ -387,7 +387,7 @@ def reset_password_recovery(
       重置完还能再用一次。想换新的就在个人中心"重新生成"。
 
     Raises:
-        RecoveryError: 没绑定邮箱 / 恢复码格式不对 / 码不对。
+        RecoveryError: 没有找回码记录 / 找回码格式不对 / 码不对。
     """
     record = store.load_users().find(username)
     if record is None:
@@ -397,7 +397,7 @@ def reset_password_recovery(
     if not blob:
         raise RecoveryError(
             f"「{record.username}」没有可用的找回码。\n"
-            "找回码是注册时寄到邮箱的那一封；没有它，密码忘了就打不开了。"
+            "记得旧密码时，可以登录后在个人中心生成找回码。"
         )
 
     normalized = normalize_recovery_code(code)
@@ -407,7 +407,7 @@ def reset_password_recovery(
             "（字母表里没有 0/O 和 1/I/L，横杠可以带也可以不带）"
         )
     if not check_recovery_code(store, username, normalized):
-        raise RecoveryError("找回码不对，请核对邮件里那一串。")
+        raise RecoveryError("找回码不对，请核对邮件或原先保存的找回码。")
     if not new_password:
         raise RecoveryError("新密码不能为空")
 

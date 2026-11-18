@@ -1,27 +1,4 @@
-"""「忘记密码？」对话框 —— 用注册时寄到邮箱的找回码重设密码。
-
-流程::
-
-    账号  [ 张老师 ▾ ]
-    邮箱  zh***@163.com        ← 从本地记录读出来，只显示掩码
-    找回码 [ SHFS-7BTW-… ]      ← 从邮件里复制粘贴
-    新密码 [ ●●●● ]
-    确认   [ ●●●● ]
-    [取消]  [重设密码]
-
-★ 这里**没有**"发送验证码"按钮，这是故意的
-------------------------------------------
-
-邮箱在这条流程里**不参与验证**，它只是找回码的**存放处**。
-
-原因还是那条：库密钥只在本地、只被密码包裹。忘密码那天它已经解不开了，
-"现在发一封邮件"发不出任何有用的东西 —— 新发的码没有被用来包裹过任何密钥。
-
-能解开库密钥的，只有**注册时**生成、并已经用它包好密钥的那一串找回码。
-所以这个对话框要的是"邮件里那一串"，不是"刚发的新码"。
-
-如果用户把那封邮件删了 —— 那确实没办法，界面会如实说明。
-"""
+"""输入本地保存或邮件中的 24 位找回码，重新包裹同一把库密钥。"""
 
 from __future__ import annotations
 
@@ -39,13 +16,13 @@ from PySide6.QtWidgets import (
 )
 
 from core.crypto_store import CryptoError, CryptoStore
-from core.email_recovery import mail_configured
 from core.recovery import (
     RECOVERY_CODE_LENGTH,
     RecoveryError,
     recovery_info,
     reset_password_recovery,
 )
+from core.session_token import clear_token
 #: ★ import 方向：本模块依赖 login_window 的常量，反过来 login_window
 #: 只在 `_do_forgot_password()` 里**延迟 import** 本模块 —— 单向依赖，不成环。
 from ui.login_window import MIN_PASSWORD_LENGTH
@@ -71,20 +48,18 @@ class RecoverDialog(QDialog):
     """
 
     def __init__(self, store: CryptoStore, root: str | None = None,
-                 parent: QWidget | None = None) -> None:
+                 parent: QWidget | None = None, *, username: str = "") -> None:
         super().__init__(parent)
         self._store = store
-        self._data_root = root
+        self._data_root = root if root is not None else store.root
         self._busy = False
-        #: v1.9.8：没有发信配置时，找回码是注册时**显示在屏幕上**的那一串。
-        self._mail_ready = mail_configured(root)
         self.username = ""
 
         self.setWindowTitle("找回密码")
         self.setModal(True)
         self.setMinimumWidth(520)
         self._build()
-        self._refresh_accounts()
+        self._refresh_accounts(username)
 
     # ---------------------------------------------------------------- 搭界面
     def _build(self) -> None:
@@ -96,22 +71,10 @@ class RecoverDialog(QDialog):
         title.setObjectName("H1")
         box.addWidget(title)
 
-        if self._mail_ready:
-            hint_text = (
-                "找回码在你注册成功时收到的那封邮件里"
-                "（主题：【成绩单透镜】密码找回码）。\n"
-                "把它整串复制过来即可，横杠带不带都行。"
-            )
-        else:
-            hint_text = (
-                "本机没有配置发信服务，找回码不会寄邮件 —— 它在你注册成功时"
-                "直接显示在屏幕上（注册时如果没保存，就没有了）。\n"
-                "把它整串填进来即可，横杠带不带都行。"
-            )
-        hint = QLabel(hint_text)
-        hint.setObjectName("Notice")
-        hint.setWordWrap(True)
-        box.addWidget(hint)
+        self._hint = QLabel("输入你保存的找回码。")
+        self._hint.setObjectName("Notice")
+        self._hint.setWordWrap(True)
+        box.addWidget(self._hint)
 
         form = QFormLayout()
         form.setSpacing(10)
@@ -164,15 +127,16 @@ class RecoverDialog(QDialog):
         box.addWidget(buttons)
 
     # ---------------------------------------------------------------- 数据
-    def _refresh_accounts(self) -> None:
+    def _refresh_accounts(self, username: str = "") -> None:
         try:
             index = self._store.load_users()
         except CryptoError as exc:
             self._status.setText(f"读不到账户列表：{exc}")
             return
-        names = [record.username for record in index]
+        names = [record.username for record in index if not username or record.username == username]
         self._account.clear()
         self._account.addItems(names)
+        self._account.setEnabled(not username)
         if not names:
             self._status.setText(
                 "这台电脑上还没有账户。如果文件在、但账户不见了，"
@@ -184,16 +148,22 @@ class RecoverDialog(QDialog):
     def _on_account_changed(self, name: str) -> None:
         if not name:
             self._email_label.setText("—")
+            self._hint.setText("输入你保存的找回码。")
             return
         info = recovery_info(self._store, name)
         if info["enabled"]:
             if info["email"]:
                 self._email_label.setText(_mask_email(info["email"]))
+                self._hint.setText(
+                    "可从「成绩单透镜」找回码邮件复制找回码，也可以输入你之前保存的找回码。"
+                )
             else:
                 self._email_label.setText("（本机未绑定邮箱）")
+                self._hint.setText("请使用注册或重新生成时保存的 24 位找回码。")
             self._status.setText("")
         else:
             self._email_label.setText("（没有绑定找回码）")
+            self._hint.setText("可用旧密码登录后，在个人中心生成找回码。")
             self._status.setText(
                 f"「{name}」没有可用的找回码 —— 账户是旧版本建的，"
                 "或者注册时没有完成。没有它，密码忘了就打不开了。"
@@ -212,7 +182,7 @@ class RecoverDialog(QDialog):
             QMessageBox.warning(self, "还没选账号", "请选择一个账号。")
             return
         if not code:
-            QMessageBox.warning(self, "还没填找回码", "请把邮件里那一串复制过来。")
+            QMessageBox.warning(self, "还没填找回码", "请输入你保存的 24 位找回码。")
             return
         if len(new_pass) < MIN_PASSWORD_LENGTH:
             QMessageBox.warning(self, "密码太短", f"密码至少 {MIN_PASSWORD_LENGTH} 位。")
@@ -227,6 +197,10 @@ class RecoverDialog(QDialog):
 
         def _work() -> str:
             reset_password_recovery(self._store, name, code, new_pass)
+            try:
+                clear_token(self._data_root)
+            except CryptoError:
+                pass
             return name
 
         def _done(result: str) -> None:

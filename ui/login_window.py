@@ -19,9 +19,9 @@
 
 ★ 找回密码：**走找回码**（v1.9.8 起分两种模式）
 
-* **邮箱模式**（本机配置了 ``email.json``）：注册填邮箱并验证（6 位验证码，
+* **邮箱可选**（本机配置了 ``email.json``）：填写邮箱后须验证（6 位验证码，
   10 分钟有效）；找回码寄到邮箱。
-* **本地模式**（安装包默认，没有发信配置）：注册不要求邮箱；找回码在注册成功
+* **本地模式**（邮箱留空或安装包没有发信配置）：找回码在注册成功
   时**直接显示在屏幕上**，必须当场保存。安装包不内置任何 SMTP 凭据 ——
   公开仓库放密钥等于把所有人的邮箱交出去。
 
@@ -286,17 +286,7 @@ class LoginWindow(QWidget):
         forgot.clicked.connect(self._do_forgot_password)
         box.addWidget(forgot)
 
-        if self._mail_ready:
-            warn_text = (
-                "忘了密码？用注册时寄到邮箱的那串「找回码」重设，成绩不会丢。\n"
-                "但找回码只有那一封邮件里有 —— 删了就真打不开了。"
-            )
-        else:
-            warn_text = (
-                "忘了密码？用注册时程序显示的那串「找回码」重设，成绩不会丢。\n"
-                "找回码只显示过那一次 —— 当时没保存的话就没有了。"
-            )
-        warn = QLabel(warn_text)
+        warn = QLabel("忘了密码时，可以用保存在邮件或手边的找回码重设密码。")
         warn.setObjectName("Muted")
         warn.setWordWrap(True)
         box.addWidget(warn)
@@ -329,8 +319,7 @@ class LoginWindow(QWidget):
 
         if self._mail_ready:
             warn_text = (
-                "⚠ 请记住这个密码，并填一个能收信的邮箱。\n"
-                "注册成功后会往这个邮箱寄一串「找回码」—— 忘了密码时它是唯一的出路。"
+                "邮箱可选。填写并验证后，找回码会发到该邮箱。留空时，注册成功后请保存屏幕上的找回码。"
             )
         else:
             warn_text = (
@@ -356,7 +345,7 @@ class LoginWindow(QWidget):
         mail_box.setContentsMargins(0, 0, 0, 0)
         mail_box.setSpacing(0)
 
-        mail_box.addWidget(self._label("邮箱"))
+        mail_box.addWidget(self._label("邮箱（选填）"))
         mail_row = QHBoxLayout()
         mail_row.setSpacing(8)
         self._new_email = QLineEdit()
@@ -417,7 +406,7 @@ class LoginWindow(QWidget):
 
         box.addStretch(1)
         self._register_status = QLabel(
-            f"密码至少 {MIN_PASSWORD_LENGTH} 位。先填邮箱点「发送验证码」。"
+            f"密码至少 {MIN_PASSWORD_LENGTH} 位。填写邮箱时请先验证。"
             if self._mail_ready
             else f"密码至少 {MIN_PASSWORD_LENGTH} 位。注册后会显示找回码，请当场保存。"
         )
@@ -478,7 +467,7 @@ class LoginWindow(QWidget):
 
     # ---------------------------------------------------------------- 动作
     def _do_forgot_password(self) -> None:
-        """「忘记密码？」→ 打开找回对话框（用邮件里的找回码重设密码）。
+        """「忘记密码？」→ 打开找回对话框。
 
         ★ 这里**延迟 import** ``ui.recover_dialog``：那个模块要 import 本模块的
           ``MIN_PASSWORD_LENGTH``，写在文件头上就成环了。
@@ -492,8 +481,6 @@ class LoginWindow(QWidget):
             self._set_status(
                 f"「{dialog.username}」的密码已重设，请用新密码登录。"
             )
-            if not self._remember.isChecked():
-                clear_token(self._data_root)
 
     def _do_login(self) -> None:
         if self._leaving:
@@ -682,12 +669,12 @@ class LoginWindow(QWidget):
             QMessageBox.warning(self, "还差一点", "请填账号。")
             return
         email = ""
-        if self._mail_ready:
+        if raw_email:
             try:
                 email = normalize_email(raw_email)
             except EmailCodeError:
                 QMessageBox.warning(
-                    self, "要填邮箱", "注册必须填一个能收信的邮箱 —— 找回码要寄到那里。"
+                    self, "邮箱格式不对", "请输入能收信的邮箱，或清空邮箱后直接注册。"
                 )
                 return
             if not code:
@@ -707,12 +694,11 @@ class LoginWindow(QWidget):
         self._register_btn.setEnabled(False)
         self._register_btn.setText("创建中…")
         self._set_register_status(
-            "正在校验验证码…" if self._mail_ready else "正在创建账户并生成找回码…"
+            "正在校验验证码…" if email else "正在创建账户并生成找回码…"
         )
 
         def _work() -> tuple[str, bool]:
-            # ① 邮箱验证（只在能真发信时需要；本地模式跳过）
-            if self._mail_ready:
+            if email:
                 check_email_code(email, code, root=self._data_root)
             # ② 建账户
             session = self._store.register(name, password)

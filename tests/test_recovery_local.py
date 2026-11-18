@@ -232,9 +232,10 @@ def test_login_window_shows_mail_block_when_configured(
         win.deleteLater()
 
 
-@pytest.mark.parametrize("smtp_enabled", [False, True])
-def test_register_shows_valid_recovery_code_when_mail_cannot_deliver(
-    app: QApplication, store: CryptoStore, data_root: Path, monkeypatch, smtp_enabled: bool
+@pytest.mark.parametrize(("smtp_enabled", "with_email"), [(False, True), (True, False), (True, True)])
+def test_register_shows_recovery_code_without_email_or_when_delivery_fails(
+    app: QApplication, store: CryptoStore, data_root: Path, monkeypatch,
+    smtp_enabled: bool, with_email: bool,
 ) -> None:
     from core import email_recovery
     from ui import login_window
@@ -261,15 +262,50 @@ def test_register_shows_valid_recovery_code_when_mail_cannot_deliver(
         window._new_user.setText("test_registration")
         window._new_pass.setText(PASSWORD)
         window._new_pass2.setText(PASSWORD)
-        window._new_email.setText("test@example.com")
+        window._new_email.setText("test@example.com" if with_email else "")
         window._new_code.setText("123456")
         window._do_register()
-        assert bool(checked) == smtp_enabled
+        assert bool(checked) == (smtp_enabled and with_email)
         assert len(shown) == 1
         assert check_recovery_code(store, "test_registration", shown[0])
         store.login("test_registration", PASSWORD)
     finally:
         window.deleteLater()
+
+
+def test_recovery_dialog_for_current_account_uses_saved_code_and_revokes_token(
+    app: QApplication, store: CryptoStore, data_root: Path, monkeypatch
+) -> None:
+    from core.session_token import save_token
+    from ui import recover_dialog
+    from ui.pages.account_page import _ChangePasswordDialog
+
+    original = store.register("recover-user", PASSWORD)
+    store.register("another-user", PASSWORD)
+    store.save(original, FILE_GRADES, {"score": 91})
+    code = enable_recovery(original, "test@example.com", store=store)
+    token = save_token("recover-user", root=data_root)
+    monkeypatch.setattr(recover_dialog, "run_async",
+                        lambda _parent, work, *, on_done, on_error: on_done(work()))
+    choice = _ChangePasswordDialog("recover-user", can_use_recovery=True)
+    dialog = recover_dialog.RecoverDialog(store, username="recover-user")
+    try:
+        choice._choose_recovery()
+        assert choice.use_recovery
+        assert not dialog._account.isEnabled()
+        assert dialog._account.count() == 1
+        assert "找回码邮件" in dialog._hint.text()
+        dialog._code.setText(code)
+        dialog._new_pass.setText(NEW_PASSWORD)
+        dialog._new_pass2.setText(NEW_PASSWORD)
+        dialog._do_reset()
+        assert dialog.username == "recover-user"
+        session = store.login("recover-user", NEW_PASSWORD)
+        assert store.load(session, FILE_GRADES) == {"score": 91}
+        assert not token.exists()
+    finally:
+        choice.deleteLater()
+        dialog.deleteLater()
 
 
 # ---------------------------------------------------------------------------

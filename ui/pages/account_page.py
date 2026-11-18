@@ -318,8 +318,18 @@ class AccountPage(QWidget):
             QMessageBox.warning(self, "还没有登录", "请先登录。")
             return
 
-        dialog = _ChangePasswordDialog(self._username, parent=self)
+        username = self._username
+        dialog = _ChangePasswordDialog(
+            username, parent=self, can_use_recovery=recovery_info(self._store, username)["enabled"]
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dialog.use_recovery:
+            from ui.recover_dialog import RecoverDialog
+
+            recovery = RecoverDialog(self._store, self._data_root, parent=self, username=username)
+            if recovery.exec() == QDialog.DialogCode.Accepted:
+                self._set_pwd_status(f"「{username}」的密码已更新。")
             return
         old_password = dialog.old_password
         new_password = dialog.new_password
@@ -332,9 +342,9 @@ class AccountPage(QWidget):
 
         def _work() -> str:
             # login 解出库密钥（也就验了旧密码），change_password 再换新的包裹
-            session = self._store.login(self._username, old_password)
+            session = self._store.login(username, old_password)
             self._store.change_password(session, old_password, new_password)
-            return self._username
+            return username
 
         def _done(name: str) -> None:
             self._pwd_btn.setEnabled(True)
@@ -349,17 +359,11 @@ class AccountPage(QWidget):
             except Exception:  # noqa: BLE001 - 清不掉也要能继续用
                 token_note = ""
             self._set_pwd_status(f"「{name}」的密码已更新。{token_note}")
-            code_hint = (
-                "· 邮箱里的找回码依然有效 —— 它包的是同一把库密钥。\n"
-                if self._mail_ready
-                else "· 你保存的那串找回码依然有效 —— 它包的是同一把库密钥。\n"
-            )
             QMessageBox.information(
                 self,
                 "密码已修改",
                 f"账户「{name}」的密码已经改好。\n\n"
-                "· 成绩库没有被重新加密，一条数据都没动。\n"
-                + code_hint
+                "请使用新密码登录。此前保存的找回码仍可使用。\n"
                 + (f"· {token_note}\n" if token_note else ""),
             )
 
@@ -391,8 +395,10 @@ class _ChangePasswordDialog(QDialog):
     密码只在内存里待一会儿：不落盘、不打日志、不进异常信息。
     """
 
-    def __init__(self, username: str, parent: QWidget | None = None) -> None:
+    def __init__(self, username: str, parent: QWidget | None = None,
+                 *, can_use_recovery: bool = False) -> None:
         super().__init__(parent)
+        self.use_recovery = False
         self.old_password = ""
         self.new_password = ""
         self.setWindowTitle("修改密码")
@@ -428,6 +434,11 @@ class _ChangePasswordDialog(QDialog):
         box.addWidget(self._new2)
 
         buttons = QDialogButtonBox()
+        if can_use_recovery:
+            recovery = QPushButton("用找回码修改")
+            recovery.setObjectName("Ghost")
+            recovery.clicked.connect(self._choose_recovery)
+            buttons.addButton(recovery, QDialogButtonBox.ButtonRole.ActionRole)
         cancel = QPushButton("取消")
         cancel.setObjectName("Ghost")
         cancel.clicked.connect(self.reject)
@@ -438,6 +449,10 @@ class _ChangePasswordDialog(QDialog):
         ok.clicked.connect(self._accept)
         buttons.addButton(ok, QDialogButtonBox.ButtonRole.AcceptRole)
         box.addWidget(buttons)
+
+    def _choose_recovery(self) -> None:
+        self.use_recovery = True
+        self.accept()
 
     def _accept(self) -> None:
         old = self._old.text()
