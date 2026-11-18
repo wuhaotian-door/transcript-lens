@@ -111,11 +111,33 @@ Start-Sleep -Seconds 3          # 句柄释放有延迟，马上重打会被占�
 
 | 目标 | 路径 | 大小量级 | 给谁 |
 |---|---|---|---|
-| release | `dist\transcript-lens.exe` | ~230MB | **给辅导员的**（单文件、双击就跑） |
+| release 本地入口 | `dist\transcript-lens.exe` | ~230MB | 固定路径，供本地启动 |
+| release 发布包 | `release\成绩透析镜v<版本>.exe` | ~230MB | 对外发布，单文件、双击就跑 |
 | debug | `dist\transcript-lens-debug\` | ~680MB | 自己排查用（带控制台） |
 
-> `dist/`、`build/`、`*.spec` 都在 `.gitignore` 里。**绝不要 `git add` 它们** ——
+发布包文件名从 `core/version.py` 读取版本号，例如 `成绩透析镜v1.9.5.exe`。
+程序窗口和 Windows 可执行文件共用 `ui/assets/app.ico`。
+
+> `dist/`、`build/`、`release/`、`*.spec` 都在 `.gitignore` 里。**绝不要 `git add` 它们** ——
 > `build_exe.ps1` 最后一步会显式检查这一点。
+
+### Windows 安装向导
+
+先构建并验证单文件版，再用 [Inno Setup](https://jrsoftware.org/inno-setup/downloads) 打包。
+
+```powershell
+.\build_exe.ps1 -Target release
+.\build_installer.ps1 -CompilerPath 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+```
+
+`-LanguageFile` 可传入 Inno Setup 对应版本的 `ChineseSimplified.isl`，用来生成中文向导。
+安装包输出为 `release\成绩透析镜v<版本>-安装向导.exe`。适用于 64 位 Windows 10/11，
+默认安装在当前用户的程序目录，无需管理员权限。向导默认安装程序文件，可选建开始菜单快捷方式并登记到 Windows 应用列表。
+默认安装完成后，从所选目录启动 `transcript-lens.exe` 或运行 `unins000.exe` 卸载。
+卸载器只移除安装的程序文件和快捷方式，成绩库仍使用 `%LOCALAPPDATA%\SGMS`。
+
+安装向导用于首次安装或手动覆盖安装。在线更新清单中的 `app` 仍指向可直接启动的单文件 EXE 或它的分片。
+更新清单应在相应程序附件可下载且校验值确认后修改。
 
 ### 第 4 步：打 tag + 建 Release
 
@@ -144,7 +166,7 @@ git push origin v1.9
 
 ### 第 5 步：上传文件到网盘
 
-把 `dist\transcript-lens.exe` 传到网盘（任选：蓝奏云 / 阿里云盘 / 奶牛快传 /
+把 `release\成绩透析镜v<版本>.exe` 传到网盘（任选：蓝奏云 / 阿里云盘 / 奶牛快传 /
 对象存储 / 自己的服务器），**拿到直链**。
 
 | 要求 | 为什么 |

@@ -29,9 +29,11 @@
 from __future__ import annotations
 
 import csv
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -39,7 +41,7 @@ from core import scholarship
 from core.crypto_store import CryptoStore, default_root
 from core.excel_io import ExcelEngineError, friendly_error, read_frame, sanitize_message
 from core.parser import normalize_header, strip_blank_marker, to_float
-from core.user_store import load_user_json, save_user_json
+from core.user_store import ROSTER_WRITE_LOCK, load_user_json, save_user_json
 
 __all__ = [
     "BATCH_FILE",
@@ -89,6 +91,11 @@ NAME_HEADER_KEYWORDS = ("姓名", "学生姓名", "名字", "考生姓名")
 CLASS_HEADER_KEYWORDS = ("班级", "行政班", "所在班级", "班级名称", "班别")
 SCORE_HEADER_KEYWORDS = (
     "德育分", "德育成绩", "德育", "品德分", "品德", "分值", "分数", "得分", "分值合计",
+)
+
+_MORAL_TITLE = re.compile(
+    r"(?P<class_name>[A-Za-z0-9][A-Za-z0-9-]*)\s*班(?:学生)?\s*"
+    r"(?P<start>\d{4})\s*[-—–]+\s*(?P<end>\d{4})\s*学年\s*品行诚信"
 )
 
 #: 表头最多往下找几行。德育分表常见"大标题 + 制表日期"两行在前面。
@@ -199,6 +206,7 @@ class ColumnMap:
     class_col: int | None = None
     score_col: int | None = None
     hits: int = 0
+    component_cols: tuple[int, int, int] | None = None
 
     @property
     def missing(self) -> list[str]:
@@ -250,8 +258,10 @@ def detect_columns(df: Any) -> ColumnMap:
     for r in range(limit):
         row = df.iloc[r]
         found: dict[str, list[int]] = {"id": [], "name": [], "class": [], "score": []}
+        headers: dict[str, int] = {}
         for c in range(len(row)):
             text = normalize_header(row.iloc[c])
+            headers.setdefault("".join(text.split()), c)
             if _match_header(text, ID_HEADER_KEYWORDS):
                 found["id"].append(c)
             if _match_header(text, NAME_HEADER_KEYWORDS):
@@ -260,7 +270,12 @@ def detect_columns(df: Any) -> ColumnMap:
                 found["class"].append(c)
             if _match_header(text, SCORE_HEADER_KEYWORDS):
                 found["score"].append(c)
-        score = sum(1 for v in found.values() if v)
+        total_col = next((c for label, c in headers.items() if label.startswith("合计总分")), None)
+        component_labels = ("基本分", "加分小计", "扣分小计")
+        if total_col is not None and all(label in headers for label in component_labels):
+            found["score"] = [total_col]
+            found["components"] = [headers[label] for label in component_labels]
+        score = sum(bool(found[key]) for key in ("id", "name", "class", "score"))
         if score > best_score:
             best_score = score
             best_row = r
@@ -284,6 +299,7 @@ def detect_columns(df: Any) -> ColumnMap:
         class_col=first("class"),
         score_col=first("score"),
         hits=best_score,
+        component_cols=tuple(best_cols["components"]) if "components" in best_cols else None,
     )
     if columns.missing:
         raise ImportFormatError(
@@ -377,6 +393,8 @@ class ImportPlan:
     rounded: list[str] = field(default_factory=list)
     blank_rows: int = 0
     total_rows: int = 0
+    year: str = ""
+    school_year: str = ""
 
     @property
     def failures(self) -> list[ErrorRow]:
@@ -402,6 +420,7 @@ def plan_import(
     sheet_name: int | str = 0,
     known_classes: Sequence[str] = (),
     default_class: str = "",
+    year: str = "",
     frame: Any = None,
 ) -> ImportPlan:
     """把一张表校验成一个 :class:`ImportPlan`（**只读，不动库**）。
@@ -420,14 +439,30 @@ def plan_import(
     df = read_table(target, sheet_name=sheet_name) if frame is None else frame
     columns = detect_columns(df)
     known = {str(name).strip() for name in known_classes if str(name).strip()}
-    plan = ImportPlan(path=target, columns=columns)
+    if year and year not in scholarship.ACADEMIC_YEARS:
+        raise ImportFormatError("请选择大一至大四中的一个学年。")
+    plan = ImportPlan(path=target, columns=columns, year=year)
+    fallback_class = (default_class or "").strip()
+    source_class = ""
+    if columns.component_cols is not None:
+        title = next(
+            (match for cell in df.iloc[:columns.header_row].to_numpy().flat
+             if (match := _MORAL_TITLE.search(normalize_header(cell))) is not None),
+            None,
+        )
+        if title is not None:
+            source_class = title["class_name"]
+            plan.school_year = f"{title['start']}-{title['end']}"
+            if fallback_class and fallback_class != source_class:
+                raise ImportFormatError(f"表头属于「{source_class}」班，请切换到该班再导入。")
+            fallback_class = source_class
+        plan.warnings.append("已按基本分、加分小计与扣分小计复算合计总分，上限为 100 分。")
 
     if df.shape[0] <= columns.header_row + 1:
         plan.warnings.append("这张表只有表头，没有数据行。")
         return plan
 
     seen: dict[str, int] = {}
-    fallback_class = (default_class or "").strip()
 
     for r in range(columns.header_row + 1, df.shape[0]):
         cells = df.iloc[r]
@@ -442,6 +477,10 @@ def plan_import(
         raw_name = _cell_text(cell(columns.name_col))
         raw_class = _cell_text(cell(columns.class_col)) or fallback_class
         raw_score_text = _cell_text(cell(columns.score_col))
+        if columns.component_cols is not None and not raw_id and not raw_name and not raw_score_text:
+            label = _cell_text(cell(0))
+            if (r == columns.header_row + 1 and not label) or "签名" in label:
+                continue
         plan.total_rows += 1
 
         if all(_is_blank(cell(c)) for c in (columns.id_col, columns.name_col,
@@ -459,6 +498,8 @@ def plan_import(
             reason = "姓名为空"
         elif not raw_class:
             reason = "这一行没有班级，文件里也没有班级列，界面上也没选目标班级"
+        elif source_class and raw_class != source_class:
+            reason = f"班级「{raw_class}」与表头班级「{source_class}」不一致"
         elif raw_class not in known:
             # ★ 这里**不写 ``if known and ...``**：一个班都没有的时候，每一行都
             #   该以"班级还没建过"失败。放过去的话，德育分会写进一个没有班级
@@ -476,16 +517,22 @@ def plan_import(
 
         value: float | None = None
         if not reason:
-            if _is_blank(cell(columns.score_col)) or strip_blank_marker(
-                    raw_score_text) is None:
+            if columns.component_cols is not None:
+                try:
+                    value = _score_from_subtotals(
+                        tuple(_cell_text(cell(col)) for col in columns.component_cols), raw_score_text
+                    )
+                except ValueError as exc:
+                    reason = str(exc)
+            elif _is_blank(cell(columns.score_col)) or strip_blank_marker(raw_score_text) is None:
                 reason = "德育分是空的"
             else:
                 value = to_float(raw_score_text)
-                if value is None or value != value:      # NaN 也不等于自己
+            if not reason:
+                if value is None or value != value:
                     reason = f"德育分「{raw_score_text}」不是数字"
                 elif not (MORAL_MIN <= value <= MORAL_MAX):
-                    reason = (f"德育分 {value:g} 超出 {MORAL_MIN}-{MORAL_MAX}，"
-                              f"写进去只会变成错的分")
+                    reason = f"德育分 {value:g} 超出 {MORAL_MIN}-{MORAL_MAX}"
 
         if reason:
             plan.errors.append(ErrorRow(
@@ -495,13 +542,13 @@ def plan_import(
             continue
 
         assert value is not None
-        rounded = int(round(value))          # 见下方注释：和手填那条路同一个取整
-        if rounded != value:
+        score = value if year or columns.component_cols is not None else float(round(value))
+        if score != value:
             plan.rounded.append(raw_id or raw_name)
         seen[f"{raw_class}|{raw_id}"] = r
         plan.rows.append(RawRow(
             row_index=r, student_id=raw_id, student=raw_name,
-            class_name=raw_class, score_text=raw_score_text, score=float(rounded),
+            class_name=raw_class, score_text=raw_score_text, score=score,
         ))
 
     if plan.rounded:
@@ -515,9 +562,21 @@ def plan_import(
     return plan
 
 
-# 取整一律用内置 round()（银行家舍入），和「保存德育分」按钮那条路
-# （ui/pages/scholarship_page.py 里的 int(round(float(text)))）**完全一致**：
-# 同一份数据，手填和导入必须算出同一个分数，否则"谁抄错了"永远说不清。
+def _score_from_subtotals(components: tuple[str, ...], stated: str) -> float:
+    base, bonus, deduction = components
+    try:
+        base_value, bonus_value, deduction_value = map(Decimal, (base, bonus or "0", deduction or "0"))
+        total = Decimal(stated) if stated else None
+    except InvalidOperation as exc:
+        raise ValueError("基本分、加扣分小计或合计总分无法读成数字") from exc
+    if not all(x.is_finite() for x in (base_value, bonus_value, deduction_value)):
+        raise ValueError("基本分和加扣分小计必须是有限数字")
+    if bonus_value < 0 or deduction_value > 0:
+        raise ValueError("加分小计应为正分，扣分小计应为负分或零")
+    calculated = min(Decimal(MORAL_MAX), base_value + bonus_value + deduction_value)
+    if total is not None and (not total.is_finite() or total != calculated):
+        raise ValueError(f"表内合计 {total} 与按小计复算的 {calculated} 不一致，请核对原表")
+    return float(calculated)
 
 
 # ---------------------------------------------------------------------------
@@ -563,6 +622,8 @@ class ImportSummary:
     classes: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     errors_path: Path | None = None
+    year: str = ""
+    school_year: str = ""
 
     @property
     def succeeded(self) -> int:
@@ -577,6 +638,8 @@ class ImportSummary:
         ]
         if self.classes:
             lines.append("涉及班级：" + "、".join(self.classes))
+        if self.year:
+            lines.append(f"学年：{self.year}" + (f"（{self.school_year}）" if self.school_year else ""))
         if self.errors_path is not None:
             lines.append(f"失败和跳过的清单已导出：{self.errors_path}")
         for note in self.warnings:
@@ -584,7 +647,8 @@ class ImportSummary:
         return "\n".join(lines)
 
 
-def _roster(store: CryptoStore, username: str, class_name: str) -> dict[str, str]:
+def _roster(store: CryptoStore, username: str, class_name: str, *,
+            year: str = "", school_year: str = "") -> dict[str, str]:
     """这个班的「学号 → 学生 key」对照表。
 
     ★ 为什么不直接拼 ``sid:<学号>``：班级快照里的 key 是**导入成绩时**就算好
@@ -592,9 +656,15 @@ def _roster(store: CryptoStore, username: str, class_name: str) -> dict[str, str
       自己再拼一遍就等于开第二个真源 —— 拼法一变，德育分全部对不上人。
       所以能查名单就查名单，拼 key 只作为名单为空时的兜底。
     """
-    record = scholarship.load_class(store, username, class_name)
+    record = (scholarship.load_year_class(store, username, class_name, year)
+              if year else scholarship.load_class(store, username, class_name))
     if record is None:
         return {}
+    if school_year and record.school_year and school_year != record.school_year:
+        raise ImportApplyError(
+            f"德育表是 {school_year} 学年，{class_name} 班{year}的成绩卡是 "
+            f"{record.school_year} 学年。请检查选中的学年。"
+        )
     out: dict[str, str] = {}
     for student in record.students:
         sid = str(student.get("student_id") or "").strip()
@@ -620,9 +690,23 @@ def apply_plan(
     Raises:
         ImportApplyError: 一个班都写不进去（账户没了 / 盘写不了）。
     """
+    with ROSTER_WRITE_LOCK:
+        return _apply_plan(store, username, plan, batch_id, error_dir)
+
+
+def _apply_plan(
+    store: CryptoStore,
+    username: str,
+    plan: ImportPlan,
+    batch_id: str,
+    error_dir: str | Path | None,
+) -> ImportSummary:
+    if plan.school_year and not plan.year:
+        raise ImportApplyError("请先选择这份德育表对应的大一至大四学年。")
     batch = batch_id or new_batch_id()
     summary = ImportSummary(batch_id=batch, source=plan.path.name,
-                            total=plan.total_rows, blank=plan.blank_rows)
+                            total=plan.total_rows, blank=plan.blank_rows,
+                            year=plan.year, school_year=plan.school_year)
     summary.classes = plan.classes
     summary.warnings = list(plan.warnings)
 
@@ -635,9 +719,11 @@ def apply_plan(
     rosters: dict[str, dict[str, str]] = {}
     for row in plan.rows:
         if row.class_name not in rosters:
-            rosters[row.class_name] = _roster(store, username, row.class_name)
+            rosters[row.class_name] = _roster(
+                store, username, row.class_name, year=plan.year, school_year=plan.school_year
+            )
         roster = rosters[row.class_name]
-        if roster:
+        if roster or plan.year:
             key = roster.get(row.student_id)
             if key is None:
                 extra_errors.append(ErrorRow(
@@ -654,15 +740,17 @@ def apply_plan(
 
     saved_classes = 0
     for class_name, rows in by_class.items():
-        moral = scholarship.load_moral(store, username, class_name)
+        moral = scholarship.load_moral(store, username, class_name, year=plan.year,
+                                       school_year=plan.school_year)
         for row in rows:
             if row.key in moral:
                 summary.updated += 1
             else:
                 summary.added += 1
-            moral[row.key] = int(row.score or 0)
+            moral[row.key] = row.score if row.score is not None else 0.0
         try:
-            scholarship.save_moral(store, username, class_name, moral)
+            scholarship.save_moral(store, username, class_name, moral, year=plan.year,
+                                   school_year=plan.school_year)
         except Exception as exc:                    # noqa: BLE001 —— 换成人话再抛
             raise ImportApplyError(
                 f"「{class_name}」的德育分写不进去：{type(exc).__name__}: {exc}"
@@ -692,6 +780,7 @@ def run_import(
     *,
     sheet_name: int | str = 0,
     default_class: str = "",
+    year: str = "",
     error_dir: str | Path | None = None,
     known_classes: Sequence[str] | None = None,
     frame: Any = None,
@@ -716,7 +805,7 @@ def run_import(
     report = progress or (lambda done, total, message: None)
     report(0, 3, "正在读表…")
     plan = plan_import(path, sheet_name=sheet_name, known_classes=known_classes,
-                       default_class=default_class, frame=frame)
+                       default_class=default_class, year=year, frame=frame)
     report(1, 3, f"校验完成：{len(plan.rows)} 行可导入，"
                  f"{len(plan.failures)} 行失败，{len(plan.skipped)} 行跳过")
     report(2, 3, "正在写库…")
@@ -758,6 +847,8 @@ def record_batch(
         "failed": summary.failed,
         "skipped": summary.skipped,
         "classes": list(summary.classes),
+        "year": summary.year,
+        "school_year": summary.school_year,
         "errors_file": str(summary.errors_path) if summary.errors_path else "",
     }
     items = [item for item in load_batches(store, username)

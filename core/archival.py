@@ -30,7 +30,13 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
-from core.calculator import CalculationResult, CalculationScope, calculate_student
+from core.calculator import (
+    CalculationResult,
+    CalculationScope,
+    CourseScore,
+    calculate_student,
+    dedupe_courses,
+)
 from core.parser import Category, Course, ExamRow, ParseResult
 
 __all__ = [
@@ -211,10 +217,11 @@ class StudentArchive:
     key: str
     student: str
     records: list[SemesterRecord] = field(default_factory=list)
+    roster_id: str = ""
 
     @property
     def student_id(self) -> str:
-        return next((r.student_id for r in self.records if r.student_id), "")
+        return self.roster_id or next((r.student_id for r in self.records if r.student_id), "")
 
     @property
     def terms(self) -> list[str]:
@@ -225,12 +232,21 @@ class StudentArchive:
         )
 
     @property
+    def calculation_records(self) -> list[SemesterRecord]:
+        """完整学年与单学期归档并存时，累计统计采用完整学年。"""
+        years = {r.term for r in self.records if r.term + "下" in SEMESTER_ORDER}
+        return [
+            r for r in self.sorted_records
+            if not (r.term in SEMESTER_ORDER and r.term[:-1] in years)
+        ]
+
+    @property
     def total_credit(self) -> float:
-        return sum(r.total_credit for r in self.records)
+        return sum(r.total_credit for r in self.calculation_records)
 
     @property
     def weighted_sum(self) -> float:
-        return sum(r.weighted_sum for r in self.records)
+        return sum(r.weighted_sum for r in self.calculation_records)
 
     @property
     def cumulative_average(self) -> float | None:
@@ -257,7 +273,7 @@ class StudentArchive:
         from core.calculator import dedupe_courses
 
         pairs: list[tuple[Course, float | None]] = []
-        for record in self.sorted_records:
+        for record in self.calculation_records:
             for snapshot in record.courses:
                 pairs.append(
                     (
@@ -281,11 +297,11 @@ class StudentArchive:
 
     @property
     def failed_total(self) -> int:
-        return sum(len(r.failed_courses) for r in self.records)
+        return sum(len(r.failed_courses) for r in self.calculation_records)
 
     @property
     def absent_total(self) -> int:
-        return sum(len(r.absent_courses) for r in self.records)
+        return sum(len(r.absent_courses) for r in self.calculation_records)
 
     @property
     def all_warnings(self) -> list[str]:
@@ -296,6 +312,7 @@ class StudentArchive:
             "key": self.key,
             "student": self.student,
             "records": [r.as_dict() for r in self.sorted_records],
+            **({"student_id": self.roster_id} if self.roster_id else {}),
         }
 
     to_dict = as_dict
@@ -306,6 +323,7 @@ class StudentArchive:
             key=str(data.get("key", "")),
             student=str(data.get("student", "")),
             records=[SemesterRecord.from_dict(r) for r in data.get("records", [])],
+            roster_id=str(data.get("student_id") or ""),
         )
 
 
@@ -361,6 +379,8 @@ class Archive:
         effective_name = (new_name or target_student.student).strip()
 
         target_student.student = effective_name
+        if target_student.roster_id:
+            target_student.roster_id = effective_id
         for r in target_student.records:
             if effective_name:
                 r.student = effective_name
@@ -434,6 +454,8 @@ def semester_rank(term: str) -> int:
     text = (term or "").strip()
     if text in SEMESTER_ORDER:
         return SEMESTER_ORDER.index(text)
+    if text + "下" in SEMESTER_ORDER:
+        return SEMESTER_ORDER.index(text + "下")
     return len(SEMESTER_ORDER) + 1
 
 
@@ -488,14 +510,19 @@ def build_archive(
             existing = StudentArchive(key=key, student=row.student)
             new_students[key] = existing
 
-        snapshots = [
-            CourseSnapshot(
+        scores = dedupe_courses(
+            CourseScore(
                 name=course.name,
+                category=course.category,
                 credit=float(course.credit),
-                category=course.category.value,
                 score=row.score_list[index] if index < len(row.score_list) else None,
             )
             for index, course in enumerate(courses)
+        ).course_scores
+        snapshots = [
+            CourseSnapshot(name=course.name, credit=course.credit,
+                           category=course.category.value, score=course.score)
+            for course in scores
         ]
         record = SemesterRecord(
             term=term,
@@ -576,7 +603,7 @@ def trend(
     只有学期数 ≥ 2 时才有 Δ。返回的 ``series`` 是每一段的明细，
     供时间轴直接画。
     """
-    terms = archive.terms
+    terms = list(dict.fromkeys(record.term for record in archive.calculation_records))
     series = [
         {"term": term, "average": term_average(archive, term, scope)}
         for term in terms
@@ -616,12 +643,12 @@ def partition(
     """
     failed = [
         {"term": r.term, "course": name}
-        for r in archive.sorted_records
+        for r in archive.calculation_records
         for name in r.failed_courses
     ]
     absent = [
         {"term": r.term, "course": name}
-        for r in archive.sorted_records
+        for r in archive.calculation_records
         for name in r.absent_courses
     ]
     known = [

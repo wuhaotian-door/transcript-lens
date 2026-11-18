@@ -40,7 +40,6 @@
 
 from __future__ import annotations
 
-import logging
 import traceback
 
 from PySide6.QtCore import QTimer, Qt, Signal
@@ -80,7 +79,6 @@ from ui.pages import (
 __all__ = ["APP_NAME", "MainWindow", "NAV_ITEMS", "PROFILE_NAV_KEY", "TOPBAR_HEIGHT"]
 
 #: 本模块的日志器。补档失败**只记 warning**，绝不影响导入结果、绝不弹窗。
-_log = logging.getLogger(__name__)
 
 #: 程序名（侧栏顶部）
 APP_NAME = "成绩单透镜"
@@ -245,11 +243,6 @@ class MainWindow(QMainWindow):
 
         box.addStretch(1)
 
-        foot = QLabel("本地离线 · 成绩不出这台电脑")
-        foot.setObjectName("BrandSub")
-        foot.setWordWrap(True)
-        foot.setContentsMargins(18, 8, 14, 16)
-        box.addWidget(foot)
         return side
 
     def _build_topbar(self) -> WindowTitleBar:
@@ -293,7 +286,7 @@ class MainWindow(QMainWindow):
     def _wire(self) -> None:
         # 智育分析页双击/点「侧写」→ 切到成长档案页的二级个人专属侧写
         self.analysis_page.student_selected.connect(self._open_archive_profile)
-        # 名单更新时，顺手补进学生主档
+        # 分析页的名单也给旧侧写入口使用。
         self.analysis_page.roster_changed.connect(self._on_roster_changed)
         # 个人中心「切换账号」
         self.account_page.switch_account.connect(self.switch_account.emit)
@@ -301,6 +294,9 @@ class MainWindow(QMainWindow):
         self.settings_page.set_export_provider(self.analysis_page.export_records)
         # ★ 导入完一个班 → 成长档案 / 奖学金两页立刻能选到它，不用切页重进
         self.analysis_page.class_saved.connect(self._on_class_saved)
+        self.archive_page.student_deleted.connect(self._on_student_deleted, Qt.ConnectionType.QueuedConnection)
+        self.archive_page.class_deleted.connect(self._on_class_deleted, Qt.ConnectionType.QueuedConnection)
+        self.archive_page.model_settings_requested.connect(self._go_model_settings)
         # ★ v1.9.1：设置页删完成绩库 → 别的页面读的是**同一个库**，
         #   不刷新就会继续显示已经删掉的学生（AGENTS §18：一处真源 + 信号刷新）。
         #   ★ 这条信号原先**没有接收方**（第一波只把发射端做出来了）。
@@ -328,13 +324,25 @@ class MainWindow(QMainWindow):
           某一页没刷新出来是显示问题，不该打断用户看成绩。
         """
         try:
-            self.scholarship_page.reload_classes(select=class_name)
+            self.scholarship_page.reload_classes(select=class_name, year=self.analysis_page.term[:2])
         except Exception:  # noqa: BLE001
             traceback.print_exc()
         try:
             self.archive_page.reload()
         except Exception:  # noqa: BLE001
             traceback.print_exc()
+
+    def _go_model_settings(self) -> None:
+        self.goto(self._stack.indexOf(self.settings_page))
+        self.settings_page.focus_model_settings()
+
+    def _on_class_deleted(self, class_name: str, removed: tuple[str, ...]) -> None:
+        self.analysis_page.forget_class(class_name, removed)
+        self.scholarship_page.reload_classes()
+
+    def _on_student_deleted(self, sid: str, name: str) -> None:
+        self.analysis_page.forget_student(sid, name)
+        self.scholarship_page.reload_classes(select=self.scholarship_page.current_class)
 
     def _on_library_cleared(self, grade_rows: int, profile_rows: int, files: int) -> None:
         """设置页「删除成绩库」之后的广播（接 ``SettingsPage.library_cleared``）。
@@ -431,40 +439,9 @@ class MainWindow(QMainWindow):
         self._open_archive_profile(payload)
 
     def _on_roster_changed(self, rows: list) -> None:
-        """导入完成后把名单补进学生主档。"""
+        """把导入结果交给仍启用旧侧写入口的窗口。"""
         if self.profile_page is not None:
             self.profile_page.set_roster(rows)
-        self._upsert_student_roster(rows)
-
-    def _upsert_student_roster(self, rows: list) -> None:
-        """把名单里每个**有学号**的学生补进学生主档。
-
-        ★ 失败只记 ``logging.warning``：成绩已经存进去了，主档漏一个人是
-          显示问题，不许影响导入结果、更不许弹窗（AGENTS §18 同源）。
-        """
-        try:
-            from core.database import StudentStore  # noqa: PLC0415 - 晚绑定，组件可能还没落地
-        except Exception:  # noqa: BLE001 - 还没落地就跳过补档，界面照常
-            _log.debug("StudentStore 还没落地，这次跳过学生主档补档")
-            return
-        try:
-            store = StudentStore()
-        except Exception:  # noqa: BLE001 - 打不开主档也只记日志
-            _log.warning("学生主档打不开，这次跳过补档", exc_info=True)
-            return
-        try:
-            class_name = str(self.analysis_page.class_name or "").strip()
-        except Exception:  # noqa: BLE001 - 班级号读不到就留空，不许断链
-            class_name = ""
-        for row in rows or ():
-            student_id = str(getattr(row, "student_id", "") or "").strip()
-            if not student_id:
-                continue
-            name = str(getattr(row, "student", "") or "").strip()
-            try:
-                store.upsert_import(student_id, name, class_name)
-            except Exception:  # noqa: BLE001 - 单个学生失败不中断整批
-                _log.warning("学生主档补档失败：%s", student_id, exc_info=True)
 
     def _sync_nav(self, index: int) -> None:
         """把侧栏选中态对齐到当前页。"""

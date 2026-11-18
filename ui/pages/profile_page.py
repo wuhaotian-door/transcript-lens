@@ -51,7 +51,6 @@ from PySide6.QtWidgets import (
     QStyle,
     QStyledItemDelegate,
     QTabWidget,
-    QTextEdit,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -63,7 +62,9 @@ from core.archival import SEMESTER_ORDER, merge_records, partition, semester_ran
 from core.calculator import CalculationScope, weighted_average
 from core.crypto_store import CryptoError, CryptoStore
 from core.database import GradeHistoryDB, ProfileStore
-from core.scholarship import list_classes, load_moral, save_moral
+from core.student_deletion import purge_student
+from core.scholarship import list_classes, list_moral_scopes, load_moral, save_moral
+from core.user_store import ROSTER_WRITE_LOCK
 from ui.anim import make_card
 from ui.intentions import (
     INTENTION_OPTIONS,
@@ -125,7 +126,6 @@ from ui.pages.profile_shared import (
     build_empty_student_archive,
     build_side_text_prompt,
     build_student_json,
-    delete_all_semester_sides,
     delete_semester_side,
     format_credit,
     format_score,
@@ -150,6 +150,8 @@ from ui.pages.profile_shared import (
     term_of_archive,
 )
 from ui.pages.semester_side_profile import SemesterSideProfilePage
+from ui.widgets.profile_reading import ProfileDocument, profile_scroll
+from ui.widgets.model_picker import CORE_MISSING_HINT, ModelPicker
 
 logger = logging.getLogger(__name__)
 
@@ -596,13 +598,14 @@ class ProfilePage(QWidget):
         self._provider: Callable[[int], dict[str, Any] | None] | None = None
         self._profile_store: Any = None
         self._grade_db: Any = None
-        self._moral_cache: dict[str, Any] | None = None
         self._tag_pool: dict[str, list[QWidget]] = {}
         self._active_tab = 0
         self._grade_payloads: dict[int, dict[str, Any]] = {}
         self._hidden_terms: set[str] = set()
 
         self._chat_engine = chat_engine
+        self._chat_injected = chat_engine is not None
+        self._preferred_chat_model = ""
         self._chat_models_given = chat_models is not None
         self._chat_models: list[Any] = list(chat_models or [])
         self._chat_key = ""
@@ -646,7 +649,6 @@ class ProfilePage(QWidget):
             self._intentions = {}
         self._profile_store = None
         self._grade_db = None
-        self._moral_cache = None
         self._hidden_terms = set()
         self._chat_key = ""
         self._chat_student_id = ""
@@ -909,7 +911,7 @@ class ProfilePage(QWidget):
         search_holder.setContentsMargins(14, 0, 14, 10)
         self._search = QLineEdit()
         self._search.setObjectName("ListSearch")
-        self._search.setPlaceholderText("搜索姓名或学号")
+        self._search.setPlaceholderText("搜索姓名、学号或班级")
         self._search.setClearButtonEnabled(True)
         self._search.setMinimumHeight(32)
         self._search.textChanged.connect(self._on_search)
@@ -964,6 +966,7 @@ class ProfilePage(QWidget):
         all_entries = self._list_entries("")
         self._total_people = len(all_entries)
         entries = self._list_entries(self._search_text)
+        entries.sort(key=lambda entry: (not entry['class_name'], entry['class_name'].casefold()))
         self._entries = entries
         self._list.blockSignals(True)
         try:
@@ -1166,7 +1169,7 @@ class ProfilePage(QWidget):
                 logger.exception("读取这一行的侧写数据失败")
                 payload = None
             if payload:
-                return payload
+                return {**payload, 'class_name': entry['class_name'] or payload.get('class_name', '')}
         key = entry["key"]
         sid = entry["sid"]
         name = entry["name"]
@@ -1182,6 +1185,7 @@ class ProfilePage(QWidget):
         return {
             "student": name,
             "student_id": sid,
+            "class_name": entry['class_name'],
             "key": key,
             "index": index,
             "results": {},
@@ -1395,9 +1399,6 @@ class ProfilePage(QWidget):
         self._render_detail()
 
     def _build_review_pane(self) -> QWidget:
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
         inner = QWidget()
         box = QVBoxLayout(inner)
         box.setContentsMargins(0, 0, 0, 0)
@@ -1407,8 +1408,7 @@ class ProfilePage(QWidget):
         box.addWidget(self._build_intention())
         box.addWidget(self._build_outline())
         box.addStretch(1)
-        scroll.setWidget(inner)
-        return scroll
+        return profile_scroll(inner)
 
     # -- 学生 CRUD --------------------------------------------------------
     def _refresh_students(self) -> None:
@@ -1633,13 +1633,13 @@ class ProfilePage(QWidget):
             self._delete_student_archive(sid, name)
 
     def _delete_student_hard(self, sid: str, name: str) -> None:
-        self._delete_hard_data(sid)
         try:
-            self._book.remove(sid)
+            purge_student(self._store, self._username, sid, name)
         except Exception:  # noqa: BLE001
-            logger.exception("删除学生主档失败")
-            QMessageBox.critical(self, "删除学生", "这名学生没有删掉，请稍后再试。")
+            logger.exception("删除学生失败")
+            QMessageBox.critical(self, "删除学生", "删除未完成，请检查数据目录后重试。")
             return
+        self._profile_store = None
         self._audit_student(
             "student_delete", student_id=sid, detail=f"彻底删除学生 {name}（{sid}）"
         )
@@ -1665,60 +1665,6 @@ class ProfilePage(QWidget):
         self._selected_sid = ""
         self._current_term = ""
         self._render()
-
-    def _delete_hard_data(self, sid: str) -> None:
-        """彻底删除前先清关联数据：成绩历史、侧写（含学期侧写）、聊天文件。"""
-        db = self._history()
-        if db is not None:
-            try:
-                terms = sorted(
-                    {
-                        str(row.get("semester") or "")
-                        for row in db.rows()
-                        if same_student_id(row.get("student_id"), sid)
-                    }
-                    - {""}
-                )
-                for term in terms:
-                    db.delete_semester(sid, term)
-            except Exception:  # noqa: BLE001 - 清理失败不该拦住删除主档
-                logger.exception("删除成绩历史失败")
-        profile_store = self._side_store()
-        if profile_store is not None:
-            try:
-                remove_side = getattr(profile_store, "remove", None)
-                if callable(remove_side):
-                    remove_side(sid)
-                else:
-                    logger.warning("侧写库没有 remove，退回清空侧写正文")
-                    profile_store.clear_side_text(sid)
-            except Exception:  # noqa: BLE001
-                logger.exception("删除侧写失败")
-        try:
-            delete_all_semester_sides(self._store, self._username, sid)
-        except Exception:  # noqa: BLE001
-            logger.exception("删除学期侧写失败")
-        # 档案快照（archive.json.enc）里这一份也一起摘掉，否则同一个学号
-        # 重新导入时会把旧学期整份带回来。
-        try:
-            archive = load_archive(self._store, self._username)
-            students = getattr(archive, "students", None)
-            key = student_key(sid, "")
-            if isinstance(students, dict) and key in students:
-                students.pop(key, None)
-                store_archive(self._store, self._username, archive)
-        except Exception:  # noqa: BLE001 - 快照清不掉不该拦住删除主档
-            logger.exception("删除档案快照失败")
-        try:
-            from core.user_store import delete_user_json
-
-            chat_name = (
-                f"{CHAT_HISTORY_DIR}{CHAT_HISTORY_PREFIX}"
-                f"{safe_student_file(student_key(sid, ''))}{CHAT_HISTORY_SUFFIX}"
-            )
-            delete_user_json(self._store, self._username, chat_name)
-        except Exception:  # noqa: BLE001
-            logger.exception("删除聊天记录失败")
 
     # -- 关页 -------------------------------------------------------------
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
@@ -1941,6 +1887,7 @@ class ProfilePage(QWidget):
 
         self._moral_row = QLabel(moral_text(None))
         self._moral_row.setObjectName("Muted")
+        self._moral_row.setWordWrap(True)
         box.addWidget(self._moral_row, 1)
 
         self._moral_delete = QPushButton(ACTION_TEXT)
@@ -1953,68 +1900,61 @@ class ProfilePage(QWidget):
         return card
 
     def _build_chat_pane(self) -> QWidget:
-        """学生信息卡 + 只读谈话记录 + 一行输入框。
-
-        ★ 容器上**绝不挂任何 QGraphicsEffect**（AGENTS §17：挂了整页可能画成
-          空白，静态断言查不出来）。本函数里一个 ``setGraphicsEffect`` 都没有。
-        """
         pane = QWidget()
         box = QVBoxLayout(pane)
         box.setContentsMargins(0, 10, 0, 0)
         box.setSpacing(10)
-
         box.addWidget(self._build_student_card())
 
-        self._chat_status = QLabel("")
-        self._chat_status.setObjectName("Muted")
-        self._chat_status.setWordWrap(True)
-        self._chat_status.setMinimumWidth(320)
-        box.addWidget(self._chat_status)
-
-        # 缺模型时的兜底入口（懒 import + try/except，见 _open_model_center）
-        self._model_center_btn = QPushButton("打开模型中心")
-        self._model_center_btn.setObjectName("Ghost")
-        self._model_center_btn.setMinimumHeight(32)
-        self._model_center_btn.setMaximumWidth(160)
-        self._model_center_btn.clicked.connect(self._open_model_center)
-        self._model_center_btn.hide()
-        box.addWidget(self._model_center_btn)
-
-        # 缺推理核心时的兜底入口
-        self._backend_setup_btn = QPushButton("下载推理核心")
-        self._backend_setup_btn.setObjectName("Ghost")
-        self._backend_setup_btn.setMinimumHeight(32)
-        self._backend_setup_btn.setMaximumWidth(160)
-        self._backend_setup_btn.clicked.connect(self._open_backend_setup)
-        self._backend_setup_btn.hide()
-        box.addWidget(self._backend_setup_btn)
-
-        self._chat_view = QTextEdit()
-        self._chat_view.setObjectName("Outline")
+        self._chat_view = ProfileDocument(conversation=True)
+        self._chat_view.setMinimumHeight(180)
         self._chat_view.setReadOnly(True)
-        self._chat_view.setPlaceholderText("这里显示这名学生的谈话记录。")
+        self._chat_view.setPlaceholderText("谈话记录")
         box.addWidget(self._chat_view, 1)
 
+        self._chat_input = QLineEdit()
+        self._chat_input.setPlaceholderText("输入消息（Enter 发送）")
+        self._chat_input.returnPressed.connect(self._on_chat_send_clicked)
+        box.addWidget(self._chat_input)
+        self._chat_status = QLabel("选择学生后可开始谈话。")
+        self._chat_status.setObjectName("Muted")
+        self._chat_status.setWordWrap(True)
+        box.addWidget(self._chat_status)
         row = QHBoxLayout()
         row.setSpacing(8)
-        self._chat_input = QLineEdit()
-        self._chat_input.setPlaceholderText("说点什么…（回车发送）")
-        self._chat_input.returnPressed.connect(self._on_chat_send_clicked)
-        row.addWidget(self._chat_input, 1)
+        self._model_center_btn = ModelPicker(self)
+        self._model_center_btn.model_selected.connect(self._choose_chat_model)
+        self._model_center_btn.library_requested.connect(self._open_model_center)
+        self._model_center_btn.settings_requested.connect(self._open_chat_model_settings)
+        row.addWidget(self._model_center_btn)
+        row.addStretch()
+
+        self._backend_setup_btn = QPushButton("下载推理核心")
+        self._backend_setup_btn.setObjectName("Primary")
+        self._backend_setup_btn.setMinimumHeight(34)
+        self._backend_setup_btn.clicked.connect(self._open_backend_setup)
+        row.addWidget(self._backend_setup_btn)
         self._chat_send = QPushButton("发送")
         self._chat_send.setObjectName("Primary")
         self._chat_send.setMinimumHeight(34)
-        self._chat_send.setMaximumWidth(120)
         self._chat_send.clicked.connect(self._on_chat_send_clicked)
         row.addWidget(self._chat_send)
         box.addLayout(row)
+        self._set_chat_enabled(False)
+        return profile_scroll(pane)
 
-        # ★ 建页面时还没选学生：输入区先关上、状态行给出怎么开始
-        #   （不这么写的话，窗口一打开输入框就能打字，发出去才发现没人可谈）
-        self._chat_status.setText("先在左边点一名学生，再开始谈话。")
-        self._chat_input.setEnabled(False)
-        self._chat_send.setEnabled(False)
-        return pane
+    def _open_chat_model_settings(self) -> None:
+        navigate = getattr(self.window(), "_go_model_settings", None)
+        if callable(navigate):
+            navigate()
+        else:
+            self._open_model_center()
+
+    def _choose_chat_model(self, model) -> None:
+        self._preferred_chat_model = getattr(model, "name", "")
+        if not self._chat_injected:
+            self._chat_engine = None
+        self._refresh_chat_availability()
 
     def _build_student_card(self) -> QFrame:
         """当前学生的基本信息卡片（姓名 / 学号 / 班级）。"""
@@ -2040,15 +1980,10 @@ class ProfilePage(QWidget):
         info.addWidget(self._chat_meta)
         box.addLayout(info, 1)
 
-        note = QLabel("本机离线推理，谈话记录加密存在本机")
-        note.setObjectName("Muted")
-        note.setWordWrap(True)
-        note.setFixedWidth(220)
-        box.addWidget(note)
         return card
 
     def _build_portrait(self) -> QFrame:
-        card = make_card()
+        card = make_card(shadow=False, name="ProfilePortrait")
         box = QVBoxLayout(card)
         box.setContentsMargins(20, 18, 20, 18)
         box.setSpacing(10)
@@ -2115,15 +2050,11 @@ class ProfilePage(QWidget):
         title = QLabel("AI 侧写")
         title.setObjectName("H2")
         head.addWidget(title)
-        note = QLabel("把已有成绩与德育分拼成提示词，交给本机 AI 引擎生成")
-        note.setObjectName("Muted")
-        head.addWidget(note)
         head.addStretch(1)
 
         self._ai_btn = QPushButton("点击生成")
         self._ai_btn.setObjectName("Ghost")
         self._ai_btn.setMinimumHeight(36)
-        self._ai_btn.setToolTip("生成的内容会存进本地加密文件")
         self._ai_btn.clicked.connect(self._generate_side_text)
         head.addWidget(self._ai_btn)
 
@@ -2159,12 +2090,11 @@ class ProfilePage(QWidget):
         self._side_status.setMinimumWidth(320)
         box.addWidget(self._side_status)
 
-        self._side_text = QTextEdit()
-        self._side_text.setObjectName("Outline")
+        self._side_text = ProfileDocument()
         # ★ **可编辑**（任务书 5）：生成或读回来的正文都要能让辅导员改，
         #   改完「保存」才写回 ProfileStore。生成期间临时置只读。
         self._side_text.setReadOnly(False)
-        self._side_text.setMinimumHeight(150)
+        self._side_text.setMinimumHeight(235)
         self._side_text.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
@@ -2182,7 +2112,8 @@ class ProfilePage(QWidget):
         box.addWidget(label)
         note = QLabel(hint)
         note.setObjectName("Muted")
-        box.addWidget(note)
+        note.setWordWrap(True)
+        box.addWidget(note, 1)
         box.addStretch(1)
         return holder
 
@@ -2239,13 +2170,7 @@ class ProfilePage(QWidget):
         title = QLabel("辅导提纲")
         title.setObjectName("H2")
         head.addWidget(title)
-        # ★ 任务书 4.1：这条提示在 1268 宽的窗口里会被裁掉半截 —— 必须换行，
-        # 并且给一个够宽的最小宽度，否则它会把整行撑开、切页时窗口横向跳动。
-        self._outline_note = QLabel("本地规则拼出来的，不联网、不调 AI")
-        self._outline_note.setObjectName("Muted")
-        self._outline_note.setWordWrap(True)
-        self._outline_note.setMinimumWidth(200)
-        head.addWidget(self._outline_note, 1)
+        head.addStretch(1)
 
         self._copy_btn = QPushButton("一键复制")
         self._copy_btn.setObjectName("Ghost")
@@ -2254,8 +2179,7 @@ class ProfilePage(QWidget):
         head.addWidget(self._copy_btn)
         box.addLayout(head)
 
-        self._outline = QTextEdit()
-        self._outline.setObjectName("Outline")
+        self._outline = ProfileDocument()
         self._outline.setReadOnly(True)
         self._outline.setMinimumHeight(210)
         self._outline.setSizePolicy(
@@ -2623,56 +2547,37 @@ class ProfilePage(QWidget):
             self._moral_delete.setEnabled(value is not None and bool(key))
 
     def _delete_moral_row(self) -> None:
-        """删掉这名学生的德育分记录（确认框 → 写回德育表）。"""
-        payload = self._payload or {}
-        key = payload.get("key") or ""
+        key = str((self._payload or {}).get("key") or "")
         if not key:
             return
+        entries = self._student_moral_entries(key)
+        if not entries:
+            return
+        selected = entries[0]
+        if len(entries) > 1:
+            labels = [
+                f"{row['班级']}班 · {row['学年'] or '旧记录'} · {moral_text(row['分数'])} 分"
+                for row in entries
+            ]
+            choice, ok = QInputDialog.getItem(self, "选择记录", "请选择要删除的德育分",
+                                              labels, editable=False)
+            if not ok:
+                return
+            selected = entries[labels.index(choice)]
         if not self._confirm_delete():
             return
-        if not self._delete_moral_values(key):
+        name, year = selected["班级"], selected["学年"]
+        try:
+            with ROSTER_WRITE_LOCK:
+                table = load_moral(self._store, self._username, name, year=year)
+                if key in table:
+                    del table[key]
+                    save_moral(self._store, self._username, name, table, year=year)
+        except (CryptoError, OSError, ValueError):
             QMessageBox.information(self, "删除德育分", "这条德育分没有删掉，请稍后再试。")
             return
-        self._moral_cache = None            # 下次重新扫班级目录
         self._render_moral(key)
-
-    def _delete_moral_values(self, key: str) -> bool:
-        """把 ``key`` 从每个录过他的班级德育表里删掉。
-
-        ★ 班级列表照 :meth:`_student_moral` 的办法扫目录（``list_classes`` 是
-          唯一真源，不另存索引）。删法是把该键写成空串再存 —— 读的时候
-          ``load_moral`` 会把空串当成"没录"（AGENTS §14：没录 ≠ 0 分）。
-        """
-        savers: list[Callable[[], None]] = []
-        names: list[str] = []
-        try:
-            names = [row.class_name for row in list_classes(self._store, self._username)]
-        except Exception:  # noqa: BLE001 - 扫不到就是没有班级录过德育分
-            logger.exception("扫班级目录失败（删除德育分降级）")
-            return False
-        for class_name in names:
-            try:
-                table = load_moral(self._store, self._username, class_name)
-            except Exception:  # noqa: BLE001
-                logger.exception("读德育分失败（%s）", class_name)
-                continue
-            if not isinstance(table, dict) or key not in table:
-                continue
-            table = dict(table)
-            table[key] = ""
-            savers.append(
-                (lambda name=class_name, data=table:
-                 save_moral(self._store, self._username, name, data))
-            )
-        if not savers:
-            return False
-        for save in savers:
-            try:
-                save()
-            except Exception:  # noqa: BLE001
-                logger.exception("写德育分失败（删除）")
-                return False
-        return True
+        self._render_info_card()
 
     def _side_store(self) -> Any:
         """``ProfileStore`` 懒建：库坏了 / 没登录不该让页面开不起来。"""
@@ -2696,10 +2601,11 @@ class ProfilePage(QWidget):
             self._side_text_guard = False
         self._side_key = key or ""
         if text:
-            self._side_hint.setText("侧写正文存放在本地加密文件里，只在本机可见。")
+            self._side_hint.hide()
             self._ai_btn.setText("重新生成")
         else:
             self._side_hint.setText(SIDE_TEXT_EMPTY_HINT)
+            self._side_hint.show()
             self._ai_btn.setText("点击生成")
         self._ai_btn.setEnabled(bool(key) and not self._side_busy)
         if hasattr(self, "_side_delete"):
@@ -2714,19 +2620,27 @@ class ProfilePage(QWidget):
     def _student_grades(self, key: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
         return self._grade_rows(key, payload.get("archive"))
 
-    def _student_moral(self, key: str) -> Any:
-        if self._moral_cache is None:
-            names: list[str] = []
-            try:
-                names = [row.class_name for row in list_classes(self._store, self._username)]
-            except Exception:  # noqa: BLE001 - 查不到就当没录
-                logger.exception("扫班级目录失败（德育分查询降级）")
-            self._moral_cache = names
+    def _student_moral_entries(self, key: str) -> list[dict[str, Any]]:
+        if not self._username:
+            return []
+        entries = []
         try:
-            return moral_of(self._store, self._username, key, self._moral_cache)
-        except Exception:  # noqa: BLE001
-            logger.exception("读德育分失败（%s）", key)
+            scopes = list_moral_scopes(self._store, self._username)
+            for name, year in scopes:
+                score = load_moral(self._store, self._username, name, year=year).get(key)
+                if score is not None:
+                    entries.append({"班级": name, "学年": year, "分数": score})
+        except (CryptoError, ValueError, OSError):
+            logger.exception("读取学生德育分失败")
+        return entries
+
+    def _student_moral(self, key: str) -> Any:
+        entries = self._student_moral_entries(key)
+        if not entries:
             return None
+        if len(entries) == 1 and not entries[0]["学年"]:
+            return entries[0]["分数"]
+        return entries
 
     def _generate_side_text(self) -> None:
         """「点击生成」：拼提示词 → **本机引擎流式生成** → 正文进可编辑文本框。
@@ -2910,6 +2824,7 @@ class ProfilePage(QWidget):
     def set_chat_engine(self, engine: Any) -> None:
         """注入一个引擎（**测试用**：给了它就绝不加载真模型）。"""
         self._chat_engine = engine
+        self._chat_injected = engine is not None
 
     def set_chat_models(self, models: list[Any] | None) -> None:
         """注入本地模型清单（测试用：``[]`` = 本机一个模型都没有）。
@@ -3104,17 +3019,13 @@ class ProfilePage(QWidget):
             speaker = "辅导员" if turn.get("role") == CHAT_ROLE_USER else "你"
             clock = turn.get("time") or ""
             stamp = f"（{clock}）" if clock else ""
-            self._chat_view.append(f"{speaker}{stamp}：{turn.get('text', '')}")
+            tone = 'assistant' if turn.get('role') == CHAT_ROLE_ASSISTANT else 'user'
+            self._chat_view.append_entry(f"{speaker}{stamp}：{turn.get('text', '')}", tone)
         self._chat_view.moveCursor(self._chat_view.textCursor().MoveOperation.End)
 
     def _append_chat_line(self, text: str) -> None:
-        cursor = self._chat_view.textCursor()
-        cursor.movePosition(cursor.MoveOperation.End)
-        if not self._chat_view.toPlainText().endswith("\n"):
-            cursor.insertText("\n")
-        cursor.insertText(text)
-        self._chat_view.setTextCursor(cursor)
-        self._chat_view.ensureCursorVisible()
+        tone = "assistant" if text.startswith("你：") else "user"
+        self._chat_view.append_entry(text, tone)
 
     def _append_chat_chunk(self, piece: str) -> None:
         """流式：第一块写"你："并换行，后面的**原地续写**（每块都换行会竖成一列）。"""
@@ -3131,60 +3042,39 @@ class ProfilePage(QWidget):
         self._chat_view.ensureCursorVisible()
 
     def _refresh_chat_availability(self) -> None:
-        """刷新状态行 + 输入区状态。**一次都不弹窗。**
-
-        两级降级（任务书 2）：
-        1. ``llama-cpp-python`` 没装 → 贴 :func:`engine_available` 给的中文原因；
-        2. 引擎装好了但本机一个模型都没有 → 「请先在模型中心下载模型」。
-
-        ★ 两级**分开判、分开说** —— 混成一句会让用户去下模型，而下完模型仍然
-          跑不起来（因为引擎根本没装），那是把人往坑里带。
-        """
         if not self._chat_key:
-            self._chat_status.setText("先在左边点一名学生，再开始谈话。")
+            self._chat_status.setText("选择学生后可开始谈话。")
             self._set_chat_enabled(False)
             return
 
-        # ★ 注入了引擎（``set_chat_engine`` / 构造参数）时**不再要求磁盘上有模型**
-        #   —— 引擎本身就是"能跑"的证明；测试注入的假引擎也没有磁盘模型。
-        injected = self._chat_engine is not None
-        if injected:
-            engine_ready, engine_reason = True, ""
-        else:
-            engine_ready, engine_reason = engine_available()
-            self._chat_engine_reason = engine_reason
-
-        if not injected and not self._chat_models_given:
+        ready, reason = (True, "") if self._chat_injected else engine_available()
+        self._chat_engine_ready = ready
+        self._chat_status.setToolTip(reason)
+        if ready and not self._chat_models_given:
             self._scan_chat_models()
-        self._chat_model = self._first_usable_chat_model()
-        self._chat_engine_ready = engine_ready
-
-        if engine_ready and (injected or self._chat_model is not None):
-            self._chat_status.setText("可以开始谈话（本机离线推理）。")
-            self._set_chat_enabled(True)
-            return
-
-        reasons: list[str] = []
-        if not engine_ready and engine_reason:
-            reasons.append(engine_reason)
-        if self._chat_model is None:
-            reasons.append("请先在模型中心下载模型")
-        self._chat_status.setText("　".join(reasons) or "本地推理暂时不可用。")
-        self._set_chat_enabled(False)
+        models = [model for model in self._chat_models if getattr(model, "usable", True)]
+        self._chat_model = next(
+            (model for model in models if getattr(model, "name", "") == self._preferred_chat_model),
+            models[0] if models else None,
+        )
+        self._model_center_btn.set_models(models, self._chat_model)
+        has_model = self._chat_injected or self._chat_model is not None
+        self._chat_status.setText(CORE_MISSING_HINT if not ready else (
+            "" if has_model else "请先在模型中心下载模型"
+        ))
+        self._chat_status.setVisible(bool(self._chat_status.text()))
+        self._set_chat_enabled(ready and has_model)
 
     def _set_chat_enabled(self, enabled: bool) -> None:
-        busy = bool(self._chat_worker is not None and self._chat_worker.isRunning())
-        usable = bool(enabled) and not busy
-        if hasattr(self, "_chat_input"):
-            self._chat_input.setEnabled(usable)
-        if hasattr(self, "_chat_send"):
-            self._chat_send.setEnabled(usable)
-        missing_model = self._chat_engine is None and self._chat_model is None
-        if hasattr(self, "_model_center_btn"):
-            self._model_center_btn.setVisible(bool(missing_model) and bool(self._chat_key))
-        missing_engine = not getattr(self, "_chat_engine_ready", True)
-        if hasattr(self, "_backend_setup_btn"):
-            self._backend_setup_btn.setVisible(bool(missing_engine) and bool(self._chat_key))
+        busy = bool(self._chat_worker is not None)
+        selected = bool(self._chat_key)
+        ready = getattr(self, "_chat_engine_ready", True)
+        self._chat_input.setEnabled(enabled and not busy)
+        self._chat_send.setEnabled(enabled and not busy)
+        self._chat_send.setVisible(selected and ready)
+        self._model_center_btn.setVisible(selected and ready)
+        self._model_center_btn.setEnabled(not busy)
+        self._backend_setup_btn.setVisible(selected and not ready)
 
     def _scan_chat_models(self) -> None:
         """扫磁盘上真的装好了的模型（拿不到清单就是空表，不报错）。"""
@@ -3273,6 +3163,7 @@ class ProfilePage(QWidget):
         self._chat_open = False
         self._chat_error = ""
         self._chat_status.setText("正在生成，请稍候…")
+        self._chat_status.show()
         self._set_chat_enabled(False)
 
         worker = _PageChatWorker(engine, prompt, stop=CHAT_STOP_WORDS)
@@ -3328,6 +3219,7 @@ class ProfilePage(QWidget):
         self._refresh_chat_availability()
         if self._chat_error:
             self._chat_status.setText(self._chat_error)
+            self._chat_status.show()
             self._chat_error = ""
         if self._chat_input.isEnabled():
             self._chat_input.setFocus()

@@ -73,6 +73,7 @@ FAKE_ANCHOR_FIXTURE = FIXTURES / "fake_grades_with_anchor.xlsx"
 
 #: 全局样式表（Spec 一：写在 ui/styles.qss 里加载）
 QSS_RELATIVE = Path("ui") / "styles.qss"
+APP_ICON_PATH = PROJECT_ROOT / "ui" / "assets" / "app.ico"
 
 #: 自检要确认能 import 的模块（界面 + 核心 + 本地模板）
 CHECK_MODULES: tuple[str, ...] = (
@@ -375,6 +376,8 @@ def _selfcheck_report() -> tuple[bool, str]:
         if line.startswith("FAIL"):
             failures.append("版本迁移检查")
 
+    step("学年智育合并与德育隔离", _academic_year_selfcheck)
+
     # --- v1.9.3 补充：错误信息一键复制（traceback + 日志路径）----------------
     for line in _error_report_gate_report():
         lines.append(line)
@@ -518,6 +521,65 @@ def _category_policy_report() -> list[str]:
         lines.append("ok    口径① ≠ ② ≠ ③：选修只进①、限选只进①②")
 
     return lines
+
+
+def _academic_year_selfcheck() -> str:
+    """用临时加密库验证学年测算与德育原表导入。"""
+    from math import isclose
+    from tempfile import TemporaryDirectory
+
+    from pandas import DataFrame
+
+    from core.crypto_store import CryptoStore
+    from core.import_workers import apply_plan, plan_import
+    from core.scholarship import ClassRecord, compute_scholarship, load_moral, load_year_class, save_class
+
+    def student(course: str, score: int, credit: int) -> dict:
+        return {
+            "key": "sid:001", "student_id": "001", "student": "测试学生",
+            "academic": score,
+            "courses": [{"name": course, "score": score, "credit": credit, "category": "必修"}],
+        }
+
+    with TemporaryDirectory(prefix="tl_selfcheck_year_") as temp:
+        store = CryptoStore(root=Path(temp))
+        user = "学年自检"
+        store.register(user, "selfcheck123")
+        first = student("数学", 80, 4)
+        first["courses"].append({"name": "数学", "score": 100, "credit": 5, "category": "选修"})
+        save_class(store, user, ClassRecord("CHECK-A", "上学期", "大二上", [first], "2025-2026"))
+        partial = load_year_class(store, user, "CHECK-A", "大二")
+        if partial is None or partial.annual_complete is not False:
+            raise ValueError("单个学期被识别为完整学年")
+        second = student("英语", 100, 1)
+        second["courses"][0]["category"] = "限选"
+        save_class(store, user, ClassRecord("CHECK-A", "下学期", "大二下", [second], "2025-2026"))
+        save_class(store, user, ClassRecord("CHECK-A", "大一成绩", "大一",
+                                           [student("语文", 60, 2)], "2024-2025"))
+        save_class(store, user, ClassRecord("CHECK-B", "另一班成绩", "大二",
+                                           [student("数学", 90, 4)], "2025-2026"))
+
+        frame = DataFrame([
+            ["CHECK-A 班学生2025--2026学年品行诚信与素质测评", None, None, None, None, None],
+            ["学号", "姓名", "基本分", "加分小计", "扣分小计", "合计总分"],
+            ["001", "测试学生", 75, 10.25, -1.5, 83.75],
+        ])
+        plan = plan_import(Path(temp) / "模拟德育表.xlsx", frame=frame, known_classes=("CHECK-A",),
+                           default_class="CHECK-A", year="大二")
+        summary = apply_plan(store, user, plan, error_dir=temp)
+        if summary.succeeded != 1 or summary.failed or summary.skipped:
+            raise ValueError("整学年德育分导入失败")
+
+        annual = load_year_class(store, user, "CHECK-A", "大二")
+        moral = load_moral(store, user, "CHECK-A", year="大二", school_year="2025-2026")
+        if annual is None or not annual.annual_complete or moral != {"sid:001": 83.75}:
+            raise ValueError("学年成绩或德育分缺失")
+        rank = compute_scholarship(annual, moral)[0]
+        if rank.academic != 84 or rank.final is None or not isclose(rank.final, 83.925) or rank.rank != 1:
+            raise ValueError("学年智育加权或综合排名结果不符")
+        if load_moral(store, user, "CHECK-A", year="大一") or load_moral(store, user, "CHECK-B", year="大二"):
+            raise ValueError("德育分跨班级或跨学年读取")
+    return "智育 84（必修＋限选）/ 德育 83.75 / 综合 83.925，跨班与跨学年隔离"
 
 
 def _version_migration_report() -> list[str]:
@@ -2136,13 +2198,14 @@ def make_app(argv: list[str]):
     ★ ``setFont`` 必须是第一件事：晚于控件创建的话，已经建好的那些控件
       还是旧字体，屏幕上会出现两种字体混排。
     """
-    from PySide6.QtGui import QFont
+    from PySide6.QtGui import QFont, QIcon
     from PySide6.QtWidgets import QApplication
 
     app = QApplication(argv)
     app.setApplicationName("transcript-lens")
     app.setApplicationDisplayName("成绩单透镜")
     app.setFont(QFont(UI_FONT_FAMILY, UI_FONT_SIZE))
+    app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
     style = load_stylesheet()
     if style:
         app.setStyleSheet(style)
@@ -2424,6 +2487,7 @@ def run_bootcheck() -> int:
         check("准备了临时账户 + 自动登录令牌", True, str(data_root))
 
         app = make_app(["transcript-lens-bootcheck"])
+        check("应用图标可加载", not app.windowIcon().pixmap(32, 32).isNull())
         flow = AppFlow(app, root=str(data_root))
 
         from PySide6.QtCore import QEventLoop, QTimer

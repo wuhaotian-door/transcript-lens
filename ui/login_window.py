@@ -206,25 +206,6 @@ class LoginWindow(QWidget):
         slogan.setWordWrap(True)
         box.addWidget(slogan)
 
-        box.addSpacing(22)
-
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setStyleSheet("color:#334155;")
-        box.addWidget(line)
-
-        box.addSpacing(16)
-
-        for text in (
-            "本地离线运行",
-            "不上传、不联网",
-            "加权算术全部本地完成",
-            "成绩只存加密文件",
-        ):
-            item = QLabel(f"· {text}")
-            item.setObjectName("BrandBullet")
-            box.addWidget(item)
-
         box.addStretch(1)
         return brand
 

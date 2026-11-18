@@ -31,7 +31,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -51,6 +51,7 @@ from core.session_token import clear_token
 from core.version import CURRENT_VERSION
 from ui.anim import make_card
 from ui.workers import run_async
+from ui.widgets.profile_reading import profile_scroll
 
 __all__ = ["AccountPage"]
 
@@ -65,10 +66,6 @@ _ABOUT = (
     ("程序", "成绩单透镜 · transcript-lens"),
     # ★ v1.8 修正：这里原来硬编码 "v1.0"（charter v1.8 第五节点名的旧 bug）。
     ("版本", f"v{CURRENT_VERSION}"),
-    ("定位", "辅导员本地单机工具，成绩不出这台电脑"),
-    ("算术", "全部在本地确定性完成，绝不调用大模型做数字"),
-    ("网络", "只有找回密码会联网（发一封邮件），成绩永不出网"),
-    ("落盘", "明文成绩任何时候都不落盘，磁盘上只有 .enc 密文"),
 )
 
 
@@ -104,111 +101,86 @@ class AccountPage(QWidget):
 
     def set_user(self, username: str) -> None:
         self._username = username or ""
-        self._user_label.setText(self._username or "（还没有登录）")
+        self._user_label.setText(self._username or "未登录")
         self._refresh_recovery()
 
     # ---------------------------------------------------------------- 搭界面
     def _build(self) -> None:
-        box = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        body = QWidget()
+        box = QVBoxLayout(body)
         box.setContentsMargins(22, 20, 22, 20)
         box.setSpacing(14)
 
-        title = QLabel("👤  个人中心")
+        title = QLabel("个人中心")
         title.setObjectName("H1")
         box.addWidget(title)
 
-        # --- 账户 ---
-        acc = make_card()
-        acc_box = QVBoxLayout(acc)
-        acc_box.setContentsMargins(24, 20, 24, 20)
-        acc_box.setSpacing(10)
-
-        head = QHBoxLayout()
-        head.addWidget(self._section("当前账号"))
-        self._user_label = QLabel("（还没有登录）")
-        self._user_label.setObjectName("H2")
-        head.addWidget(self._user_label)
-        head.addStretch(1)
-        acc_box.addLayout(head)
-
-        note = QLabel(
-            "账户只建在这台电脑上。密码用 PBKDF2 派生，磁盘上只留随机盐和校验值。"
-        )
-        note.setObjectName("Muted")
-        note.setWordWrap(True)
-        acc_box.addWidget(note)
-
+        account = make_card()
+        account_box = QVBoxLayout(account)
+        account_box.setContentsMargins(20, 16, 20, 16)
+        account_box.setSpacing(10)
         row = QHBoxLayout()
-
+        info = QVBoxLayout()
+        info.setSpacing(3)
+        heading = QLabel("当前账号")
+        heading.setObjectName("ProfileMeta")
+        info.addWidget(heading)
+        self._user_label = QLabel("未登录")
+        self._user_label.setObjectName("H2")
+        self._user_label.setWordWrap(True)
+        info.addWidget(self._user_label)
+        row.addLayout(info, 1)
         switch = QPushButton("切换账号")
         switch.setObjectName("Ghost")
-        switch.setMinimumHeight(38)
+        switch.setMinimumHeight(34)
         switch.clicked.connect(self._do_switch)
         row.addWidget(switch)
-
         self._pwd_btn = QPushButton("修改密码")
         self._pwd_btn.setObjectName("Ghost")
-        self._pwd_btn.setMinimumHeight(38)
+        self._pwd_btn.setMinimumHeight(34)
         self._pwd_btn.clicked.connect(self._do_change_password)
         row.addWidget(self._pwd_btn)
-
-        row.addStretch(1)
-        acc_box.addLayout(row)
-
+        account_box.addLayout(row)
         self._pwd_status = QLabel("")
         self._pwd_status.setObjectName("Muted")
         self._pwd_status.setWordWrap(True)
-        acc_box.addWidget(self._pwd_status)
-        box.addWidget(acc)
+        account_box.addWidget(self._pwd_status)
+        box.addWidget(account)
 
-        # --- 找回密码 ---
-        rec = make_card()
-        rec_box = QVBoxLayout(rec)
-        rec_box.setContentsMargins(24, 20, 24, 20)
+        recovery = make_card()
+        rec_box = QVBoxLayout(recovery)
+        rec_box.setContentsMargins(20, 16, 20, 16)
         rec_box.setSpacing(10)
-        rec_box.addWidget(self._section("找回密码"))
-
+        rec = QHBoxLayout()
+        recovery_text = QVBoxLayout()
+        recovery_text.setSpacing(3)
+        recovery_text.addWidget(self._section("密码找回"))
         self._recovery_note = QLabel("")
         self._recovery_note.setObjectName("Muted")
         self._recovery_note.setWordWrap(True)
-        rec_box.addWidget(self._recovery_note)
-
-        rec_row = QHBoxLayout()
-        self._regen_btn = QPushButton("重新生成找回码")
+        recovery_text.addWidget(self._recovery_note)
+        rec.addLayout(recovery_text, 1)
+        self._regen_btn = QPushButton("生成找回码")
         self._regen_btn.setObjectName("Ghost")
-        self._regen_btn.setMinimumHeight(38)
+        self._regen_btn.setMinimumHeight(34)
         self._regen_btn.clicked.connect(self._do_regen)
-        rec_row.addWidget(self._regen_btn)
-        rec_row.addStretch(1)
-        rec_box.addLayout(rec_row)
-
+        rec.addWidget(self._regen_btn)
+        rec_box.addLayout(rec)
         self._regen_status = QLabel("")
         self._regen_status.setObjectName("Muted")
         self._regen_status.setWordWrap(True)
         rec_box.addWidget(self._regen_status)
-        box.addWidget(rec)
+        box.addWidget(recovery)
 
-        # --- 关于 ---
-        about = make_card()
-        about_box = QVBoxLayout(about)
-        about_box.setContentsMargins(24, 20, 24, 20)
-        about_box.setSpacing(8)
-        about_box.addWidget(self._section("关于"))
-
-        for key, value in _ABOUT:
-            line = QHBoxLayout()
-            name = QLabel(key)
-            name.setObjectName("H3")
-            name.setFixedWidth(60)
-            line.addWidget(name)
-            text = QLabel(value)
-            text.setObjectName("Muted")
-            text.setWordWrap(True)
-            line.addWidget(text, 1)
-            about_box.addLayout(line)
-
+        about = QLabel("  ·  ".join(value for _, value in _ABOUT))
+        about.setObjectName("ProfileMeta")
+        about.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        about.setWordWrap(True)
         box.addWidget(about)
-        box.addStretch(1)
+        box.addStretch()
+        outer.addWidget(profile_scroll(body))
 
     @staticmethod
     def _section(text: str) -> QLabel:
@@ -225,17 +197,11 @@ class AccountPage(QWidget):
         info = recovery_info(self._store, self._username)
         self._regen_btn.setEnabled(True)
         if info["enabled"]:
-            self._recovery_note.setText(
-                f"找回邮箱：{_mask_email(info['email'])}\n"
-                "忘了密码时，用注册（或上次重新生成）时寄到该邮箱的那串「找回码」"
-                "重设密码，成绩不会丢。\n"
-                "重新生成会作废旧的那串 —— 新邮件发出去之后，旧邮件就没用了。"
-            )
+            self._recovery_note.setText(f"找回邮箱 {_mask_email(info['email'])}")
+            self._regen_btn.setText("重新生成找回码")
         else:
-            self._recovery_note.setText(
-                "⚠ 这个账户还没有找回码，忘了密码就打不开了。\n"
-                "点下面的按钮生成一串并寄到邮箱（需要输一次密码）。"
-            )
+            self._recovery_note.setText("尚未设置找回码")
+            self._regen_btn.setText("生成找回码")
 
     # ---------------------------------------------------------------- 动作
     def _do_switch(self) -> None:
@@ -400,14 +366,6 @@ class _ChangePasswordDialog(QDialog):
         title.setObjectName("H2")
         box.addWidget(title)
 
-        note = QLabel(
-            "先输旧密码确认是本人。成绩库不会被重新加密，"
-            "邮箱里的找回码也依然有效。"
-        )
-        note.setObjectName("Muted")
-        note.setWordWrap(True)
-        box.addWidget(note)
-
         box.addWidget(QLabel("旧密码"))
         self._old = QLineEdit()
         self._old.setEchoMode(QLineEdit.EchoMode.Password)
@@ -482,10 +440,7 @@ class _PasswordDialog(QDialog):
         title.setObjectName("H2")
         box.addWidget(title)
 
-        note = QLabel(
-            "生成找回码要用到库密钥，所以需要你输一次密码。\n"
-            "新找回码会寄到下面这个邮箱，旧的那串立刻作废。"
-        )
+        note = QLabel("新找回码发送成功后，旧找回码失效。")
         note.setObjectName("Muted")
         note.setWordWrap(True)
         box.addWidget(note)

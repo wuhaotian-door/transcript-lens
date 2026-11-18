@@ -61,11 +61,12 @@ pytest 可以直接 import、直接用，不需要 ``QT_QPA_PLATFORM=offscreen``
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Callable
 
 from core.crypto_store import CryptoError, CryptoStore, StoreCorruptError
 from core.archival import semester_rank
-from core.user_store import list_user_json, load_user_json, save_user_json, user_file
+from core.user_store import ROSTER_WRITE_LOCK, list_user_json, load_user_json, save_user_json, user_file
 
 #: 审计日志写不进去时用它留痕（**不抛**，成绩已经存好了）
 _LOGGER = logging.getLogger(__name__)
@@ -444,7 +445,7 @@ class GradeHistoryDB:
             if sid and nm and sid not in names:
                 names[sid] = nm
 
-        stored = self._payload().get("rows")
+        stored = self._payload(strict=True).get("rows")
         rows: list[dict[str, Any]] = [r for r in stored if isinstance(r, dict)] \
             if isinstance(stored, list) else []
 
@@ -771,8 +772,8 @@ class GradeHistoryDB:
             decisions[sid] = USE_OVERWRITE if choice == USE_OVERWRITE else USE_SKIP
         return decisions
 
-    def _payload(self) -> dict[str, Any]:
-        payload = load_user_json(self._store, self._username, self.filename, None)
+    def _payload(self, *, strict: bool = False) -> dict[str, Any]:
+        payload = load_user_json(self._store, self._username, self.filename, None, strict=strict)
         if isinstance(payload, dict):
             return payload
         return {"table": self.table, "version": 1, "rows": []}
@@ -1495,6 +1496,19 @@ def _bare_student_id(value: Any) -> str:
     return ""
 
 
+_UNSAFE_STUDENT_FILENAME = re.compile(r"[^0-9A-Za-z_-]+")
+
+
+def safe_student_file(key: str) -> str:
+    """学生键对应的安全文件名片段（侧写和聊天沿用同一规则）。"""
+    text = _clean_text(key)
+    for prefix in ("sid:", "name:"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    return (_UNSAFE_STUDENT_FILENAME.sub("_", text).strip("_") or "unknown")[:64]
+
+
 def _user_dir(store: CryptoStore, username: str) -> Any:
     """这个用户的密文目录（``u_<uid>/``）。
 
@@ -1769,27 +1783,51 @@ class StudentStore:
         Raises:
             ValueError: 学号为空。
         """
-        key = _student_id_of(student_id)
-        if not key:
-            raise ValueError("学号不能为空")
-        rows = self._load()
-        row = rows.get(key)
-        if row is None:
-            return self.add(student_id=key, name=name, class_name=class_name,
-                            source=source)
-        updated = dict(row)
-        if not _clean_text(updated.get("name")) and _clean_text(name):
-            updated["name"] = _clean_text(name)
-        if not _clean_text(updated.get("class_name")) and _clean_text(class_name):
-            updated["class_name"] = _clean_text(class_name)
-        if not _clean_text(updated.get("source")):
-            updated["source"] = _clean_text(source) or "import"
-        if updated == row:
-            return dict(row)
-        updated["updated_at"] = _now()
-        rows[key] = updated
-        self._write(rows)
-        return dict(updated)
+        return self.upsert_import_many([(student_id, name)], class_name, source=source)[0]
+
+    def upsert_import_many(
+        self, students: list[tuple[str, str]], class_name: str = "", *, source: str = "import"
+    ) -> list[dict[str, Any]]:
+        """一次读写主档和审计，保留已有的手工信息与归档状态。"""
+        if not students:
+            return []
+        rows = self._load(strict=True)
+        changed = False
+        audit: list[dict[str, Any]] = []
+        saved: list[dict[str, Any]] = []
+        stamp = _now()
+        for student_id, name in students:
+            key = _student_id_of(student_id)
+            if not key:
+                raise ValueError("学号不能为空")
+            row = rows.get(key)
+            fields = {"name": _clean_text(name), "class_name": _clean_text(class_name),
+                      "source": _clean_text(source) or "import"}
+            if row is None:
+                if not fields["name"]:
+                    raise ValueError("姓名不能为空")
+                updated = {
+                    "student_id": key, **fields, "note": "", "archived": False,
+                    "created_at": stamp, "updated_at": stamp,
+                }
+                audit.append({"operation": OP_STUDENT_ADD, "student_id": key,
+                              "detail": f"新建学生 {fields['name']}", "count": 1})
+            else:
+                updated = dict(row)
+                for field, value in fields.items():
+                    if value and not _clean_text(row.get(field)):
+                        updated[field] = value
+                if updated != row:
+                    updated["updated_at"] = stamp
+            if updated != row:
+                rows[key] = updated
+                changed = True
+            saved.append(dict(updated))
+        if changed:
+            self._write(rows)
+        if audit:
+            GradeAuditLog(username=self._username, uid=self._uid, store=self._store).record_many(audit)
+        return saved
 
     def archive(self, student_id: str, archived: bool = True) -> dict[str, Any]:
         """归档 = 从列表里拿掉（**一条数据都不删**）；``archived=False`` = 恢复。
@@ -1869,8 +1907,8 @@ class StudentStore:
             _LOGGER.warning("学生主档审计日志没写进去（已忽略）：%s: %s",
                             type(exc).__name__, exc)
 
-    def _load(self) -> dict[str, dict[str, Any]]:
-        payload = load_user_json(self._store, self._username, self.filename, None)
+    def _load(self, *, strict: bool = False) -> dict[str, dict[str, Any]]:
+        payload = load_user_json(self._store, self._username, self.filename, None, strict=strict)
         if not isinstance(payload, dict):
             return {}
         stored = payload.get("rows")
@@ -1944,7 +1982,7 @@ class StudentMigrationReport:
         if self.chats:
             moved.append(f"聊天 {self.chats} 份")
         if self.moral:
-            moved.append(f"德育分 {self.moral} 个班")
+            moved.append(f"德育分 {self.moral} 份")
         if self.intentions:
             moved.append("意愿 1 条")
         text = f"学号 {old} → {new}；已迁移：" + (
@@ -2075,29 +2113,34 @@ def migrate_student_id(old_id: str, new_id: str, *, store: CryptoStore | None = 
         except OSError as exc:
             _LOGGER.warning("改学号：聊天记录没迁成（继续）：%s", exc)
 
-    # 5) 德育分（键是 sid:<学号>，一个班一个文件；走 scholarship 的公开 API）
-    try:
-        from core import scholarship  # noqa: PLC0415 - 晚绑定，避免 import 环
+    # 5) 班级成绩快照及德育分，覆盖每个班级学年并保留来源元数据。
+    from core.scholarship import moral_file_scope
+    with ROSTER_WRITE_LOCK:
+        for filename in _class_payload_names(vault, user):
+            try:
+                payload = load_user_json(vault, user, filename, strict=True)
+                rows = payload.get("students", []) if isinstance(payload, dict) else []
+                keys = {row.get("key") for row in rows}
+                if report.old_id not in keys or report.new_id in keys:
+                    continue
+                for row in rows:
+                    if row.get("key") == report.old_id:
+                        row["key"] = report.new_id
+                        row["student_id"] = _bare_student_id(report.new_id)
+                save_user_json(vault, user, filename, payload)
+            except (CryptoError, OSError, ValueError) as exc:
+                _LOGGER.warning("改学号：班级快照没迁成（继续）：%s: %s", type(exc).__name__, exc)
 
-        classes: list[str] = []
-        for record in scholarship.list_classes(vault, user):
-            class_name = str(getattr(record, "class_name", "") or "")
-            if class_name and class_name not in classes:
-                classes.append(class_name)
-        # ★ 兜底：只有德育分文件、没有班级快照的班（list_classes 扫不到）也要迁 ——
-        #   否则"这个班的德育分静默不迁"，而它恰恰是用户手录、丢了就没法复原的数据。
-        for name in list_user_json(vault, user, "_moral.json.enc"):
-            stem = name.rsplit("_moral.json.enc", 1)[0]
-            class_name = stem[len("class_"):] if stem.startswith("class_") else ""
-            if class_name and class_name not in classes:
-                classes.append(class_name)
-        for class_name in classes:
-            scores = dict(scholarship.load_moral(vault, user, class_name) or {})
-            if _rename_key(scores, report.old_id, report.new_id):
-                scholarship.save_moral(vault, user, class_name, scores)
-                report.moral += 1
-    except Exception as exc:  # noqa: BLE001
-        _LOGGER.warning("改学号：德育分没迁成（继续）：%s: %s", type(exc).__name__, exc)
+        for filename in list_user_json(vault, user, "_moral.json.enc"):
+            if moral_file_scope(filename) is None:
+                continue
+            try:
+                payload = load_user_json(vault, user, filename, strict=True)
+                if _rename_nested(payload, "scores", report.old_id, report.new_id):
+                    save_user_json(vault, user, filename, payload)
+                    report.moral += 1
+            except (CryptoError, OSError, ValueError) as exc:
+                _LOGGER.warning("改学号：德育分没迁成（继续）：%s: %s", type(exc).__name__, exc)
 
     # 6) 意愿标签（{"intentions": {"sid:<学号>": "考研"}}）
     try:

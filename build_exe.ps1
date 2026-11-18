@@ -132,6 +132,8 @@ $Common = @(
     #   漏了的话 exe 里窗口能开、界面全白（main.load_stylesheet 读不到会返回空串，
     #   自检里有一条专门查这个文件在不在）。
     '--add-data', 'ui/styles.qss;ui',
+    '--icon', 'ui/assets/app.ico',
+    '--add-data', 'ui/assets/app.ico;ui/assets',
 
     # pandas 是延迟 import openpyxl 的，静态分析看不到，必须显式带上
     '--hidden-import', 'openpyxl',
@@ -443,7 +445,7 @@ else {
 
 # --- 红线 11：确认构建产物真的被 git 忽略 --------------------------------
 Write-Host "`n=== 3/4 红线 11：构建产物必须被 git 忽略 ===" -ForegroundColor Cyan
-foreach ($probe in @('dist/', 'build/', 'transcript-lens.spec')) {
+foreach ($probe in @('dist/', 'build/', 'release/', 'transcript-lens.spec')) {
     git check-ignore -q $probe
     if ($LASTEXITCODE -eq 0) {
         Write-Host "  已忽略  $probe" -ForegroundColor Green
@@ -453,6 +455,16 @@ foreach ($probe in @('dist/', 'build/', 'transcript-lens.spec')) {
     }
 }
 
+if (($Both -or $Target -eq 'release') -and -not $ShowConsole) {
+    $version = & python -B -c 'from core.version import CURRENT_VERSION; print(CURRENT_VERSION)'
+    if ($LASTEXITCODE -ne 0 -or -not $version) { throw '读取发布版本号失败' }
+    $releaseDir = Join-Path $Root 'release'
+    New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
+    $releaseExe = Join-Path $releaseDir "成绩透析镜v${version}.exe"
+    Copy-Item -LiteralPath (Join-Path $Root 'dist\transcript-lens.exe') -Destination $releaseExe -Force
+    $built += $releaseExe
+}
+
 Write-Host "`n=== 4/4 完成 ===" -ForegroundColor Cyan
 $built | ForEach-Object { Write-Host "  $_" }
-Write-Host "`n提示：dist/ 与 build/ 已被忽略，不要 git add 它们。" -ForegroundColor Yellow
+Write-Host "`n提示：dist/、build/ 与 release/ 已被忽略，不要 git add 它们。" -ForegroundColor Yellow

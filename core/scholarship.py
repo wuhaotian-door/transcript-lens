@@ -1,13 +1,13 @@
 """奖学金测算（规则见 charter v1.6 第 4 章 —— **已定死，不许改**）。
 
-    final = 智育加权(口径①) × 0.7 + 德育分 × 0.3
+    final = 智育加权(必修＋限选) × 0.7 + 德育分 × 0.3
 
 * 班级内按 final 降序排名；
 * 前 X 名一等、接下来 Y 名二等、再接下来 Z 名三等（X/Y/Z 每班独立配置）；
 * **特等奖**：final 进入前 X 名 **且** 每门科目原始成绩 ≥ 90，
   不占名额，默认不与其他奖项叠加。
 
-★ 这个模块**一行加权算术都没有**。智育分是 ``core.calculator`` 用口径①
+学年智育复用 ``core.calculator`` 的必修＋限选口径
   算好的，这里只做「乘以 0.7、加上德育×0.3、排序、截名额」这几步
   —— 那不是加权算术，是奖项规则的算术，charter 第 4 章明确给了公式。
 
@@ -21,19 +21,23 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
-from core.calculator import CalculationScope
+from core.calculator import CalculationScope, CourseScore, dedupe_courses, weighted_average
 from core.crypto_store import CryptoStore
-from core.user_store import load_user_json, save_user_json
+from core.parser import Category
+from core.user_store import ROSTER_WRITE_LOCK, list_user_json, load_user_json, save_user_json
 
 __all__ = [
     "AWARD_FIRST",
     "AWARD_NONE",
     "AWARD_SPECIAL",
+    "ACADEMIC_SCOPE",
     "ACADEMIC_WEIGHT",
+    "ACADEMIC_YEARS",
     "CLASS_PREFIX",
     "MORAL_WEIGHT",
     "SPECIAL_MIN_SCORE",
@@ -43,15 +47,19 @@ __all__ = [
     "class_filename",
     "compute_scholarship",
     "list_classes",
+    "list_moral_scopes",
     "load_class",
     "load_moral",
     "load_quota",
+    "load_year_class",
+    "moral_file_scope",
     "moral_filename",
     "quota_filename",
     "save_class",
     "save_moral",
     "save_quota",
     "validate_class_name",
+    "validate_school_year",
 ]
 
 #: 班级号前缀 —— 一个班一个文件：``class_{班级号}.json.enc``
@@ -64,8 +72,8 @@ MORAL_WEIGHT = 0.3
 #: 特等奖的每门课最低分（charter 4.4，**不许放宽**）
 SPECIAL_MIN_SCORE = 90
 
-#: 智育分取哪一档口径 —— charter 4.2 指定「总加权（全口径）」= 口径①
-ACADEMIC_SCOPE = CalculationScope.ALL
+#: 全年智育与奖项只计必修和限选。
+ACADEMIC_SCOPE = CalculationScope.REQUIRED_LIMITED
 
 #: 奖项名
 AWARD_SPECIAL = "特等"
@@ -79,7 +87,13 @@ _CLASS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,31}$")
 
 #: 从 ``list_classes`` 里认出一个班级文件的严格模式。
 #: ★ 必须排除 ``_moral`` / ``_quota`` 后缀，否则"德育分文件"会被当成一个班。
-_CLASS_FILE_RE = re.compile(r"^class_(?P<name>[A-Za-z0-9][A-Za-z0-9-]{0,31})\.json\.enc$")
+_CLASS_FILE_RE = re.compile(
+    r"^class_(?P<name>[A-Za-z0-9][A-Za-z0-9-]{0,31})(?:_y[1-4]_(?:first|second|full))?\.json\.enc$"
+)
+ACADEMIC_YEARS = ("大一", "大二", "大三", "大四")
+_MORAL_FILE_RE = re.compile(
+    r"^class_(?P<name>[A-Za-z0-9][A-Za-z0-9-]{0,31})(?:_y(?P<year>[1-4]))?_moral\.json\.enc$"
+)
 
 
 def validate_class_name(name: str) -> str:
@@ -102,12 +116,30 @@ def class_filename(class_name: str) -> str:
     return f"{CLASS_PREFIX}{validate_class_name(class_name)}.json.enc"
 
 
-def moral_filename(class_name: str) -> str:
-    return f"{CLASS_PREFIX}{validate_class_name(class_name)}_moral.json.enc"
+def _class_year_stem(class_name: str, year: str) -> str:
+    stem = f"{CLASS_PREFIX}{validate_class_name(class_name)}"
+    return f"{stem}_y{ACADEMIC_YEARS.index(year) + 1}" if year else stem
 
 
-def quota_filename(class_name: str) -> str:
-    return f"{CLASS_PREFIX}{validate_class_name(class_name)}_quota.json.enc"
+def moral_filename(class_name: str, year: str = "") -> str:
+    return f"{_class_year_stem(class_name, year)}_moral.json.enc"
+
+
+def quota_filename(class_name: str, year: str = "") -> str:
+    return f"{_class_year_stem(class_name, year)}_quota.json.enc"
+
+
+def moral_file_scope(filename: str) -> tuple[str, str] | None:
+    match = _MORAL_FILE_RE.fullmatch(filename)
+    if match is None:
+        return None
+    year = match["year"]
+    return match["name"], ACADEMIC_YEARS[int(year) - 1] if year else ""
+
+
+def list_moral_scopes(store: CryptoStore, username: str) -> list[tuple[str, str]]:
+    return sorted(scope for name in list_user_json(store, username, "_moral.json.enc")
+                  if (scope := moral_file_scope(name)) is not None)
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +151,7 @@ def quota_filename(class_name: str) -> str:
 class ClassRecord:
     """一个班的成绩快照（从导入的成绩表里抽出来，加密落盘）。
 
-    ``students`` 里每一项都是**算好的**：``academic`` 是口径①的加权均分，
+    ``students`` 里每一项都是**算好的**：``academic`` 是必修与限选的加权均分，
     ``courses`` 是这门课他真考了多少分。以后测算时**不需要重新解析 Excel**，
     也就不会出现"两次解析结果不一致"。
     """
@@ -128,6 +160,8 @@ class ClassRecord:
     source: str = ""
     term: str = ""
     students: list[dict[str, Any]] = field(default_factory=list)
+    school_year: str = ""
+    annual_complete: bool | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -135,6 +169,7 @@ class ClassRecord:
             "source": self.source,
             "term": self.term,
             "students": list(self.students),
+            "school_year": self.school_year,
         }
 
     @classmethod
@@ -152,6 +187,7 @@ class ClassRecord:
             source=str(data.get("source") or ""),
             term=str(data.get("term") or ""),
             students=[s for s in students if isinstance(s, dict)],
+            school_year=str(data.get("school_year") or ""),
         )
 
     @property
@@ -190,12 +226,12 @@ class Quota:
 class ScholarshipRow:
     """结果表格的一行。"""
 
-    rank: int
+    rank: int | None
     student: str
     student_id: str
     key: str
     academic: float | None
-    moral: int | None
+    moral: float | None
     final: float | None
     award: str
     note: str = ""
@@ -210,7 +246,7 @@ class ScholarshipRow:
 
     @property
     def moral_text(self) -> str:
-        return "—" if self.moral is None else str(self.moral)
+        return "—" if self.moral is None else str(self.moral).removesuffix(".0")
 
 
 # ---------------------------------------------------------------------------
@@ -219,78 +255,200 @@ class ScholarshipRow:
 
 
 def save_class(store: CryptoStore, username: str, record: ClassRecord) -> Any:
-    """把一个班的成绩快照写进加密库。"""
-    return save_user_json(store, username, class_filename(record.class_name),
-                          record.as_dict())
+    """在指定学年范围保存成绩。无学年标签的调用仍使用原班级文件。"""
+    with ROSTER_WRITE_LOCK:
+        year, half = record.term[:2], record.term[2:]
+        filename = class_filename(record.class_name)
+        if year in ACADEMIC_YEARS and half in ("", "上", "下"):
+            validate_school_year(store, username, record.class_name, year, record.school_year)
+            filename = _year_grade_filename(record.class_name, year, half)
+        return save_user_json(store, username, filename, record.as_dict())
 
 
 def load_class(store: CryptoStore, username: str, class_name: str) -> ClassRecord | None:
-    path_name = class_filename(class_name)
-    return ClassRecord.from_dict(load_user_json(store, username, path_name))
+    name = validate_class_name(class_name)
+    filename = _latest_class_files(store, username).get(name)
+    return ClassRecord.from_dict(load_user_json(store, username, filename)) if filename else None
+
+
+def _year_grade_filename(class_name: str, year: str, half: str) -> str:
+    coverage = {"": "full", "上": "first", "下": "second"}[half]
+    return f"{_class_year_stem(class_name, year)}_{coverage}.json.enc"
+
+
+def validate_school_year(
+    store: CryptoStore, username: str, class_name: str, year: str, school_year: str,
+) -> None:
+    """同一班级的公历学年只对应一个年级，原表明确标注时检查两者是否一致。"""
+    if not school_year:
+        return
+    files = set(list_user_json(store, username))
+    for previous_year in ACADEMIC_YEARS:
+        for half in ("", "上", "下"):
+            filename = _year_grade_filename(class_name, previous_year, half)
+            if filename not in files:
+                continue
+            previous = ClassRecord.from_dict(load_user_json(store, username, filename, strict=True))
+            if previous is None or not previous.school_year:
+                continue
+            if previous_year == year and previous.school_year != school_year:
+                raise ValueError(f"{class_name} 班{year}已登记为 {previous.school_year} 学年，"
+                                 f"原表是 {school_year} 学年。")
+            if previous_year != year and previous.school_year == school_year:
+                raise ValueError(f"{class_name} 班的 {school_year} 学年已归入{previous_year}。")
+
+
+def load_year_class(
+    store: CryptoStore, username: str, class_name: str, year: str,
+) -> ClassRecord | None:
+    """读取单个班级学年。完整学年表优先，其余情况按上下两份合并。"""
+    if year not in ACADEMIC_YEARS:
+        raise ValueError("请选择大一至大四中的一个学年。")
+
+    def read(half: str) -> ClassRecord | None:
+        filename = _year_grade_filename(class_name, year, half)
+        return ClassRecord.from_dict(load_user_json(store, username, filename, strict=True))
+
+    full = read("")
+    if full is not None:
+        full.annual_complete = True
+        full.students = [_annual_student(student, student) for student in full.students]
+        return full
+    first, second = read("上"), read("下")
+    if first is None or second is None:
+        partial = first or second
+        if partial is not None:
+            partial.annual_complete = False
+            partial.students = [_annual_student(student, student) for student in partial.students]
+        return partial
+    if first.school_year and second.school_year and first.school_year != second.school_year:
+        raise ValueError(f"{year}的上下半学年来自不同学年，请检查两次导入的归属。")
+
+    first_students = {row["key"]: row for row in first.students if row.get("key")}
+    second_students = {row["key"]: row for row in second.students if row.get("key")}
+    students = [
+        _combine_year_student(first_students.get(key), second_students.get(key))
+        for key in dict.fromkeys((*first_students, *second_students))
+    ]
+    return ClassRecord(
+        class_name, " / ".join(filter(None, (first.source, second.source))), year, students,
+        first.school_year or second.school_year, True,
+    )
+
+
+def _combine_year_student(
+    first: dict[str, Any] | None, second: dict[str, Any] | None,
+) -> dict[str, Any]:
+    student = dict(second or first or {})
+    if first is None or second is None or first.get("academic") is None or second.get("academic") is None:
+        return {**student, "academic": None, "incomplete_year": True}
+
+    return _annual_student(student, first, second)
+
+
+def _annual_student(student: dict[str, Any], *sources: dict[str, Any]) -> dict[str, Any]:
+    # 先按课程类别筛选，再处理同名课程，避免选修成绩覆盖同名必修成绩。
+    allowed = {category.value for category in ACADEMIC_SCOPE.categories}
+    courses = [
+        CourseScore(course["name"], Category(course["category"]),
+                    float(course["credit"]), course.get("score"))
+        for source in sources
+        for course in source.get("courses", ())
+        if course.get("category") in allowed and course.get("credit") is not None
+    ]
+    winners = dedupe_courses(courses).course_scores
+    return {**student, "academic": weighted_average(winners),
+            "courses": [course.as_dict() for course in winners]}
+
+
+def _latest_class_files(store: CryptoStore, username: str) -> dict[str, str]:
+    """扫描班级快照，每班给旧页面提供最近写入的一份。"""
+    account = store.load_users().find(username)
+    if account is None:
+        return {}
+    folder = store.user_dir(account.uid)
+    if not folder.is_dir():
+        return {}
+    latest: dict[str, tuple[int, str]] = {}
+    for path in folder.iterdir():
+        hit = _CLASS_FILE_RE.fullmatch(path.name)
+        if not hit or not path.is_file():
+            continue
+        name = hit["name"]
+        try:
+            candidate = path.stat().st_mtime_ns, path.name
+        except FileNotFoundError:
+            continue
+        if candidate > latest.get(name, (0, "")):
+            latest[name] = candidate
+    return {name: latest[name][1] for name in sorted(latest)}
 
 
 def list_classes(store: CryptoStore, username: str) -> list[ClassRecord]:
-    """列出所有已导入的班级（**扫目录**，不另存索引）。
-
-    ★ 不维护"班级索引文件"是刻意的：索引和文件一旦对不上
-      （删了文件没改索引、写索引时崩了），界面就会显示一个点进去没内容的班。
-      直接扫目录，永远和磁盘一致。
-    """
-    record = store.load_users().find(username)
-    if record is None:
-        return []
-    folder = store.user_dir(record.uid)
-    if not folder.is_dir():
-        return []
-    out: list[ClassRecord] = []
-    for path in sorted(folder.iterdir()):
-        if not path.is_file():
-            continue
-        hit = _CLASS_FILE_RE.match(path.name)
-        if not hit:
-            continue                      # _moral / _quota 都不是班级文件
-        item = load_class(store, username, hit.group("name"))
-        if item is not None:
-            out.append(item)
-    return out
+    """从加密目录列出班级，每班只出现一次。"""
+    return [
+        record for filename in _latest_class_files(store, username).values()
+        if (record := ClassRecord.from_dict(load_user_json(store, username, filename))) is not None
+    ]
 
 
 def save_moral(store: CryptoStore, username: str, class_name: str,
-               scores: dict[str, int]) -> Any:
+               scores: dict[str, float], *, year: str = "", school_year: str = "") -> Any:
     """存德育分。键是学生 ``key``（``sid:<学号>``），不是姓名。"""
-    clean: dict[str, int] = {}
+    clean: dict[str, float] = {}
     for key, value in scores.items():
         if not isinstance(key, str) or not key:
             continue
         try:
-            number = int(value)
+            number = float(value)
         except (TypeError, ValueError):
             continue
-        clean[key] = max(0, min(100, number))
-    return save_user_json(store, username, moral_filename(class_name),
-                          {"scores": clean})
+        if math.isfinite(number):
+            clean[key] = max(0, min(100, number))
+    with ROSTER_WRITE_LOCK:
+        path = moral_filename(class_name, year)
+        previous = _read_moral_payload(store, username, class_name, year, school_year) if year else {}
+        cycle = school_year or previous.get("school_year", "")
+        payload: dict[str, Any] = {"scores": clean}
+        if cycle:
+            payload["school_year"] = cycle
+        return save_user_json(store, username, path, payload)
 
 
-def load_moral(store: CryptoStore, username: str, class_name: str) -> dict[str, int]:
-    raw = load_user_json(store, username, moral_filename(class_name), {})
+def _read_moral_payload(store: CryptoStore, username: str, class_name: str,
+                        year: str, school_year: str) -> dict[str, Any]:
+    raw = load_user_json(store, username, moral_filename(class_name, year), {}, strict=bool(year))
+    if not isinstance(raw, dict):
+        return {}
+    saved_year = raw.get("school_year")
+    if school_year and saved_year and school_year != saved_year:
+        raise ValueError(f"{class_name} 班{year}的德育分属于 {saved_year} 学年，当前成绩属于 {school_year} 学年。")
+    return raw
+
+
+def load_moral(store: CryptoStore, username: str, class_name: str, *, year: str = "",
+               school_year: str = "") -> dict[str, float]:
+    raw = _read_moral_payload(store, username, class_name, year, school_year)
     scores = raw.get("scores") if isinstance(raw, dict) else None
     if not isinstance(scores, dict):
         return {}
-    out: dict[str, int] = {}
+    out: dict[str, float] = {}
     for key, value in scores.items():
         try:
-            out[str(key)] = max(0, min(100, int(value)))
+            number = float(value)
         except (TypeError, ValueError):
             continue
+        if math.isfinite(number):
+            out[str(key)] = max(0, min(100, number))
     return out
 
 
-def save_quota(store: CryptoStore, username: str, class_name: str, quota: Quota) -> Any:
-    return save_user_json(store, username, quota_filename(class_name), quota.as_dict())
+def save_quota(store: CryptoStore, username: str, class_name: str, quota: Quota, *, year: str = "") -> Any:
+    return save_user_json(store, username, quota_filename(class_name, year), quota.as_dict())
 
 
-def load_quota(store: CryptoStore, username: str, class_name: str) -> Quota:
-    return Quota.from_dict(load_user_json(store, username, quota_filename(class_name)))
+def load_quota(store: CryptoStore, username: str, class_name: str, *, year: str = "") -> Quota:
+    return Quota.from_dict(load_user_json(store, username, quota_filename(class_name, year)))
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +486,7 @@ def all_courses_above(student: dict[str, Any], threshold: float = SPECIAL_MIN_SC
 
 def compute_scholarship(
     record: ClassRecord,
-    moral: dict[str, int] | None = None,
+    moral: dict[str, float] | None = None,
     quota: Quota | None = None,
     *,
     stackable: bool = False,
@@ -345,6 +503,8 @@ def compute_scholarship(
     Returns:
         按最终成绩降序排列的 :class:`ScholarshipRow` 列表。
     """
+    if record.annual_complete is False:
+        raise ValueError("请先导入完整学年成绩或同一学年的上下两份成绩。")
     moral = moral or {}
     quota = quota or Quota()
 
@@ -359,20 +519,20 @@ def compute_scholarship(
             academic = None
 
         raw_moral = moral.get(key)
-        moral_value: int | None
+        moral_value: float | None
         try:
-            moral_value = None if raw_moral is None else int(raw_moral)
+            moral_value = None if raw_moral is None else float(raw_moral)
         except (TypeError, ValueError):
             moral_value = None
 
         notes: list[str] = []
-        if moral_value is None:
+        if moral_value is None or not math.isfinite(moral_value):
             # ★ 没录德育分 ≠ 德育满分，也 ≠ 0 分真实值 —— 按 0 参与计算，
             #   但必须在备注里说清楚，否则用户会以为这个人真的德育 0 分。
             moral_value = 0
             notes.append("德育分未录入，按 0 计")
         if academic is None:
-            notes.append("没有可用的智育成绩")
+            notes.append("个人学年成绩不完整" if student.get("incomplete_year") else "没有可用的智育成绩")
             final = None
         else:
             final = academic * ACADEMIC_WEIGHT + float(moral_value) * MORAL_WEIGHT
@@ -403,7 +563,7 @@ def compute_scholarship(
         )
     )
     for index, item in enumerate(prepared, 1):
-        item["rank"] = index
+        item["rank"] = None if record.annual_complete and item["final"] is None else index
 
     # --- 3. 特等奖：final 进入前 X 名 且 每门 ≥ 90 -------------------------
     first_quota = max(0, quota.first)

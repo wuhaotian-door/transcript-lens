@@ -24,7 +24,6 @@ import inspect
 import json
 import logging
 import os
-import re
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Sequence
@@ -45,7 +44,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.archival import SEMESTER_ORDER, merge_records, partition, semester_rank, trend
+from core.archival import SEMESTER_ORDER, archive_key, merge_records, partition, semester_rank, trend
 from core.calculator import (
     CalculationScope,
     CourseScore,
@@ -53,9 +52,9 @@ from core.calculator import (
     weighted_average,
 )
 from core.crypto_store import CryptoError, CryptoStore
-from core.database import GradeHistoryDB, ProfileStore
+from core.database import GradeHistoryDB, ProfileStore, safe_student_file
 from core.gpa import DEFAULT_SCHEME, gpa_of
-from core.parser import Category
+from core.parser import Category, strip_blank_marker
 from core.scholarship import list_classes, load_moral, save_moral
 from ui.intentions import INTENTION_OPTIONS, KEY_PREFIX_NAME, KEY_PREFIX_SID, student_key
 from core.user_store import (
@@ -142,31 +141,11 @@ CHAT_MAX_PROMPT_CHARS = 4000
 CHAT_STOP_WORDS = ("\n辅导员：", "辅导员：")
 
 #: 文件名里不允许出现的字符（学号里的 ``:`` / 空格 / 引号都换掉）。
-_UNSAFE_FILENAME = re.compile(r"[^0-9A-Za-z_-]+")
 
 
 # ---------------------------------------------------------------------------
 # 纯逻辑 helper（零 Qt；v1.9.1 的 profile_page.py 里原样搬来）
 # ---------------------------------------------------------------------------
-
-def safe_student_file(key: str) -> str:
-    """把 ``sid:2023001`` 这种键变成安全的文件名片段。
-
-    ★ 谈话记录按学生分开存（``cache/chat_history_<学号>.json.enc``），而键里带
-      ``sid:`` 前缀 —— 冒号在 Windows 上根本不是合法文件名字符。没有学号时
-      退回"整个键的清洗结果"，**绝不返回空串**（空串会拼出
-      ``chat_history_.json.enc``，两个没学号的学生就共用一份记录了）。
-    """
-    text = str(key or "").strip()
-    for prefix in ("sid:", "name:"):
-        if text.startswith(prefix):
-            text = text[len(prefix):]
-            break
-    safe = _UNSAFE_FILENAME.sub("_", text).strip("_")
-    if not safe:
-        safe = "unknown"
-    return safe[:64]
-
 
 def moral_text(value: Any) -> str:
     """德育分那一行的文字。**没录 ≠ 0 分**（AGENTS §14）：没录就写"未录入"。"""
@@ -175,7 +154,12 @@ def moral_text(value: Any) -> str:
     if isinstance(value, bool):          # True/False 不该被当成 1/0
         return NO_MORAL_TEXT
     if isinstance(value, (int, float)):
-        return f"{value:g}"
+        return str(value).removesuffix(".0")
+    if isinstance(value, list):
+        return "\n".join(
+            f"{row['班级']}班 {row['学年'] or '旧记录'}：{moral_text(row['分数'])}"
+            for row in value
+        ) or NO_MORAL_TEXT
     text = str(value).strip()
     return text or NO_MORAL_TEXT
 
@@ -335,16 +319,19 @@ def _ordered_records(archive: Any) -> list[Any]:
     return sorted(records, key=lambda rec: semester_rank(getattr(rec, "term", "")))
 
 
-def grade_rows_from_records(archive: Any) -> list[dict[str, Any]]:
-    """归档 → ``[{"term": ..., "course": ..., "score": ..., "credit": ...}]``。
+def is_unselected_elective(category: Any, score: Any) -> bool:
+    """只隐藏没有参加的选修课，保留显式零分等有效状态。"""
+    return _category_text(category) == Category.ELECTIVE.value and strip_blank_marker(score) is None
 
-    只搬运，不改口径：``score is None``（没选这门课）原样留着，
-    由 :func:`format_score` 决定显示成空白。
-    """
+
+def grade_rows_from_records(archive: Any) -> list[dict[str, Any]]:
+    """归档中的可显示课程，排除未选的选修课。"""
     rows: list[dict[str, Any]] = []
     for record in _ordered_records(archive):
         term = str(getattr(record, "term", "") or "")
         for course in getattr(record, "courses", ()) or ():
+            if is_unselected_elective(getattr(course, "category", None), getattr(course, "score", None)):
+                continue
             rows.append({
                 "term": term,
                 "course": str(getattr(course, "name", "") or ""),
@@ -379,7 +366,7 @@ def group_grades_by_term(rows: list[dict[str, Any]],
     terminal = {str(t or "").strip() for t in (terminal_terms or ())}
     buckets: dict[str, list[dict[str, Any]]] = {}
     for row in rows or ():
-        if not isinstance(row, dict):
+        if not isinstance(row, dict) or is_unselected_elective(row.get("category"), row.get("score")):
             continue
         term = str(row.get("term") or row.get("semester") or "").strip()
         course = str(row.get("course") or row.get("course_name") or "").strip()
@@ -480,7 +467,7 @@ def build_side_text_prompt(student: str, student_id: str, key: str, grades: Any,
         lines.append("")
         lines.append("德育分：未录入")
     else:
-        lines.extend(["", f"德育分：{moral}"])
+        lines.extend(["", f"德育分：{moral_text(moral)}"])
     return "\n".join(lines)
 
 
@@ -774,9 +761,7 @@ class StudentBook:
             record = normalise_student_record(raw)
             if record.student_id:
                 merged[record.student_id] = record
-        # 主档还读不出东西时，保留本进程里刚写的那几条（契约可能"写得进读不出"）
-        for sid, record in self._memory.items():
-            merged.setdefault(sid, record)
+        # 成功读到主档时用它替换缓存，别处删除的学生不应重新出现。
         self._memory = merged
 
     def _read_all_from_real(self) -> list[Any] | None:
@@ -1370,6 +1355,10 @@ def student_archive_of_key(archive: Any, key: str) -> Any | None:
     if callable(getter):
         try:
             found = getter(key)
+            if found is None and key.startswith("sid:"):
+                found = getter(archive_key(key[4:])) or getter(archive_key(key))
+            if found is None and key.startswith("name:"):
+                found = getter(archive_key("", key[5:]))
         except Exception:  # noqa: BLE001
             logger.warning("取学生档案失败（%s）", key, exc_info=True)
             return None
@@ -1391,7 +1380,7 @@ def build_empty_student_archive(key: str, student: str, student_id: str = "") ->
     """
     from core.archival import StudentArchive
 
-    return StudentArchive(key=key or student_id, student=student)
+    return StudentArchive(key=key or student_id, student=student, roster_id=student_id)
 
 
 def course_rows_from_archive(student_archive: Any) -> list[dict[str, Any]]:
@@ -1400,6 +1389,8 @@ def course_rows_from_archive(student_archive: Any) -> list[dict[str, Any]]:
     for record in _ordered_records(student_archive):
         term = getattr(record, "term", "") or ""
         for course in getattr(record, "courses", []) or []:
+            if is_unselected_elective(getattr(course, "category", None), getattr(course, "score", None)):
+                continue
             rows.append(
                 {
                     "term": term,

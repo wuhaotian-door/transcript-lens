@@ -2,9 +2,9 @@
 
 页面结构::
 
-    ┌ 班级 [CS2023-1 ▾]   [重新读取] ────────────────────────────────┐
+    ┌ 班级 [CS2023-1 ▾]   学年 [大一 ▾]   [重新读取] ────────────────┐
     │ ① 德育分（0-100）—— 可直接从 Excel 整列粘贴                      │
-    │    排名 | 姓名 | 学号 | 智育分 | 德育分(QSpinBox)                │
+    │    序号 | 姓名 | 学号 | 智育分 | 德育分                         │
     │    [保存德育分]                                                  │
     ├ ② 名额：一等[2] 二等[3] 三等[4]  [保存名额]  ☐允许特等叠加       │
     │    [开始测算]                                                    │
@@ -17,15 +17,12 @@
   （:class:`core.scholarship.ClassRecord`），这里只调
   :func:`core.scholarship.compute_scholarship`。
 
-★ 为什么德育分用 **delegate 里的 QSpinBox**，而不是每格
-  ``setCellWidget(QSpinBox)``：
-  ``setCellWidget`` 之后那个格子就**不再是一个 item**，QTableWidget 的
-  原生 Ctrl+V 粘贴会跳过它 —— 而"从 Excel 整列粘贴"是这一页最要紧的输入方式
-  （几十号人一个个点太慢）。用 :class:`MoralSpinDelegate`，
-  双击编辑时是 0-100 的 SpinBox，批量粘贴照常工作。
+德育分按班级及学年保存，表格保留小数。
 """
 
 from __future__ import annotations
+
+import math
 
 from typing import Any
 
@@ -45,7 +42,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
-    QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -63,6 +59,7 @@ from core.import_workers import (
 )
 from core.scholarship import (
     ACADEMIC_WEIGHT,
+    ACADEMIC_YEARS,
     AWARD_FIRST,
     AWARD_SECOND,
     AWARD_SPECIAL,
@@ -77,6 +74,7 @@ from core.scholarship import (
     list_classes,
     load_moral,
     load_quota,
+    load_year_class,
     save_moral,
     save_quota,
 )
@@ -106,7 +104,7 @@ AWARD_COL = 6
 NOTE_COL = 7
 
 #: 德育分录入表列
-MORAL_COLUMNS: tuple[str, ...] = ("排名", "姓名", "学号", "智育分", "德育分")
+MORAL_COLUMNS: tuple[str, ...] = ("序号", "姓名", "学号", "智育分", "德育分")
 M_NAME_COL = 1
 M_ID_COL = 2
 M_ACADEMIC_COL = 3
@@ -119,32 +117,6 @@ _AWARD_STYLE: dict[str, tuple[str, str]] = {
     AWARD_SECOND:  ("#E2E8F0", "#475569"),   # 银
     AWARD_THIRD:   ("#FFEDD5", "#9A3412"),   # 铜
 }
-
-
-class MoralSpinDelegate(QStyledItemDelegate):
-    """德育分那一列的编辑器：0-100 的 QSpinBox。
-
-    ★ 只提供**编辑器**，不改变单元格本身是 item 这件事 ——
-      所以 QTableWidget 的原生粘贴（从 Excel 复制一列贴进来）照常工作。
-      用 ``setCellWidget`` 就会把这一点弄丢。
-    """
-
-    def createEditor(self, parent, option, index):  # noqa: N802 - Qt 命名
-        editor = QSpinBox(parent)
-        editor.setRange(MORAL_MIN, MORAL_MAX)
-        editor.setFrame(False)
-        return editor
-
-    def setEditorData(self, editor, index) -> None:  # noqa: N802
-        try:
-            value = int(index.data(Qt.ItemDataRole.EditRole) or 0)
-        except (TypeError, ValueError):
-            value = 0
-        editor.setValue(max(MORAL_MIN, min(MORAL_MAX, value)))
-
-    def setModelData(self, editor, model, index) -> None:  # noqa: N802
-        editor.interpretText()
-        model.setData(index, str(editor.value()), Qt.ItemDataRole.EditRole)
 
 
 def _cell(text: str, *, align=Qt.AlignmentFlag.AlignCenter,
@@ -188,13 +160,14 @@ class ScholarshipPage(QWidget):
         self._username = username or ""
         self.reload_classes()
 
-    def reload_classes(self, select: str | None = None) -> None:
+    def reload_classes(self, select: str | None = None, *, year: str = "") -> None:
         """重新扫一遍加密库里的班级，刷新下拉。
 
         ``select`` 指定要选中哪一个（刚导入完那个班时用）。
         """
         blocked = self._class_box.blockSignals(True)
-        previous = select or self._class_box.currentText()
+        previous = select or self.current_class
+        year_blocked = self._year_box.blockSignals(True)
         try:
             self._class_box.clear()
             try:
@@ -203,23 +176,27 @@ class ScholarshipPage(QWidget):
             except (CryptoError, OSError):
                 records = []
             for record in records:
-                self._class_box.addItem(f"{record.class_name}（{record.size} 人）",
-                                        record.class_name)
+                self._class_box.addItem(record.class_name, record.class_name)
+            if year in ACADEMIC_YEARS:
+                self._year_box.setCurrentText(year)
+            index = self._class_box.findData(previous)
+            self._class_box.setCurrentIndex(index if index >= 0 else 0)
         finally:
             # ★ 必须 finally：中途抛异常也要把信号放回去，
             #   否则这个下拉从此**再也不响应选择**（最难查的那种）。
             self._class_box.blockSignals(blocked)
+            self._year_box.blockSignals(year_blocked)
 
         if self._class_box.count() == 0:
             self._record = None
             self._set_status("还没有任何班级。先在「📊 智育分析」填好班级号并导入成绩表。")
             self._clear_moral_table()
             self._clear_result_table()
+            self._run_btn.setEnabled(False)
+            self._save_moral_btn.setEnabled(False)
             if hasattr(self, "_head_status"):
                 self._head_status.setText("")
             return
-        index = self._class_box.findData(previous)
-        self._class_box.setCurrentIndex(index if index >= 0 else 0)
         self._load_current_class()
 
     @property
@@ -253,7 +230,7 @@ class ScholarshipPage(QWidget):
         box.addWidget(title)
 
         formula = QLabel(
-            f"最终成绩 = 智育加权（口径① 含全部）× {ACADEMIC_WEIGHT:g}"
+            f"最终成绩 = 智育加权（必修＋限选）× {ACADEMIC_WEIGHT:g}"
             f" + 德育分 × {MORAL_WEIGHT:g}　·　"
             f"特等奖：进入一等名额且每门 ≥ {SPECIAL_MIN_SCORE:g} 分，不占名额"
         )
@@ -287,6 +264,13 @@ class ScholarshipPage(QWidget):
         self._class_box.currentIndexChanged.connect(self._load_current_class)
         box.addWidget(self._class_box)
 
+        box.addWidget(QLabel("学年"))
+        self._year_box = QComboBox()
+        self._year_box.addItems(ACADEMIC_YEARS)
+        self._year_box.setMinimumHeight(36)
+        self._year_box.currentIndexChanged.connect(self._load_current_class)
+        box.addWidget(self._year_box)
+
         reload_btn = QPushButton("重新读取")
         reload_btn.setObjectName("Ghost")
         reload_btn.setMinimumHeight(36)
@@ -296,6 +280,7 @@ class ScholarshipPage(QWidget):
 
         self._head_status = QLabel("")
         self._head_status.setObjectName("Muted")
+        self._head_status.setWordWrap(True)
         box.addWidget(self._head_status)
         return card
 
@@ -338,9 +323,6 @@ class ScholarshipPage(QWidget):
         self._moral_table.verticalHeader().setVisible(False)
         self._moral_table.verticalHeader().setDefaultSectionSize(34)
         self._moral_table.setShowGrid(False)
-        self._moral_table.setItemDelegateForColumn(
-            M_MORAL_COL, MoralSpinDelegate(self._moral_table)
-        )
         self._moral_table.itemChanged.connect(self._on_moral_changed)
         header = self._moral_table.horizontalHeader()
         for col in range(len(MORAL_COLUMNS)):
@@ -462,32 +444,43 @@ class ScholarshipPage(QWidget):
 
     # ---------------------------------------------------------------- 读班级
     def _load_current_class(self) -> None:
-        name = self.current_class
+        name, year = self.current_class, self._year_box.currentText()
+        self._record = None
+        self._clear_moral_table()
+        self._clear_result_table()
+        self._run_btn.setEnabled(False)
+        self._save_moral_btn.setEnabled(False)
         if not name or not self._username:
-            self._record = None
-            self._clear_moral_table()
             return
         try:
-            records = {r.class_name: r for r in list_classes(self._store, self._username)}
-        except (CryptoError, OSError):
-            records = {}
-        record = records.get(name)
-        self._record = record
-        if record is None:
-            self._clear_moral_table()
-            self._head_status.setText("读不出这个班的数据")
+            record = load_year_class(self._store, self._username, name, year)
+            quota = load_quota(self._store, self._username, name, year=year)
+            moral = (load_moral(self._store, self._username, name, year=year,
+                                school_year=record.school_year) if record else {})
+        except (CryptoError, OSError, ValueError) as exc:
+            self._head_status.setText(f"无法读取{name}班{year}的数据")
+            self._set_status(str(exc))
             return
-
-        self._head_status.setText(
-            f"{record.size} 人　·　来源 {record.source or '（未知）'}"
-        )
-        quota = load_quota(self._store, self._username, name)
         self._quota_spins["first"].setValue(quota.first)
         self._quota_spins["second"].setValue(quota.second)
         self._quota_spins["third"].setValue(quota.third)
-        self._fill_moral_table(record, load_moral(self._store, self._username, name))
-        self._clear_result_table()
-        self._set_status("德育分和名额都填好后，点「③ 开始测算」。")
+        self._record = record
+        if record is None:
+            self._head_status.setText(f"{year}暂无成绩")
+            self._set_status("请在「智育分析」导入该班该学年的成绩表。")
+            return
+        coverage = "完整学年" if record.annual_complete else f"仅{record.term[-1]}半学年"
+        school_year = f"　·　{record.school_year}" if record.school_year else ""
+        self._head_status.setText(f"{record.size} 人　·　{coverage}{school_year}")
+        self._head_status.setToolTip(record.source)
+        self._moral_table.setHorizontalHeaderItem(3, QTableWidgetItem("学年智育" if record.annual_complete else "本表智育"))
+        self._fill_moral_table(record, moral)
+        self._save_moral_btn.setEnabled(not self._import_busy)
+        self._run_btn.setEnabled(bool(record.annual_complete))
+        if record.annual_complete:
+            self._set_status("可查看学年排名，填写名额后同时测算奖项。")
+        else:
+            self._set_status("可录入该学年的德育分。请补齐学年成绩后查看排名与奖项。")
 
     def _clear_moral_table(self) -> None:
         blocked = self._moral_table.blockSignals(True)
@@ -523,7 +516,7 @@ class ScholarshipPage(QWidget):
             value = moral.get(str(student.get("key") or ""))
             # 没录过就给空白（不是 0）—— 0 是"真的德育 0 分"，
             # 空白是"还没录"，这两个必须能分开（红线 2 的同一条道理）
-            item = QTableWidgetItem("" if value is None else str(value))
+            item = QTableWidgetItem("" if value is None else str(value).removesuffix(".0"))
             item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter
                                       | Qt.AlignmentFlag.AlignVCenter))
             self._moral_table.setItem(i, M_MORAL_COL, item)
@@ -532,19 +525,19 @@ class ScholarshipPage(QWidget):
 
     # ---------------------------------------------------------------- 校验
     def _on_moral_changed(self, item: QTableWidgetItem) -> None:
-        """粘贴进来的值可能带小数、负数、超过 100 —— 就地夹到 0-100。"""
+        """保留合法小数，无效输入留空。"""
         if item.column() != M_MORAL_COL:
             return
         text = item.text().strip()
         if text:
             try:
-                value = int(round(float(text)))
-            except (TypeError, ValueError):
-                value = MORAL_MIN
-            value = max(MORAL_MIN, min(MORAL_MAX, value))
-            if str(value) != text:
+                value = float(text)
+            except ValueError:
+                value = math.nan
+            clean = str(value).removesuffix(".0") if MORAL_MIN <= value <= MORAL_MAX else ""
+            if clean != text:
                 blocked = self._moral_table.blockSignals(True)
-                item.setText(str(value))
+                item.setText(clean)
                 self._moral_table.blockSignals(blocked)
         # ★ 每次改动都重算"已录入 N / M" —— 不重算的话，用户粘完一列
         #   抬头一看还写着"已录入 0 / 6"，会以为没粘进去。
@@ -561,9 +554,9 @@ class ScholarshipPage(QWidget):
                else "　⚠ 没录的人按 0 分参与测算，结果表里会注明。")
         )
 
-    def _collect_moral(self) -> dict[str, int]:
+    def _collect_moral(self) -> dict[str, float]:
         """把表格里的德育分收成 ``{学生 key: 分数}``（空格子 = 没录，不进去）。"""
-        out: dict[str, int] = {}
+        out: dict[str, float] = {}
         if self._record is None:
             return out
         for i, student in enumerate(self._record.students):
@@ -574,11 +567,11 @@ class ScholarshipPage(QWidget):
             if not text:
                 continue
             try:
-                out[str(student.get("key") or "")] = max(
-                    MORAL_MIN, min(MORAL_MAX, int(round(float(text))))
-                )
-            except (TypeError, ValueError):
+                value = float(text)
+            except ValueError:
                 continue
+            if MORAL_MIN <= value <= MORAL_MAX:
+                out[str(student.get("key") or "")] = value
         return out
 
     # ---------------------------------------------------------------- 动作
@@ -588,7 +581,8 @@ class ScholarshipPage(QWidget):
             return
         try:
             save_moral(self._store, self._username, self._record.class_name,
-                       self._collect_moral())
+                       self._collect_moral(), year=self._year_box.currentText(),
+                       school_year=self._record.school_year)
         except (CryptoError, ValueError, OSError) as exc:
             QMessageBox.critical(self, "保存失败", f"{type(exc).__name__}: {exc}")
             return
@@ -610,11 +604,10 @@ class ScholarshipPage(QWidget):
         if not self._username:
             QMessageBox.information(self, "还没登录", "先登录再导入德育分。")
             return
-        if not self.class_names():
+        if self._record is None:
             QMessageBox.information(
-                self, "还没有班级",
-                "一个班都还没建过。先在「📊 智育分析」把这个班的成绩导进来，"
-                "这里才有学号名单可以对应。",
+                self, "缺少班级学年名单",
+                "先在「智育分析」导入该班该学年的成绩，再导入对应的德育分。",
             )
             return
 
@@ -627,13 +620,14 @@ class ScholarshipPage(QWidget):
         if not path:
             return
 
-        self._begin_import_busy("正在读表…")
-        known = tuple(self.class_names())
-        default_class = self.current_class
+        self._begin_import_busy("正在读表…", 0)
+        self._import_user = self._username
+        default_class, year = self.current_class, self._year_box.currentText()
+        known = (default_class,)
         run_async(
             self,
             lambda: plan_import(path, known_classes=known,
-                                default_class=default_class),
+                                default_class=default_class, year=year),
             on_done=self._on_import_planned,
             on_error=self._on_import_failed,
         )
@@ -641,6 +635,14 @@ class ScholarshipPage(QWidget):
     def _on_import_planned(self, plan: ImportPlan) -> None:
         """读表回来了（**还没写库**）：摆预览，等用户点头。"""
         self._end_import_busy()
+        if self._username != self._import_user:
+            return
+        if plan.school_year and self._record and self._record.school_year:
+            if plan.school_year != self._record.school_year:
+                self._on_import_failed(ImportFormatError(
+                    f"原表属于 {plan.school_year} 学年，请核对当前所选学年。"
+                ))
+                return
         try:
             ok = MoralImportPreviewDialog.confirm(plan, self)
         except Exception as exc:  # noqa: BLE001 - 弹窗崩了也不能把数据写进去
@@ -652,11 +654,12 @@ class ScholarshipPage(QWidget):
             self._moral_status.setText("已取消：没有确认预览，本次没有导入任何数据。")
             return
 
-        self._begin_import_busy("正在写库…")
+        self._begin_import_busy("正在写库…", 2)
         batch_id = new_batch_id()
+        username = self._import_user
         run_async(
             self,
-            lambda: apply_plan(self._store, self._username, plan,
+            lambda: apply_plan(self._store, username, plan,
                                batch_id=batch_id),
             on_done=self._on_import_applied,
             on_error=self._on_import_failed,
@@ -665,6 +668,8 @@ class ScholarshipPage(QWidget):
     def _on_import_applied(self, summary: ImportSummary) -> None:
         """写库回来了：刷新界面 + 把"成功 N / 跳过 M / 失败 K"摆出来。"""
         self._end_import_busy()
+        if self._username != self._import_user:
+            return
         self._load_current_class()
         self._moral_status.setText(
             f"批量导入（{summary.source}）：成功 {summary.succeeded} 行 / "
@@ -683,6 +688,8 @@ class ScholarshipPage(QWidget):
     def _on_import_failed(self, exc: BaseException) -> None:
         """读表或写库出错 —— 说人话，并且**绝不假装成功**。"""
         self._end_import_busy()
+        if self._username != self._import_user:
+            return
         if isinstance(exc, ImportFormatError):
             self._moral_status.setText("这份表读不进来：" + str(exc))
             QMessageBox.critical(self, "这份表读不进来", str(exc))
@@ -706,13 +713,17 @@ class ScholarshipPage(QWidget):
         self._import_progress.setVisible(True)
         self._import_moral_btn.setEnabled(False)
         self._save_moral_btn.setEnabled(False)
+        self._class_box.setEnabled(False)
+        self._year_box.setEnabled(False)
         self._moral_status.setText(text)
 
     def _end_import_busy(self) -> None:
         self._import_busy = False
         self._import_progress.setVisible(False)
         self._import_moral_btn.setEnabled(True)
-        self._save_moral_btn.setEnabled(True)
+        self._save_moral_btn.setEnabled(self._record is not None)
+        self._class_box.setEnabled(True)
+        self._year_box.setEnabled(True)
 
     def _do_save_quota(self) -> None:
         if self._record is None:
@@ -722,7 +733,8 @@ class ScholarshipPage(QWidget):
                       self._quota_spins["second"].value(),
                       self._quota_spins["third"].value())
         try:
-            save_quota(self._store, self._username, self._record.class_name, quota)
+            save_quota(self._store, self._username, self._record.class_name, quota,
+                       year=self._year_box.currentText())
         except (CryptoError, ValueError, OSError) as exc:
             QMessageBox.critical(self, "保存失败", f"{type(exc).__name__}: {exc}")
             return
@@ -741,12 +753,7 @@ class ScholarshipPage(QWidget):
         quota = Quota(self._quota_spins["first"].value(),
                       self._quota_spins["second"].value(),
                       self._quota_spins["third"].value())
-        if quota.total == 0:
-            QMessageBox.information(
-                self, "名额都是 0",
-                "一/二/三等奖名额都是 0，算出来只有特等奖。\n"
-                "先填名额再测算。",
-            )
+        if not self._record.annual_complete:
             return
 
         moral = self._collect_moral()
@@ -759,11 +766,11 @@ class ScholarshipPage(QWidget):
 
     # ---------------------------------------------------------------- 出表
     def _fill_result_table(self, rows: list[ScholarshipRow],
-                           quota: Quota, moral: dict[str, int]) -> None:
+                           quota: Quota, moral: dict[str, float]) -> None:
         self._result_table.setRowCount(len(rows))
         for i, row in enumerate(rows):
             bg, fg = _AWARD_STYLE.get(row.award, ("", ""))
-            self._result_table.setItem(i, RANK_COL, _cell(str(row.rank), bg=bg, fg=fg))
+            self._result_table.setItem(i, RANK_COL, _cell(str(row.rank) if row.rank is not None else "—", bg=bg, fg=fg))
             self._result_table.setItem(i, NAME_COL, _cell(row.student, bg=bg, fg=fg))
             self._result_table.setItem(
                 i, ID_COL, _cell(row.student_id or "—", bg=bg, fg=fg))
@@ -783,7 +790,7 @@ class ScholarshipPage(QWidget):
         missing = self._record.size - len(moral) if self._record else 0
         text = (
             f"该班 {self._record.size if self._record else 0} 人　·　"
-            f"参测 {len(rows)} 人　·　"
+            f"参测 {sum(row.rank is not None for row in rows)} 人　·　"
             f"特等 {counts[AWARD_SPECIAL]}/—　·　"
             f"一等 {counts[AWARD_FIRST]}/{quota.first}　·　"
             f"二等 {counts[AWARD_SECOND]}/{quota.second}　·　"
@@ -797,7 +804,7 @@ class ScholarshipPage(QWidget):
     def _do_export(self) -> None:
         if not self._rows or self._record is None:
             return
-        default = f"奖学金测算_{self._record.class_name}.xlsx"
+        default = f"奖学金测算_{self._record.class_name}_{self._record.term}.xlsx"
         path, _f = QFileDialog.getSaveFileName(
             self, "导出测算结果", default, "Excel 工作簿 (*.xlsx)"
         )
@@ -822,7 +829,7 @@ class ScholarshipPage(QWidget):
 
 def _write_scholarship_xlsx(path: str, record: ClassRecord,
                             rows: list[ScholarshipRow], quota: Quota,
-                            moral: dict[str, int]) -> str:
+                            moral: dict[str, float]) -> str:
     """把测算结果写成 xlsx（openpyxl，**不联网**）。"""
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
@@ -831,15 +838,15 @@ def _write_scholarship_xlsx(path: str, record: ClassRecord,
     sheet = book.active
     sheet.title = "奖学金测算"
 
-    sheet.append([f"{record.class_name} 奖学金测算"])
+    sheet.append([f"{record.class_name} {record.term} 奖学金测算"])
     sheet["A1"].font = Font(bold=True, size=14)
     sheet.append([
-        f"最终成绩 = 智育(口径①)×{ACADEMIC_WEIGHT:g} + 德育×{MORAL_WEIGHT:g}",
+        f"最终成绩 = 智育（必修＋限选）×{ACADEMIC_WEIGHT:g} + 德育×{MORAL_WEIGHT:g}",
         f"特等奖：进入一等名额且每门 ≥ {SPECIAL_MIN_SCORE:g}，不占名额",
     ])
     sheet.append([
         f"名额：一等 {quota.first} / 二等 {quota.second} / 三等 {quota.third}",
-        f"来源：{record.source or '（未知）'}",
+        f"来源：{record.source or '（未知）'}" + (f" · {record.school_year}" if record.school_year else ""),
     ])
     sheet.append([])
 
@@ -869,7 +876,7 @@ def _write_scholarship_xlsx(path: str, record: ClassRecord,
     counts = award_counts(rows)
     sheet.append([])
     sheet.append([
-        f"总计 {record.size} 人 / 参测 {len(rows)} 人"
+        f"总计 {record.size} 人 / 参测 {sum(row.rank is not None for row in rows)} 人"
         f" / 已录德育分 {len(moral)} 人"
     ])
     sheet.append([

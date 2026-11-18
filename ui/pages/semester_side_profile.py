@@ -44,20 +44,18 @@ import re
 from typing import Any
 
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QTextCursor
+from PySide6.QtGui import QColor, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QGroupBox,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QMessageBox,
     QPushButton,
-    QSizePolicy,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
-    QTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -71,8 +69,11 @@ from core.ai.inference import (
     list_local_models,
 )
 from core.database import ProfileStore
+from ui.anim import make_card
 from ui.intentions import student_key
 from ui.pages import profile_shared
+from ui.widgets.profile_reading import ProfileDocument, profile_scroll
+from ui.widgets.model_picker import CORE_MISSING_HINT, ModelPicker
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +192,7 @@ class SemesterSideProfile(QWidget):
 
     #: 点「← 返回档案」时发出（主窗接到后切回档案详情页）。
     backRequested = Signal()
+    model_settings_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -206,7 +208,7 @@ class SemesterSideProfile(QWidget):
         self._side_worker: _SemesterSideWorker | None = None
         self._ai_error = ""
         self._text_context: tuple[str, str] | None = None
-        self._setup_card: Any = None
+        self._preferred_model = ""
 
         self._build_ui()
         self._refresh_header()
@@ -218,44 +220,73 @@ class SemesterSideProfile(QWidget):
         root.setContentsMargins(20, 16, 20, 16)
         root.setSpacing(12)
 
-        # --- 顶部一行：返回 / 标题 / 学生 ---
-        head = QHBoxLayout()
-        head.setSpacing(10)
         self._back_button = QToolButton(self)
-        self._back_button.setObjectName("backButton")
+        self._back_button.setObjectName("BackLink")
         self._back_button.setText("← 返回档案")
         self._back_button.setAutoRaise(True)
         self._back_button.setCursor(Qt.PointingHandCursor)
         self._back_button.clicked.connect(self.backRequested.emit)
-        head.addWidget(self._back_button)
+        root.addWidget(self._back_button, alignment=Qt.AlignmentFlag.AlignLeft)
 
         self._title_label = QLabel(self)
-        self._title_label.setObjectName("H2")
-        head.addWidget(self._title_label)
-        head.addStretch(1)
+        self._title_label.setObjectName("H1")
+        self._title_label.setWordWrap(True)
+        root.addWidget(self._title_label)
 
         self._student_label = QLabel(self)
-        self._student_label.setObjectName("studentLine")
-        self._student_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        head.addWidget(self._student_label)
-        root.addLayout(head)
+        self._student_label.setObjectName("ProfileMeta")
+        self._student_label.setWordWrap(True)
+        root.addWidget(self._student_label)
 
-        # --- 中部左右两块（6:4）---
-        splitter = QSplitter(Qt.Horizontal, self)
-        splitter.setObjectName("semesterSplitter")
-        splitter.setChildrenCollapsible(False)
-        splitter.addWidget(self._build_courses_panel())
-        splitter.addWidget(self._build_side_panel())
-        splitter.setStretchFactor(0, 6)
-        splitter.setStretchFactor(1, 4)
-        splitter.setSizes([600, 400])
-        root.addWidget(splitter, 1)
+        content = QWidget()
+        self._body_layout = QVBoxLayout(content)
+        self._body_layout.setContentsMargins(0, 0, 8, 4)
+        self._body_layout.setSpacing(16)
+        self._body_layout.addWidget(self._build_portrait_panel())
+
+        self._splitter = QSplitter(Qt.Horizontal)
+        self._splitter.setObjectName("semesterSplitter")
+        self._splitter.setChildrenCollapsible(False)
+        self._splitter.setHandleWidth(12)
+        self._splitter.addWidget(self._build_courses_panel())
+        self._splitter.addWidget(self._build_side_panel())
+        self._splitter.setSizes([440, 560])
+        self._body_layout.addWidget(self._splitter, 1)
+
+        self._scroll = profile_scroll(content)
+        root.addWidget(self._scroll, 1)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().resizeEvent(event)
+        self._arrange_panels()
+
+    def _arrange_panels(self) -> None:
+        if not hasattr(self, "_splitter"):
+            return
+        orientation = Qt.Orientation.Horizontal if self.width() >= 880 else Qt.Orientation.Vertical
+        if self._splitter.orientation() != orientation:
+            self._splitter.setOrientation(orientation)
+            if orientation == Qt.Orientation.Horizontal:
+                self._splitter.setSizes([440, 560])
+            else:
+                self._splitter.setSizes([350, 420])
+        columns = 4 if self.width() >= 880 else 3 if self.width() >= 620 else 2
+        if columns != self._metric_columns:
+            self._metric_columns = columns
+            for position, label in enumerate(self._metric_labels):
+                self._metrics.removeWidget(label)
+                self._metrics.addWidget(label, position // columns, position % columns)
+            for column in range(4):
+                self._metrics.setColumnStretch(column, int(column < columns))
 
     def _build_courses_panel(self) -> QWidget:
-        panel = QWidget(self)
+        panel = make_card(shadow=False, name="ProfilePanel")
         box = QVBoxLayout(panel)
-        box.setContentsMargins(0, 0, 8, 0)
-        box.setSpacing(8)
+        box.setContentsMargins(14, 14, 14, 14)
+        box.setSpacing(10)
+        title = QLabel("课程成绩", panel)
+        title.setObjectName("H2")
+        box.addWidget(title)
 
         self._empty_hint = QLabel("本学期暂无成绩记录", panel)
         self._empty_hint.setObjectName("emptyHint")
@@ -270,14 +301,16 @@ class SemesterSideProfile(QWidget):
         self._table.setSelectionMode(QAbstractItemView.SingleSelection)
         self._table.setAlternatingRowColors(True)
         self._table.setWordWrap(False)
-        self._table.setMinimumHeight(220)
+        self._table.setMinimumHeight(250)
+        self._table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
 
         header = self._table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        self._table.setColumnWidth(0, 185)
         header.setMinimumSectionSize(48)
-        self._table.setColumnWidth(0, 260)
-        self._table.setColumnWidth(1, 80)
-        self._table.setColumnWidth(2, 80)
+        self._table.setColumnWidth(1, 58)
+        self._table.setColumnWidth(2, 58)
 
         vheader = self._table.verticalHeader()
         vheader.setVisible(False)
@@ -288,86 +321,93 @@ class SemesterSideProfile(QWidget):
         box.addWidget(self._table, 1)
         return panel
 
-    def _build_side_panel(self) -> QWidget:
-        panel = QWidget(self)
-        box = QVBoxLayout(panel)
-        box.setContentsMargins(8, 0, 0, 0)
+    def _build_portrait_panel(self) -> QWidget:
+        portrait = make_card(shadow=False, name="ProfilePortrait")
+        box = QVBoxLayout(portrait)
+        box.setContentsMargins(16, 14, 16, 14)
         box.setSpacing(10)
-
-        # --- 学业画像 ---
-        portrait = QGroupBox("学业画像", panel)
-        portrait_box = QVBoxLayout(portrait)
-        portrait_box.setContentsMargins(14, 12, 14, 12)
-        portrait_box.setSpacing(6)
-
-        self._stat_courses = self._make_stat_label(portrait_box)
-        self._stat_average = self._make_stat_label(portrait_box)
-        self._stat_fails = self._make_stat_label(portrait_box)
-        self._stat_credits = self._make_stat_label(portrait_box)
-        self._stat_moral = self._make_stat_label(portrait_box)
+        title = QLabel("学业画像", portrait)
+        title.setObjectName("H2")
+        box.addWidget(title)
+        self._metrics = QGridLayout()
+        self._metric_labels: list[QLabel] = []
+        self._metric_columns = 2
+        self._metrics.setSpacing(8)
+        box.addLayout(self._metrics)
+        self._stat_average = self._add_metric(0)
+        self._stat_courses = self._add_metric(1)
+        self._stat_fails = self._add_metric(2)
+        self._stat_credits = self._add_metric(3)
+        self._stat_moral = self._add_metric(4)
         self._stat_note = QLabel("空成绩不计入平均分和学分合计，0 分按缺考计入。", portrait)
-        self._stat_note.setObjectName("statNote")
+        self._stat_note.setObjectName("ProfileMeta")
         self._stat_note.setWordWrap(True)
-        portrait_box.addWidget(self._stat_note)
-        box.addWidget(portrait)
+        box.addWidget(self._stat_note)
+        return portrait
 
-        # --- AI 侧写 ---
-        side = QGroupBox("AI 侧写", panel)
-        side_box = QVBoxLayout(side)
-        side_box.setContentsMargins(14, 12, 14, 12)
-        side_box.setSpacing(8)
-
-        self._ai_status = QLabel("尚未生成", side)
-        self._ai_status.setObjectName("aiStatus")
-        self._ai_status.setWordWrap(True)
-        side_box.addWidget(self._ai_status)
-
-        self._ai_text = QTextEdit(side)
-        self._ai_text.setObjectName("aiTextEdit")
-        self._ai_text.setReadOnly(True)
-        self._ai_text.setAcceptRichText(False)
-        self._ai_text.setPlaceholderText("还没有生成侧写。点下面的按钮，用本地模型生成本学期侧写。")
-        self._ai_text.setMinimumHeight(200)
-        self._ai_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        side_box.addWidget(self._ai_text, 1)
-
-        buttons = QHBoxLayout()
-        buttons.setSpacing(8)
-        self._generate_button = QPushButton("用 AI 生成本学期侧写", side)
-        self._generate_button.setObjectName("generateSideButton")
-        self._generate_button.clicked.connect(self._start_generation)
-        buttons.addWidget(self._generate_button)
-
-        self._save_button = QPushButton("保存", side)
-        self._save_button.setObjectName("saveSideButton")
-        self._save_button.clicked.connect(self._save_side_text)
-        buttons.addWidget(self._save_button)
-
-        self._install_core_btn = QPushButton("下载推理核心", side)
-        self._install_core_btn.setObjectName("installCoreButton")
-        self._install_core_btn.setToolTip("本地未安装推理核心时，点击进行一键安装")
-        self._install_core_btn.clicked.connect(self._on_setup_core_clicked)
-        buttons.addWidget(self._install_core_btn)
-
-        self._model_center_btn = QPushButton("模型中心", side)
-        self._model_center_btn.setObjectName("modelCenterButton")
-        self._model_center_btn.setToolTip("打开模型中心下载离线推理模型")
-        self._model_center_btn.clicked.connect(self._on_model_center_clicked)
-        buttons.addWidget(self._model_center_btn)
-
-        buttons.addStretch(1)
-        side_box.addLayout(buttons)
-        box.addWidget(side, 1)
-
-        return panel
-
-    def _make_stat_label(self, layout: QVBoxLayout) -> QLabel:
-        label = QLabel("", self)
-        label.setObjectName("statLine")
+    def _add_metric(self, position: int, text: str = "") -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("ProfileMetric")
         label.setWordWrap(True)
         label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        layout.addWidget(label)
+        label.setMinimumHeight(40)
+        self._metric_labels.append(label)
+        self._metrics.addWidget(label, position // self._metric_columns, position % self._metric_columns)
         return label
+
+    def _build_side_panel(self) -> QWidget:
+        side = make_card(shadow=False, name="ProfilePanel")
+        side_box = QVBoxLayout(side)
+        side_box.setContentsMargins(14, 14, 14, 14)
+        side_box.setSpacing(10)
+        title = QLabel("AI 侧写", side)
+        title.setObjectName("H2")
+        side_box.addWidget(title)
+        self._ai_status = QLabel("尚未生成", side)
+        self._ai_status.setObjectName("ProfileMeta")
+        self._ai_status.setWordWrap(True)
+
+        self._ai_text = ProfileDocument(side)
+        self._ai_text.setReadOnly(True)
+        self._ai_text.setPlaceholderText("生成的学期侧写将在这里显示。")
+        self._ai_text.setMinimumHeight(235)
+        side_box.addWidget(self._ai_text, 1)
+        side_box.addWidget(self._ai_status)
+        self._runtime_hint = QLabel(CORE_MISSING_HINT, side)
+        self._runtime_hint.setObjectName("ProfileMeta")
+        self._runtime_hint.setWordWrap(True)
+        side_box.addWidget(self._runtime_hint)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        self._generate_button = QPushButton("生成学期侧写", side)
+        self._generate_button.setObjectName("Ghost")
+        self._generate_button.clicked.connect(self._start_generation)
+        actions.addWidget(self._generate_button)
+        self._save_button = QPushButton("保存", side)
+        self._save_button.setObjectName("Primary")
+        self._save_button.clicked.connect(self._save_side_text)
+        actions.addWidget(self._save_button)
+        self._generate_button.setMinimumHeight(34)
+        self._save_button.setMinimumHeight(34)
+        self._ai_actions = actions
+
+        tools = QHBoxLayout()
+        tools.setSpacing(8)
+        self._model_picker = ModelPicker(side)
+        self._model_picker.model_selected.connect(self._choose_model)
+        self._model_picker.library_requested.connect(self._on_model_center_clicked)
+        self._model_picker.settings_requested.connect(self.model_settings_requested.emit)
+        tools.addWidget(self._model_picker)
+        tools.addStretch(1)
+        self._install_core_btn = QPushButton("下载推理核心", side)
+        self._install_core_btn.setObjectName("Primary")
+        self._install_core_btn.setMinimumHeight(34)
+        self._install_core_btn.clicked.connect(self._on_setup_core_clicked)
+        tools.addWidget(self._install_core_btn)
+        side_box.addLayout(tools)
+        side_box.addLayout(actions)
+        return side
 
     # -------------------------------------------------------------- setter / 刷新
     def set_session(self, session: Any) -> None:
@@ -439,9 +479,10 @@ class SemesterSideProfile(QWidget):
         if not self._term:
             return []
         rows: list[dict[str, Any]] = []
+        from ui.pages.profile_shared import is_unselected_elective
         for row in self._records:
             term = _clean_text(row.get("term") or row.get("semester"))
-            if term == self._term:
+            if term == self._term and not is_unselected_elective(row.get("category"), row.get("score")):
                 rows.append(row)
         return rows
 
@@ -453,6 +494,7 @@ class SemesterSideProfile(QWidget):
         self._fill_table(rows)
         self._refresh_portrait(rows)
         self._refresh_ai_text()
+        self._refresh_ai_controls()
 
     def _refresh_header(self) -> None:
         self._title_label.setText(f"学期侧写 · {self._term or '未指定学期'}")
@@ -484,6 +526,8 @@ class SemesterSideProfile(QWidget):
                     else Qt.AlignCenter
                 )
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                if column == 0:
+                    item.setToolTip(course)
                 self._table.setItem(index, column, item)
             self._table.setRowHeight(index, ROW_HEIGHT)
         self._empty_hint.setVisible(not rows)
@@ -515,6 +559,10 @@ class SemesterSideProfile(QWidget):
 
         fails = sum(1 for score in scores if score < 60)
         self._stat_fails.setText(f"挂科数：{fails}")
+        if self._stat_fails.property("attention") != bool(fails):
+            self._stat_fails.setProperty("attention", bool(fails))
+            self._stat_fails.style().unpolish(self._stat_fails)
+            self._stat_fails.style().polish(self._stat_fails)
 
         if has_credit:
             self._stat_credits.setText(f"学分合计：{profile_shared.format_credit(sum(credits))}")
@@ -535,12 +583,6 @@ class SemesterSideProfile(QWidget):
         self._ai_error = ""
         self._ai_text.clear()
         self._ai_status.setText("尚未生成")
-        try:
-            ready, _ = engine_available()
-            if hasattr(self, "_install_core_btn"):
-                self._install_core_btn.setVisible(not ready)
-        except Exception:
-            pass
         self._load_saved_side_text()
 
     def _store_id(self) -> str:
@@ -625,11 +667,9 @@ class SemesterSideProfile(QWidget):
             QMessageBox.information(self, "本地推理引擎未就绪", f"探测失败：{friendly_error(exc)}")
             return
         if not ready:
-            self._show_setup_card()
-            if hasattr(self, "_install_core_btn"):
-                self._install_core_btn.show()
+            self._refresh_ai_controls()
             QMessageBox.information(
-                self, "本地推理引擎未就绪", f"{reason or '本地推理引擎暂时不可用。'}\n\n已在页面下方展开推理核心安装卡片，您可点击「一键安装」或「下载推理核心」进行安装。"
+                self, "本地推理引擎未就绪", reason or CORE_MISSING_HINT
             )
             return
 
@@ -643,12 +683,11 @@ class SemesterSideProfile(QWidget):
             )
             return
         if not models:
-            if hasattr(self, "_model_center_btn"):
-                self._model_center_btn.show()
-            QMessageBox.information(self, "AI 侧写", "请先在模型中心下载模型。点击「模型中心」即可开始下载。")
+            self._refresh_ai_controls()
+            QMessageBox.information(self, "AI 侧写", "请先在模型中心下载模型。")
             return
 
-        model_path = str(getattr(models[0], "path", "") or "")
+        model_path = str(getattr(self._selected_model(models), "path", "") or "")
         if not model_path:
             QMessageBox.information(self, "AI 侧写", "模型文件缺失，请先在模型中心重新下载模型。")
             return
@@ -727,6 +766,7 @@ class SemesterSideProfile(QWidget):
     def _set_busy(self, busy: bool) -> None:
         self._generate_button.setEnabled(not busy)
         self._save_button.setEnabled(not busy)
+        self._model_picker.setEnabled(not busy)
 
     # --------------------------------------------------------------- 保存
     def _save_side_text(self) -> None:
@@ -760,36 +800,38 @@ class SemesterSideProfile(QWidget):
             return
         self._ai_status.setText("已保存到本地加密文件。")
 
-    def _show_setup_card(self) -> None:
-        """复用三态安装卡片：没有引擎时把「一键安装」摆到页面上。"""
-        if self._setup_card is None:
-            try:
-                from ui.widgets.backend_setup import BackendSetupCard
-            except Exception:  # noqa: BLE001
-                logger.exception("加载安装卡片失败")
-                return
-            self._setup_card = BackendSetupCard(self)
-            layout = self.layout()
-            if layout is not None:
-                layout.addWidget(self._setup_card)
+    def _selected_model(self, models):
+        return next((m for m in models if getattr(m, "name", "") == self._preferred_model), models[0] if models else None)
+
+    def _choose_model(self, model) -> None:
+        self._preferred_model = getattr(model, "name", "")
+        self._refresh_ai_controls()
+
+    def _refresh_ai_controls(self) -> None:
         try:
-            self._setup_card.refresh()
-            self._setup_card.show()
-        except Exception:  # noqa: BLE001
-            logger.exception("刷新安装卡片失败")
+            ready, _ = engine_available()
+            models = [m for m in list_local_models() if getattr(m, "usable", True)] if ready else []
+        except Exception:
+            ready, models = False, []
+        self._runtime_hint.setText(CORE_MISSING_HINT if not ready else "请在模型中心下载模型。")
+        self._runtime_hint.setVisible(not ready or not models)
+        self._install_core_btn.setVisible(not ready)
+        self._model_picker.setVisible(ready)
+        self._model_picker.set_models(models, self._selected_model(models))
+        self._generate_button.setVisible(ready)
+        self._save_button.setVisible(ready)
+        self._ai_status.setVisible(ready)
+        if hasattr(self, "_talk_button"):
+            self._talk_button.setVisible(ready)
+            self._talk_button.setEnabled(bool(models))
 
     def _on_setup_core_clicked(self) -> None:
-        self._show_setup_card()
         try:
             from ui.widgets.backend_setup import open_backend_setup
-            if open_backend_setup(self):
-                self._ai_status.setText("推理核心已安装完成，可以重新点击生成。")
-                if hasattr(self, "_install_core_btn"):
-                    self._install_core_btn.hide()
-                if self._setup_card is not None:
-                    self._setup_card.hide()
+            open_backend_setup(self)
         except Exception:
             logger.exception("打开推理核心安装向导失败")
+        self._refresh_ai_controls()
 
     def _on_model_center_clicked(self) -> None:
         try:
@@ -797,6 +839,7 @@ class SemesterSideProfile(QWidget):
             open_model_center(self)
         except Exception:
             logger.exception("打开模型中心失败")
+        self._refresh_ai_controls()
 
 
 # ---------------------------------------------------------------------------
@@ -815,17 +858,15 @@ class SemesterSideProfilePage(SemesterSideProfile):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._on_back: Any = None
-        self._setup_card: Any = None
         # 允许改字再保存（父类默认只读，任务书要求可编辑）
         self._ai_text.setReadOnly(False)
         self._talk_button = QPushButton("和 AI 谈谈这个学期", self)
-        self._talk_button.setObjectName("talkButton")
+        self._talk_button.setObjectName("Ghost")
         self._talk_button.setMinimumHeight(34)
         self._talk_button.setMaximumWidth(220)
         self._talk_button.clicked.connect(self._talk_to_ai)
-        layout = self.layout()
-        if layout is not None:
-            layout.addWidget(self._talk_button)
+        self._ai_actions.addStretch()
+        self._ai_actions.addWidget(self._talk_button)
         self.backRequested.connect(self._on_back_clicked)
 
     # -- 契约入口 ---------------------------------------------------------
@@ -863,6 +904,8 @@ class SemesterSideProfilePage(SemesterSideProfile):
         self._title_label.setText(
             f"{student_name or '（未命名）'} · {semester or '未指定学期'} 学业侧写"
         )
+        self._student_label.setText(f"学号 {student_id}" if student_id else "未填写学号")
+        self._scroll.verticalScrollBar().setValue(0)
 
     def current_semester(self) -> str:
         return self._term
@@ -912,17 +955,9 @@ class SemesterSideProfilePage(SemesterSideProfile):
     # -- 谈话 -------------------------------------------------------------
     def _talk_to_ai(self) -> None:
         """打开谈话窗口：系统提示词只注入本学期成绩。"""
-        ready, reason = engine_available()
+        ready, _ = engine_available()
         if not ready:
-            self._ai_status.setText(f"本地推理引擎还没装好：{reason}")
-            self._show_setup_card()
-            if hasattr(self, "_install_core_btn"):
-                self._install_core_btn.show()
-            QMessageBox.information(
-                self,
-                "本地推理引擎未就绪",
-                f"本地推理引擎还没装好：{reason}\n\n已在页面中展开安装卡片，请点击「一键安装」或「下载推理核心」。",
-            )
+            self._refresh_ai_controls()
             return
         if not self._term_rows():
             self._ai_status.setText("本学期还没有成绩记录，先导入成绩再谈。")
@@ -937,7 +972,7 @@ class SemesterSideProfilePage(SemesterSideProfile):
             open_chat(
                 parent=self,
                 system_prompt=self._side_prompt(self._term_rows()),
-                prefer_model=None,
+                prefer_model=self._preferred_model or None,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("打开谈话窗口失败")
@@ -959,20 +994,16 @@ class SemesterSideProfilePage(SemesterSideProfile):
             return
         self._extras_ready = True
         self._table.setColumnCount(4)
-        self._table.setHorizontalHeaderLabels(["课程", "学分", "成绩", "是否挂科"])
-        self._table.setColumnWidth(0, 260)
-        self._table.setColumnWidth(1, 80)
-        self._table.setColumnWidth(2, 80)
-        self._table.setColumnWidth(3, 96)
+        self._table.setHorizontalHeaderLabels(["课程", "学分", "成绩", "状态"])
+        self._table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self._table.setColumnWidth(3, 58)
 
         self._course_note = QLabel(
-            "本表按现有 calculator 口径②（必修＋限选）统计；"
-            "空白＝没选或没考，不是 0 分。",
+            "加权均分按必修和限选计算。空白成绩不等于 0 分。",
             self,
         )
         self._course_note.setObjectName("courseNote")
         self._course_note.setWordWrap(True)
-        self._course_note.setMinimumWidth(240)
         holder = self._table.parentWidget()
         if holder is not None and holder.layout() is not None:
             holder.layout().addWidget(self._course_note)
@@ -982,26 +1013,22 @@ class SemesterSideProfilePage(SemesterSideProfile):
         if box is None:
             return
         index = max(0, box.indexOf(self._stat_note))
-        self._extra_weighted = QLabel("本学期加权均分（口径②）：—", portrait)
-        self._extra_gpa = QLabel("绩点（方案一）：—", portrait)
+        self._extra_weighted = self._add_metric(5, "本学期加权均分（口径②）：—")
+        self._extra_gpa = self._add_metric(6, "绩点（方案一）：—")
         self._extra_trend = QLabel("趋势：—", portrait)
         self._extra_weak = QLabel("短板科目：—", portrait)
         self._extra_improve = QLabel("可提升科目：—", portrait)
-        self._extra_note = QLabel("短板与可提升仅为提示，不是评价。", portrait)
+        for label in (self._extra_weak, self._extra_improve):
+            label.setToolTip("短板与可提升仅供辅导参考。")
         for position, widget in enumerate(
             (
-                self._extra_weighted,
-                self._extra_gpa,
                 self._extra_trend,
                 self._extra_weak,
                 self._extra_improve,
-                self._extra_note,
             )
         ):
             widget.setWordWrap(True)
-            widget.setObjectName(
-                "statNote" if widget is self._extra_note else "statValue"
-            )
+            widget.setObjectName("ProfileMeta")
             box.insertWidget(index + position, widget)
 
     def _fill_table(self, rows: list[dict[str, Any]]) -> None:  # noqa: D401 - 覆写
@@ -1019,6 +1046,8 @@ class SemesterSideProfilePage(SemesterSideProfile):
             item = QTableWidgetItem(text)
             item.setTextAlignment(Qt.AlignCenter)
             item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            if score is not None:
+                item.setForeground(QColor('#9A471C' if text == '挂科' else '#0F766E'))
             self._table.setItem(index, 3, item)
 
     def _refresh_portrait(self, rows: list[dict[str, Any]]) -> None:

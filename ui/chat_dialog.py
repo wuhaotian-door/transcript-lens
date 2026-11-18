@@ -49,6 +49,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ui.widgets.profile_reading import ProfileDocument, profile_scroll
+from ui.widgets.model_picker import CORE_MISSING_HINT, ModelPicker
+
 from core.ai.inference import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_TEMPERATURE,
@@ -331,7 +334,7 @@ class ChatDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("AI 谈话助手")
         self.resize(980, 640)
-        self.setMinimumSize(760, 480)
+        self.setMinimumSize(540, 420)
 
         self._store = store if store is not None else getattr(parent, "_store", None)
         self._username = username or str(getattr(parent, "_username", "") or "")
@@ -350,7 +353,6 @@ class ChatDialog(QDialog):
         self._last_error = ""
         # 这一轮回答是否已经在记录框里"落笔"了（流式显示时只在第一块写一次说话人）
         self._answer_open = False
-        self._banner_action_btn_connected = False
 
         self._build()
         if models is None:
@@ -363,105 +365,26 @@ class ChatDialog(QDialog):
 
     # ---------------------------------------------------------------- 搭界面
     def _build(self) -> None:
-        root = QVBoxLayout(self)
-        root.setContentsMargins(20, 16, 20, 16)
-        root.setSpacing(10)
-
-        # 顶栏：标题 + 模型下拉框 + 模型中心/推理核心按钮
-        top_bar = QHBoxLayout()
-        top_bar.setSpacing(8)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(18, 14, 14, 14)
+        content = QWidget()
+        root = QVBoxLayout(content)
+        root.setContentsMargins(0, 0, 8, 4)
+        root.setSpacing(12)
+        outer.addWidget(profile_scroll(content))
 
         head = QLabel("AI 谈话助手")
-        head.setObjectName("H3")
-        top_bar.addWidget(head)
+        head.setObjectName("H1")
+        root.addWidget(head)
 
-        top_bar.addStretch(1)
-
-        model_label = QLabel("模型：")
-        top_bar.addWidget(model_label)
-
-        self.model_combo = QComboBox()
-        self.model_combo.setMinimumWidth(260)
-        self.model_combo.currentIndexChanged.connect(self._on_model_changed)
-        top_bar.addWidget(self.model_combo)
-
-        self.model_center_btn = QPushButton("模型中心")
-        self.model_center_btn.setObjectName("Ghost")
-        self.model_center_btn.setMinimumHeight(30)
-        self.model_center_btn.setToolTip("查看可用模型并一键下载")
-        self.model_center_btn.clicked.connect(self._open_model_center)
-        top_bar.addWidget(self.model_center_btn)
-
-        self.backend_setup_btn = QPushButton("下载推理核心")
-        self.backend_setup_btn.setObjectName("Ghost")
-        self.backend_setup_btn.setMinimumHeight(30)
-        self.backend_setup_btn.setToolTip("安装本地推理运行核心")
-        self.backend_setup_btn.clicked.connect(self._open_backend_setup)
-        top_bar.addWidget(self.backend_setup_btn)
-
-        root.addLayout(top_bar)
-
-        # 状态行（测试要求常驻、含指定关键字、无 Markdown 记号）
-        self.status_label = QLabel("")
-        self.status_label.setObjectName("Muted")
-        self.status_label.setWordWrap(True)
-        self.status_label.setMinimumWidth(420)
-        root.addWidget(self.status_label)
-
-        # 提示横幅（当未安装推理核心或未下载模型时突出展示，并带一键直达动作按钮）
-        self._banner_card = QFrame()
-        self._banner_card.setObjectName("Card")
-        banner_layout = QHBoxLayout(self._banner_card)
-        banner_layout.setContentsMargins(14, 8, 14, 8)
-        banner_layout.setSpacing(10)
-
-        self._banner_label = QLabel("", self._banner_card)
-        self._banner_label.setWordWrap(True)
-        banner_layout.addWidget(self._banner_label, 1)
-
-        self._banner_mode = "engine"
-        self._banner_action_btn = QPushButton("", self._banner_card)
-        self._banner_action_btn.setObjectName("Primary")
-        self._banner_action_btn.setMinimumHeight(32)
-        self._banner_action_btn.clicked.connect(self._on_banner_action_clicked)
-        banner_layout.addWidget(self._banner_action_btn)
-
-        self._banner_card.hide()
-        root.addWidget(self._banner_card)
-
-        # 中部主体：全宽谈话记录查看区
-        self.history_view = QTextEdit()
-        self.history_view.setObjectName("Outline")
+        self.history_view = ProfileDocument(conversation=True)
         self.history_view.setReadOnly(True)
-        self.history_view.setMinimumWidth(420)
-        self.history_view.setPlaceholderText("这里显示谈话记录。")
+        self.history_view.setMinimumHeight(220)
+        self.history_view.setPlaceholderText("谈话记录")
+        self.history_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.history_view.customContextMenuRequested.connect(self._history_menu)
         root.addWidget(self.history_view, 1)
 
-        # 快捷提问提纲建议行
-        chips_bar = QHBoxLayout()
-        chips_bar.setSpacing(8)
-        chips_label = QLabel("快捷提纲：")
-        chips_label.setObjectName("Muted")
-        chips_bar.addWidget(chips_label)
-
-        self._chip_buttons = []
-        prompts = [
-            ("学业谈话提纲", "请为该生梳理一份本学期的学业谈话提纲，分点给出建议。"),
-            ("挂科辅导建议", "针对该生存在不及格科目的情况，请给出具体的谈心谈话指导策略。"),
-            ("评语润色修改", "请针对该生的综合表现提供一段温暖、中肯、有针对性的期末评语。"),
-            ("未来发展指导", "请结合该生的成绩分布与学业表现，给出后续发展规划建议。"),
-        ]
-        for title, preset in prompts:
-            btn = QPushButton(title)
-            btn.setObjectName("Ghost")
-            btn.setMinimumHeight(26)
-            btn.clicked.connect(lambda _checked=False, text=preset: self._insert_prompt(text))
-            chips_bar.addWidget(btn)
-            self._chip_buttons.append(btn)
-        chips_bar.addStretch(1)
-        root.addLayout(chips_bar)
-
-        # 底部输入框容器（多行输入 + 操作按钮栏）
         input_container = QFrame()
         input_container.setObjectName("Card")
         input_box = QVBoxLayout(input_container)
@@ -470,40 +393,83 @@ class ChatDialog(QDialog):
 
         self.input_edit = ChatInputEdit(input_container)
         self.input_edit.setObjectName("chatInputEdit")
-        self.input_edit.setPlaceholderText("说点什么…（回车发送，Shift+回车换行）")
+        self.input_edit.setPlaceholderText("输入消息（Enter 发送，Shift+Enter 换行）")
         self.input_edit.returnPressed.connect(self._on_send_clicked)
+        self.input_edit.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.input_edit.customContextMenuRequested.connect(self._input_menu)
         input_box.addWidget(self.input_edit)
+
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("Muted")
+        self.status_label.setWordWrap(True)
+        input_box.addWidget(self.status_label)
 
         action_row = QHBoxLayout()
         action_row.setSpacing(8)
+        self.model_combo = QComboBox(self)
+        self.model_combo.hide()
+        self.model_combo.currentIndexChanged.connect(self._on_model_changed)
 
-        note = QLabel("谈话记录加密存在本机，不会上传。")
-        note.setObjectName("Muted")
-        note.setWordWrap(True)
-        action_row.addWidget(note)
-        action_row.addStretch(1)
+        self._model_picker = ModelPicker(self)
+        self._model_picker.model_selected.connect(self._pick_model)
+        self._model_picker.library_requested.connect(self._open_model_center)
+        self._model_picker.settings_requested.connect(self._open_model_settings)
+        action_row.addWidget(self._model_picker)
+        action_row.addStretch()
 
-        self.clear_btn = QPushButton("清空输入")
-        self.clear_btn.setObjectName("Ghost")
-        self.clear_btn.setMinimumHeight(32)
-        self.clear_btn.clicked.connect(self.input_edit.clear)
-        action_row.addWidget(self.clear_btn)
-
-        self.export_button = QPushButton("导出文本")
-        self.export_button.setObjectName("Ghost")
-        self.export_button.setMinimumHeight(32)
-        self.export_button.clicked.connect(self._on_export_clicked)
-        action_row.addWidget(self.export_button)
+        self.backend_setup_btn = QPushButton("下载推理核心")
+        self.backend_setup_btn.setObjectName("Primary")
+        self.backend_setup_btn.setMinimumHeight(34)
+        self.backend_setup_btn.clicked.connect(self._open_backend_setup)
+        action_row.addWidget(self.backend_setup_btn)
 
         self.send_button = QPushButton("发送")
         self.send_button.setObjectName("Primary")
-        self.send_button.setMinimumHeight(32)
+        self.send_button.setMinimumHeight(34)
         self.send_button.setMinimumWidth(88)
         self.send_button.clicked.connect(self._on_send_clicked)
         action_row.addWidget(self.send_button)
 
         input_box.addLayout(action_row)
         root.addWidget(input_container)
+
+    def _history_menu(self, position) -> None:
+        menu = self.history_view.createStandardContextMenu()
+        menu.addSeparator()
+        action = menu.addAction("导出谈话文本…", self._on_export_clicked)
+        action.setEnabled(bool(self._history_turns()))
+        menu.exec(self.history_view.viewport().mapToGlobal(position))
+
+    def _input_menu(self, position) -> None:
+        menu = self.input_edit.createStandardContextMenu()
+        menu.addSeparator()
+        prompts = menu.addMenu("常用提问")
+        for title, text in (
+            ("学业谈话提纲", "请为该生梳理一份本学期的学业谈话提纲，分点给出建议。"),
+            ("挂科辅导建议", "针对该生存在不及格科目的情况，请给出具体的谈心谈话指导策略。"),
+            ("评语润色修改", "请针对该生的综合表现提供一段温暖、中肯、有针对性的期末评语。"),
+            ("未来发展指导", "请结合该生的成绩分布与学业表现，给出后续发展规划建议。"),
+        ):
+            prompts.addAction(title, lambda _checked=False, value=text: self._insert_prompt(value))
+        menu.exec(self.input_edit.viewport().mapToGlobal(position))
+
+    def _pick_model(self, model) -> None:
+        index = next((i for i, choice in enumerate(self._choices) if choice is model), -1)
+        if index >= 0:
+            self.model_combo.setCurrentIndex(index)
+
+    def _open_model_settings(self) -> None:
+        parent = self.parentWidget()
+        request = getattr(parent, "model_settings_requested", None)
+        navigate = getattr(parent.window(), "_go_model_settings", None) if parent else None
+        if request is not None:
+            self.close()
+            request.emit()
+        elif callable(navigate):
+            self.close()
+            navigate()
+        else:
+            self._open_model_center()
 
     def _insert_prompt(self, text: str) -> None:
         if not self.input_edit.isEnabled():
@@ -533,12 +499,6 @@ class ChatDialog(QDialog):
         self._scan_models()
         self._refresh_availability()
 
-    def _on_banner_action_clicked(self) -> None:
-        if getattr(self, "_banner_mode", "engine") == "engine":
-            self._open_backend_setup()
-        else:
-            self._open_model_center()
-
     def _on_models_installed(self, _downloaded: list[str]) -> None:
         self._scan_models()
         self._refresh_availability()
@@ -554,6 +514,7 @@ class ChatDialog(QDialog):
 
     def _apply_models(self) -> None:
         """填下拉框：**只列跑得动的**（拿不到负载等级就列全部已装）。"""
+        previous = self.model()
         self._choices = [model for model in self._models if getattr(model, "usable", True)]
 
         self.model_combo.blockSignals(True)
@@ -563,8 +524,11 @@ class ChatDialog(QDialog):
                 self.model_combo.addItem(model.display, model.name)
         else:
             self.model_combo.addItem("（没有可用的本地模型）", "")
+        if previous is not None:
+            self._select(previous.name)
         self.model_combo.blockSignals(False)
         self.model_combo.setEnabled(bool(self._choices))
+        self._on_model_changed(self.model_combo.currentIndex())
 
     def _select(self, prefer_model: str | None) -> None:
         """按名字挑一个模型；命不中就选第一个（任务书：退回默认）。"""
@@ -608,7 +572,8 @@ class ChatDialog(QDialog):
         return self._engine
 
     def _on_model_changed(self, _index: int) -> None:
-        """换模型 = 把上一个从内存里放掉（1~3 GB，不能同时留着两个）。"""
+        """切换时释放旧模型并刷新当前模型按钮。"""
+        self._model_picker.set_models(self._choices, self.model())
         if self._injected_engine is not None:
             return
         engine = self._engine
@@ -625,76 +590,29 @@ class ChatDialog(QDialog):
 
     # ------------------------------------------------------------ 可用状态
     def _refresh_availability(self, prefer_model: str | None = None) -> None:
-        """刷新状态行 + 输入区的启用状态。**一次都不弹窗。**"""
-        available, engine_message = engine_available()
-        message = engine_message
-        if self._injected_engine is not None:
-            available = True
-        engine_ready = available
-
-        if self._choices:
+        engine_ready, reason = engine_available()
+        engine_ready = engine_ready or self._injected_engine is not None
+        if prefer_model:
             self._select(prefer_model)
-        elif self._models:
-            message = (
-                "本机已装的模型都太重了（负载等级不是轻松或勉强），"
-                "建议到「模型中心」换一个更小的模型。"
-            )
-            available = False
-        else:
-            message = (
-                "本机还没有下载模型。请先到「模型中心」下载一个，再回来谈话。"
-            )
-            available = False
-
-        if available and self._choices:
-            message = f"可以开始谈话。当前有 {len(self._choices)} 个可用的本地模型。"
-
+        busy = self._streaming
+        usable = engine_ready and bool(self._choices)
         if not engine_ready:
-            # ★ 引擎没装是**更根本**的原因：这时只说"去下模型""模型太重"都是句假话
-            # —— 用户下完几个 GB 回来照样用不了。所以引擎的说明优先，模型层面的事
-            # 跟在后面补一句（AGENTS.md 第 21b 节同族：界面上不许说假话）。
-            available = False
-            if self._choices:
-                hint = "装好之后，本机已有的模型就能用了。"
-            elif self._models:
-                hint = "另外，本机已有的模型都偏重，装好之后建议换一个更小的。"
-            else:
-                hint = "装好之后，还需要在「模型中心」下载一个模型。"
-            message = f"{engine_message}{hint}"
+            message = CORE_MISSING_HINT
+        elif not self._choices:
+            message = "已安装的模型负载过高，请选择较小的模型。" if self._models else "请在模型中心下载模型。"
+        else:
+            message = ""
 
         self.status_label.setText(message)
-        self.status_label.setObjectName("Muted" if available else "Warn")
-        # ★ 动态属性只影响 QSS 选择器，改完要重新抛光一次才会重画
-        self.status_label.style().unpolish(self.status_label)
-        self.status_label.style().polish(self.status_label)
-
-        if not engine_ready:
-            self._banner_mode = "engine"
-            self._banner_card.show()
-            self._banner_label.setText(f"本地推理核心尚未安装：{engine_message}。请点击右侧按钮一键安装。")
-            self._banner_action_btn.setText("一键安装推理核心")
-            self.backend_setup_btn.setText("一键安装推理核心")
-            self.backend_setup_btn.setVisible(True)
-            self.backend_setup_btn.setEnabled(True)
-        elif not self._choices:
-            self._banner_mode = "model"
-            self._banner_card.show()
-            if self._models:
-                self._banner_label.setText("本机已装模型负载偏高，建议在模型中心下载更适配的模型。")
-            else:
-                self._banner_label.setText("本地模型库中暂无可用模型，请在模型中心下载轻量模型。")
-            self._banner_action_btn.setText("前往模型中心下载")
-            self.backend_setup_btn.setText("推理核心已就绪")
-            self.backend_setup_btn.setEnabled(False)
-        else:
-            self._banner_card.hide()
-            self.backend_setup_btn.setText("推理核心已就绪")
-            self.backend_setup_btn.setEnabled(False)
-
-        usable = bool(self._choices) and available
-        self.input_edit.setEnabled(usable)
-        self.send_button.setEnabled(usable)
-        self.export_button.setEnabled(bool(self._history_turns()))
+        self.status_label.setToolTip(reason if not engine_ready else "")
+        self.status_label.setVisible(bool(message))
+        self._model_picker.set_models(self._choices, self.model())
+        self._model_picker.setVisible(engine_ready)
+        self._model_picker.setEnabled(not busy)
+        self.backend_setup_btn.setVisible(not engine_ready)
+        self.send_button.setVisible(engine_ready)
+        self.send_button.setEnabled(usable and not busy)
+        self.input_edit.setEnabled(usable and not busy)
 
     # ---------------------------------------------------------------- 历史
     def _history_turns(self) -> list[dict[str, str]]:
@@ -752,24 +670,19 @@ class ChatDialog(QDialog):
         """把记录画进左边那个只读框（纯文本，不带任何 Markdown 记号）。"""
         self.history_view.clear()
         for day in sorted(self._days):
-            self.history_view.append(f"—— {day} ——")
+            self.history_view.append_entry(f"—— {day} ——")
             for turn in self._days[day]:
                 speaker = _SPEAKER.get(turn.get("role", ""), "辅导员")
                 clock = turn.get("time") or ""
                 stamp = f"（{clock}）" if clock else ""
-                self.history_view.append(f"{speaker}{stamp}：{turn.get('text', '')}")
-            self.history_view.append("")
+                tone = "assistant" if turn.get("role") == ROLE_ASSISTANT else "user"
+                self.history_view.append_entry(f"{speaker}{stamp}：{turn.get('text', '')}", tone)
         self.history_view.moveCursor(self.history_view.textCursor().MoveOperation.End)
 
     def _print_line(self, text: str) -> None:
-        """往记录框里追加一行并滚到底（一次性的整行用）。"""
-        cursor = self.history_view.textCursor()
-        cursor.movePosition(cursor.MoveOperation.End)
-        if not self.history_view.toPlainText().endswith("\n"):
-            cursor.insertText("\n")
-        cursor.insertText(text)
-        self.history_view.setTextCursor(cursor)
-        self.history_view.ensureCursorVisible()
+        """开始新的谈话段落，后续流式输出继续写入该段。"""
+        tone = "assistant" if text.startswith(f"{_SPEAKER[ROLE_ASSISTANT]}：") else "user"
+        self.history_view.append_entry(text, tone)
 
     def _append_text(self, text: str) -> None:
         """在记录框末尾**续写**一段（不换行）—— 流式逐字显示的用。"""
@@ -860,6 +773,7 @@ class ChatDialog(QDialog):
             engine = self._engine_for_current()
         except InferenceUnavailable as exc:
             self.status_label.setText(str(exc))
+            self.status_label.show()
             return False
 
         self._remember(ROLE_USER, text)
@@ -871,6 +785,8 @@ class ChatDialog(QDialog):
         self.send_button.setEnabled(False)
         self.input_edit.setEnabled(False)
         self.status_label.setText("正在生成，请稍候…")
+        self.status_label.show()
+        self._model_picker.setEnabled(False)
 
         worker = _ChatWorker(
             engine,
@@ -895,6 +811,7 @@ class ChatDialog(QDialog):
         self._streaming = False
         self._last_error = message or "这次生成没有成功，可以再试一次。"
         self.status_label.setText(self._last_error)
+        self.status_label.show()
         self.status_label.setObjectName("Warn")
         self.status_label.style().unpolish(self.status_label)
         self.status_label.style().polish(self.status_label)
@@ -922,6 +839,7 @@ class ChatDialog(QDialog):
         if self._last_error:
             # 失败原因比"可以开始谈话"重要，压在可用状态之后贴上去
             self.status_label.setText(self._last_error)
+            self.status_label.show()
             self.status_label.setObjectName("Warn")
             self.status_label.style().unpolish(self.status_label)
             self.status_label.style().polish(self.status_label)

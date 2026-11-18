@@ -1095,13 +1095,10 @@ def test_delete_student_archive_keeps_everything(
     assert archive_page._list.count() == 0  # 归档的不出现在默认列表里
 
 
-def test_outline_note_wraps_at_narrow_width(archive_page):
+def test_outline_actions_stay_available_without_redundant_note(archive_page):
     archive_page.resize(1268, 808)
-
-    assert archive_page._outline_note.wordWrap() is True
-    assert archive_page._outline_note.text() == "本地规则拼出来的，不联网、不调 AI"
-    # 换行之后最小宽度够用，不会把卡片撑到窗口外
-    assert archive_page._outline_note.minimumWidth() >= 180
+    assert archive_page._copy_btn.text() == "一键复制"
+    assert not any("不联网、不调 AI" in label.text() for label in archive_page.findChildren(QLabel))
 
 
 def test_profile_ui_text_has_no_markdown_markers(archive_page):

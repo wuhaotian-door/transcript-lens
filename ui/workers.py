@@ -89,7 +89,11 @@ def run_async(
 
     # parent 只用来表达"这个任务属于哪个窗口"，不参与所有权
     _ = parent
-    QThreadPool.globalInstance().start(task)
+    try:
+        QThreadPool.globalInstance().start(task)
+    except Exception:
+        _finish()
+        raise
 
 
 def run_sync(fn: Callable[[], Any]) -> tuple[bool, Any]:

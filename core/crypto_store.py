@@ -97,6 +97,7 @@ import time
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -281,12 +282,17 @@ def load_app_salt(root: str | Path | None = None, *, create: bool = True) -> byt
 
 def app_fernet(root: str | Path | None = None) -> Fernet:
     """应用级 Fernet（用于自动登录令牌这类"还没有用户"的数据）。"""
-    salt = load_app_salt(root)
+    # 每次仍读取盐文件。恢复备份或更换数据目录后，按新盐派生。
+    return _app_fernet_for_salt(load_app_salt(root), PBKDF2_ITERATIONS)
+
+
+@lru_cache(maxsize=8)
+def _app_fernet_for_salt(salt: bytes, iterations: int) -> Fernet:
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=32,
         salt=salt,
-        iterations=PBKDF2_ITERATIONS,
+        iterations=iterations,
     )
     return Fernet(base64.urlsafe_b64encode(kdf.derive(_APP_KDF_PASSPHRASE)))
 

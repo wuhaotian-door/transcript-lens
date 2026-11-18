@@ -223,6 +223,16 @@ def _lift_1_9_4_to_1_9_5(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def _lift_1_9_5_to_1_9_6(data: dict[str, Any]) -> dict[str, Any]:
+    """学年成绩使用新载荷，旧版班级数据保留原归属。"""
+    return data
+
+
+def _lift_1_9_6_to_1_9_7(data: dict[str, Any]) -> dict[str, Any]:
+    """沿用现有学年快照和账户数据。"""
+    return data
+
+
 #: 版本链：``(起点, 终点, 变换函数)``。
 #:
 #: ★ 这是"未来版本在此添加分支"的那张表（任务书 2.3）。加一跳只需要
@@ -238,6 +248,8 @@ _STEPS: tuple[tuple[str, str, Callable[[dict[str, Any]], dict[str, Any]]], ...] 
     ("1.9.2", "1.9.3", _lift_1_9_2_to_1_9_3),
     ("1.9.3", "1.9.4", _lift_1_9_3_to_1_9_4),
     ("1.9.4", "1.9.5", _lift_1_9_4_to_1_9_5),
+    ("1.9.5", "1.9.6", _lift_1_9_5_to_1_9_6),
+    ("1.9.6", "1.9.7", _lift_1_9_6_to_1_9_7),
 )
 
 

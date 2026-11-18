@@ -27,32 +27,44 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import Future
+from time import monotonic
 from typing import Any
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QSize, QTimer, Qt, Signal
+from PySide6.QtGui import QColor, QFontMetrics
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QDialog,
+    QDialogButtonBox,
     QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLayout,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
     QStackedWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
+from core import applog
 from core.archival import Archive, archive_key, partition, semester_rank, trend
 from core.calculator import CalculationScope
 from core.crypto_store import CryptoError, CryptoStore
-from core.database import GradeHistoryDB, ProfileStore
-from core.user_store import load_user_json
+from core.database import GradeHistoryDB
+from core.scholarship import list_classes
+from core.student_deletion import StudentDeletionControl, audit_student_deletion, purge_class, purge_student
+from core.user_store import load_user_json, save_user_json
 from ui.anim import make_card
 from ui.pages.analysis_page import ARCHIVE_FILE
 from ui.pages.profile_page import (
@@ -75,15 +87,16 @@ from ui.pages.profile_shared import (
     StudentRecord,
     _bare_sid,
     build_empty_student_archive,
-    delete_all_semester_sides,
     migrate_student_id_for,
     migration_report_text,
     open_student_book,
     record_student_audit,
-    same_student_id,
     store_archive,
 )
 from ui.pages.semester_side_profile import SemesterSideProfilePage
+from ui.pages.student_overview import StudentOverviewPage
+from ui.widgets.profile_reading import profile_scroll
+from ui.workers import run_async
 
 logger = logging.getLogger(__name__)
 
@@ -103,13 +116,68 @@ _UP_COLOR = "#15803D"
 _DOWN_COLOR = "#C2410C"
 _FLAT_COLOR = "#475569"
 
+DELETE_PREPARE_TIMEOUT = 8.0
+DELETE_POLL_INTERVAL_MS = 50
+_ROLE_CLASS_GROUP = Qt.ItemDataRole.UserRole + 40
+_ROLE_CLASS_NAME = Qt.ItemDataRole.UserRole + 41
+CLASS_SHORTCUTS_FILE = "profile_class_shortcuts.json.enc"
+
 
 def _fmt(value: float | None, digits: int = 2) -> str:
     return "—" if value is None else f"{value:.{digits}f}"
 
 
+class _ClassRosterDelegate(StudentItemDelegate):
+    def sizeHint(self, option, index):  # noqa: N802 - Qt API
+        if index.data(_ROLE_CLASS_GROUP):
+            return QSize(0, 32)
+        return super().sizeHint(option, index)
+
+    def paint(self, painter, option, index) -> None:
+        if not index.data(_ROLE_CLASS_GROUP):
+            super().paint(painter, option, index)
+            return
+        painter.save()
+        frame = option.rect.adjusted(10, 5, -10, -2)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#EAF2FC"))
+        painter.drawRoundedRect(frame, 5, 5)
+        font = option.font
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor("#264F88"))
+        text = QFontMetrics(font).elidedText(str(index.data()), Qt.TextElideMode.ElideRight, frame.width() - 18)
+        painter.drawText(frame.adjusted(9, 0, -9, 0), Qt.AlignmentFlag.AlignVCenter, text)
+        painter.restore()
+
+
+class _StudentDeletionProgress(QDialog):
+    def __init__(self, parent: QWidget, title: str = "删除学生") -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"正在{title}")
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+        layout = QVBoxLayout(self)
+        self._message = QLabel(f"正在{title}，请稍候。", self)
+        layout.addWidget(self._message)
+        bar = QProgressBar(self)
+        bar.setRange(0, 0)
+        layout.addWidget(bar)
+
+    def show_slow_write(self) -> None:
+        self._message.setText("正在完成本地写入，等待时间比平时长。请保持程序开启。")
+
+    def reject(self) -> None:
+        # 已开始写盘时，Esc 不应关闭窗口并释放其他可能写入同一库的操作。
+        pass
+
+
 class ArchivePage(QWidget):
     """成长档案页：左名单 + 右时间轴 / 趋势 / 定型分区。"""
+
+    student_deleted = Signal(str, str)
+    class_deleted = Signal(str, object)
+    model_settings_requested = Signal()
 
     def __init__(self, store: CryptoStore | None = None,
                  parent: QWidget | None = None) -> None:
@@ -119,7 +187,11 @@ class ArchivePage(QWidget):
         self._book: StudentBook | None = None
         self._archive: Archive | None = None
         self._current: Any = None
+        self._delete_progress: _StudentDeletionProgress | None = None
+        self._show_archived = False
         self._key_by_row: dict[int, str] = {}
+        self._class_by_sid: dict[str, str] = {}
+        self._archived_sids: set[str] = set()
         self._semester_page: SemesterSideProfilePage | None = None
         self._detail_stack: QStackedWidget | None = None
         self._build()
@@ -142,6 +214,8 @@ class ArchivePage(QWidget):
         **不报错** —— 没导入过不是错误。
         """
         self._archive = None
+        self._class_by_sid.clear()
+        self._archived_sids.clear()
         if self._username:
             payload = load_user_json(self._store, self._username, ARCHIVE_FILE)
             if isinstance(payload, dict):
@@ -153,28 +227,59 @@ class ArchivePage(QWidget):
         # 同步学生主档（students.json.enc）到成长档案
         if self._book is not None and getattr(self._book, "durable", False):
             try:
-                records = self._book.search("")
+                records = self._book.records(include_archived=True)
+                self._archived_sids = {_bare_sid(r.student_id) for r in records if r.archived}
+                self._class_by_sid.update({
+                    _bare_sid(r.student_id): r.class_name.strip()
+                    for r in records
+                })
                 if records and self._archive is None:
                     self._archive = Archive()
                 if self._archive is not None:
                     archive_sids = {
-                        s.student_id for s in self._archive.students.values() if s.student_id
+                        _bare_sid(s.student_id) for s in self._archive.students.values() if s.student_id
                     }
                     for r in records:
                         rsid = _bare_sid(getattr(r, "student_id", ""))
                         rname = str(getattr(r, "name", "") or "").strip()
                         if rsid and rsid not in archive_sids:
                             key = archive_key(rsid, rname)
-                            sa = build_empty_student_archive(key, rname, rsid)
-                            self._archive.students[key] = sa
+                            if key in self._archive.students:
+                                self._archive.students[key].roster_id = rsid
+                            else:
+                                self._archive.students[key] = build_empty_student_archive(key, rname, rsid)
+                            archive_sids.add(rsid)
             except Exception:
                 logger.exception("同步学生主档到档案失败")
 
+        self._fill_missing_classes()
         self._fill_list()
+
+    def _fill_missing_classes(self) -> None:
+        """旧档案没有班级字段时，只使用能按学号唯一确定的导入班级。"""
+        if self._archive is None or not self._username:
+            return
+        wanted = {_bare_sid(s.student_id) for s in self._archive.students.values()}
+        wanted.discard("")
+        wanted.difference_update(sid for sid, name in self._class_by_sid.items() if name)
+        if not wanted:
+            return
+        candidates: dict[str, set[str]] = {}
+        try:
+            for record in list_classes(self._store, self._username):
+                for student in record.students:
+                    sid = _bare_sid(student.get("student_id"))
+                    if sid in wanted:
+                        candidates.setdefault(sid, set()).add(record.class_name)
+        except (CryptoError, OSError):
+            logger.warning("无法读取旧档案的班级快照", exc_info=True)
+        self._class_by_sid.update({
+            sid: next(iter(classes)) for sid, classes in candidates.items() if len(classes) == 1
+        })
 
     @property
     def student_count(self) -> int:
-        return self._list.count()
+        return len(self._key_by_row)
 
     def all_terms(self) -> list[str]:
         """整份档案里出现过的学期标签（去重、按学期顺序排）。
@@ -193,7 +298,7 @@ class ArchivePage(QWidget):
 
     @property
     def visible_count(self) -> int:
-        return sum(1 for i in range(self._list.count())
+        return sum(1 for i in self._key_by_row
                    if not self._list.item(i).isHidden())
 
     # ---------------------------------------------------------------- 搭界面
@@ -202,14 +307,15 @@ class ArchivePage(QWidget):
         outer.setContentsMargins(22, 20, 22, 20)
         outer.setSpacing(14)
 
-        title = QLabel("📈  成长档案")
-        title.setObjectName("H1")
-        outer.addWidget(title)
+        self._archive_title = QLabel("📈  成长档案")
+        self._archive_title.setObjectName("H1")
+        outer.addWidget(self._archive_title)
 
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(14)
-        body.addWidget(self._build_list_pane())
+        self._list_panel = self._build_list_pane()
+        body.addWidget(self._list_panel)
         body.addWidget(self._build_detail_pane(), 1)
         outer.addLayout(body, 1)
 
@@ -238,7 +344,7 @@ class ArchivePage(QWidget):
         holder_box.setContentsMargins(14, 0, 14, 10)
         self._search = QLineEdit()
         self._search.setObjectName("ListSearch")
-        self._search.setPlaceholderText("搜索姓名或学号")
+        self._search.setPlaceholderText("搜索姓名、学号或班级")
         self._search.setClearButtonEnabled(True)
         self._search.setMinimumHeight(32)
         self._search.textChanged.connect(self._on_search)
@@ -247,12 +353,14 @@ class ArchivePage(QWidget):
 
         self._list = QListWidget()
         self._list.setObjectName("StudentList")
-        self._list.setUniformItemSizes(True)
+        self._list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
         self._list.setMouseTracking(True)
         self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._list.setFrameShape(QFrame.Shape.NoFrame)
-        self._list.setItemDelegate(StudentItemDelegate(self._list))
+        self._list.setItemDelegate(_ClassRosterDelegate(self._list))
         self._list.itemClicked.connect(self._on_item_clicked)
+        self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._list.customContextMenuRequested.connect(self._roster_context_menu)
         box.addWidget(self._list, 1)
 
         self._note = QLabel("")
@@ -284,7 +392,127 @@ class ArchivePage(QWidget):
         self._delete_btn.clicked.connect(self._delete_student)
         buttons.addWidget(self._delete_btn)
         box.addLayout(buttons)
+
+        shortcuts = QHBoxLayout()
+        shortcuts.setContentsMargins(14, 0, 14, 12)
+        self._class_shortcuts = QToolButton()
+        self._class_shortcuts.setObjectName("ClassShortcuts")
+        self._class_shortcuts.setText("快捷班级")
+        self._class_shortcuts.setToolTip("展开班级堆叠，定位或编辑快捷班级")
+        self._class_shortcuts.setMinimumHeight(32)
+        self._class_shortcuts.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._class_menu = QMenu(self._class_shortcuts)
+        self._class_menu.aboutToShow.connect(self._rebuild_class_menu)
+        self._class_shortcuts.setMenu(self._class_menu)
+        shortcuts.addWidget(self._class_shortcuts)
+        shortcuts.addStretch()
+        box.addLayout(shortcuts)
         return card
+
+    def _class_names(self) -> list[str]:
+        return sorted({name for name in self._class_by_sid.values() if name}, key=str.casefold)
+
+    def _favorite_classes(self, names: list[str]) -> list[str]:
+        stored = (load_user_json(self._store, self._username, CLASS_SHORTCUTS_FILE, {})
+                  if self._username else {})
+        pinned = stored.get("classes") if isinstance(stored, dict) else None
+        return [name for name in pinned if name in names] if isinstance(pinned, list) else names
+
+    def _rebuild_class_menu(self) -> None:
+        names = self._class_names()
+        self._class_menu.clear()
+        for name in self._favorite_classes(names):
+            action = self._class_menu.addAction(name)
+            action.triggered.connect(lambda _checked=False, value=name: self._jump_to_class(value))
+        self._class_menu.addSeparator()
+        edit = self._class_menu.addAction("编辑快捷班级…")
+        edit.setEnabled(bool(names) and bool(self._username))
+        edit.triggered.connect(self._edit_class_shortcuts)
+
+    def _edit_class_shortcuts(self) -> None:
+        names = self._class_names()
+        selected = self._favorite_classes(names)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("编辑快捷班级")
+        dialog.resize(340, 350)
+        box = QVBoxLayout(dialog)
+        hint = QLabel("勾选要快捷访问的班级，可拖动调整顺序。")
+        hint.setWordWrap(True)
+        box.addWidget(hint)
+        items = QListWidget()
+        items.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        for name in dict.fromkeys([*selected, *names]):
+            item = QListWidgetItem(name, items)
+            item.setCheckState(Qt.CheckState.Checked if name in selected else Qt.CheckState.Unchecked)
+        box.addWidget(items)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        box.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        order = [items.item(i).text() for i in range(items.count())
+                 if items.item(i).checkState() == Qt.CheckState.Checked]
+        try:
+            save_user_json(self._store, self._username, CLASS_SHORTCUTS_FILE, {"classes": order})
+        except (CryptoError, OSError) as exc:
+            QMessageBox.warning(self, "快捷班级", f"保存失败。{exc}")
+
+    def _jump_to_class(self, name: str) -> None:
+        for pos in range(self._list.count()):
+            item = self._list.item(pos)
+            if item.data(_ROLE_CLASS_GROUP) and item.data(_ROLE_CLASS_NAME) == name and not item.isHidden():
+                self._list.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtTop)
+                return
+        search = self._search.text()
+        if search not in (name, f"{ARCHIVED_SEARCH_TEXT} {name}"):
+            self._search.setText(name)
+            self._jump_to_class(name)
+
+    def _roster_context_menu(self, position) -> None:
+        item = self._list.itemAt(position)
+        if item is None or self._delete_progress is not None:
+            return
+        menu = QMenu(self)
+        name = item.data(_ROLE_CLASS_NAME)
+        if item.data(_ROLE_CLASS_GROUP):
+            if not name:
+                return
+            menu.addAction("定位此班级", lambda: self._jump_to_class(name))
+            menu.addSeparator()
+            menu.addAction("删除整个班级…", lambda: self._confirm_class_deletion(name))
+        else:
+            self._list.setCurrentItem(item)
+            self._on_item_clicked(item)
+            menu.addAction("编辑学生…", self._open_edit_student)
+            menu.addAction("删除学生…", self._delete_student)
+        menu.aboutToHide.connect(menu.deleteLater)
+        menu.popup(self._list.viewport().mapToGlobal(position))
+
+    def _confirm_class_deletion(self, name: str) -> None:
+        if not self._username or self._delete_progress is not None:
+            return
+        answer = QMessageBox.question(
+            self, "删除整个班级",
+            f"确定删除 {name} 的全部学年成绩、德育和奖项名额，以及只属于该班的学生档案吗？"
+            "同时属于其他班的学生及其个人记录会保留。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        store, user = self._store, self._username
+
+        def finished(result):
+            deleted, removed = result
+            search = self._search.text().strip()
+            if search in (name, f"{ARCHIVED_SEARCH_TEXT} {name}"):
+                self._search.clear()
+            self._note.setText("班级已删除。" if deleted else "该班级已无可删除数据。")
+            self.class_deleted.emit(name, removed)
+
+        self._run_deletion("删除班级", "class.delete",
+                           lambda control: purge_class(store, user, name, control=control), finished)
 
     def _build_detail_pane(self) -> QWidget:
         self._detail_stack = QStackedWidget()
@@ -296,24 +524,23 @@ class ArchivePage(QWidget):
         box.setContentsMargins(0, 0, 0, 0)
         box.setSpacing(0)
 
-        self._empty = QLabel(
-            "👈  在左边点一名学生，这里显示他的学期时间轴和趋势。\n\n"
-            "档案来自「📊 智育分析」导入的成绩表 —— 导入时会自动存进加密库，\n"
-            "所以关掉程序再打开，档案还在。"
-        )
+        self._empty = QLabel("选择一名学生查看档案。")
         self._empty.setObjectName("Placeholder")
         self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty.setWordWrap(True)
         box.addWidget(self._empty, 1)
 
-        self._body = QWidget()
-        body_box = QVBoxLayout(self._body)
-        body_box.setContentsMargins(0, 0, 0, 0)
+        content = QWidget()
+        body_box = QVBoxLayout(content)
+        body_box.setContentsMargins(0, 0, 6, 2)
         body_box.setSpacing(14)
+        body_box.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
 
         body_box.addWidget(self._build_portrait_card())
-        body_box.addWidget(self._build_timeline_card(), 1)
+        body_box.addWidget(self._build_timeline_card())
         body_box.addWidget(self._build_partition_card())
+        body_box.addStretch(1)
+        self._body = profile_scroll(content)
         box.addWidget(self._body, 1)
 
         self._body.hide()
@@ -321,10 +548,20 @@ class ArchivePage(QWidget):
 
         # 二级页面：个人专属侧写（学期画像与 AI 侧写辅导）
         self._semester_page = SemesterSideProfilePage(parent=self)
-        self._semester_page.backRequested.connect(self._back_to_archive)
+        self._semester_page.model_settings_requested.connect(self.model_settings_requested.emit)
         self._detail_stack.addWidget(self._semester_page)
+        self._overview_page = StudentOverviewPage(self)
+        self._overview_page.back_requested.connect(self._back_to_archive)
+        self._overview_page.semester_requested.connect(self.open_semester_profile)
+        self._overview_page.model_settings_requested.connect(self.model_settings_requested.emit)
+        self._detail_stack.addWidget(self._overview_page)
+        self._detail_stack.currentChanged.connect(self._on_detail_page_changed)
 
         return self._detail_stack
+
+    def _on_detail_page_changed(self, index: int) -> None:
+        self._archive_title.setVisible(index == 0)
+        self._list_panel.setVisible(index == 0)
 
     def _build_portrait_card(self) -> QFrame:
         card = make_card()
@@ -334,6 +571,7 @@ class ArchivePage(QWidget):
 
         self._who = QLabel("—")
         self._who.setObjectName("H2")
+        self._who.setWordWrap(True)
         box.addWidget(self._who)
 
         self._cumulative = QLabel("—")
@@ -342,6 +580,7 @@ class ArchivePage(QWidget):
 
         self._cum_sub = QLabel("")
         self._cum_sub.setObjectName("Muted")
+        self._cum_sub.setWordWrap(True)
         box.addWidget(self._cum_sub)
 
         box.addStretch(1)
@@ -353,7 +592,7 @@ class ArchivePage(QWidget):
         self._profile_btn = QPushButton("🎯  个人专属侧写")
         self._profile_btn.setObjectName("Ghost")
         self._profile_btn.setMinimumHeight(32)
-        self._profile_btn.setToolTip("进入该学生的个人侧写二级页面")
+        self._profile_btn.setToolTip("查看全部已导入学期的总览")
         self._profile_btn.clicked.connect(self.open_current_profile)
         box.addWidget(self._profile_btn)
 
@@ -384,7 +623,7 @@ class ArchivePage(QWidget):
         self._timeline_box.setSpacing(8)
         self._timeline_box.addStretch(1)
         self._timeline_scroll.setWidget(inner)
-        self._timeline_scroll.setMinimumHeight(160)
+        self._timeline_scroll.setFixedHeight(84)
         self._timeline_scroll.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
@@ -414,6 +653,7 @@ class ArchivePage(QWidget):
         self._remaining = QLabel("—")
         self._remaining.setObjectName("Notice")
         self._remaining.setWordWrap(True)
+        self._remaining.setMinimumHeight(42)
         box.addWidget(self._remaining)
         return card
 
@@ -422,55 +662,46 @@ class ArchivePage(QWidget):
         blocked = self._list.blockSignals(True)
         self._list.clear()
         self._key_by_row = {}
-        students = list(self._archive.students.values()) if self._archive else []
-        students.sort(key=lambda s: (s.student, s.student_id))
+        students = self._archive.students.values() if self._archive else ()
+        search_text = self._search.text().strip()
+        self._show_archived = search_text.startswith(ARCHIVED_SEARCH_TEXT)
+        by_class: dict[str, list[Any]] = {}
+        for student in students:
+            sid = _bare_sid(student.student_id)
+            if (sid in self._archived_sids) == self._show_archived:
+                by_class.setdefault(self._class_by_sid.get(sid, ""), []).append(student)
 
-        archived_sids: set[str] = set()
-        if self._book is not None and getattr(self._book, "durable", False):
-            try:
-                for r in self._book.search("", archived_only=True):
-                    archived_sids.add(_bare_sid(r.student_id))
-            except Exception:
-                pass
-
-        search_text = (self._search.text() if hasattr(self, "_search") else "") or ""
-        show_archived = ARCHIVED_SEARCH_TEXT in search_text
-
-        visible_students = []
-        for s in students:
-            is_archived = bool(s.student_id and _bare_sid(s.student_id) in archived_sids)
-            if show_archived and not is_archived:
-                continue
-            if not show_archived and is_archived:
-                continue
-            visible_students.append(s)
-
-        for row, student in enumerate(visible_students):
-            label = (f"{student.student}（{student.student_id}）"
-                     if student.student_id else student.student)
-            item = QListWidgetItem(label)
-            item.setData(_ROLE_INDEX, row)
-            item.setData(_ROLE_NAME, student.student)
-            item.setData(_ROLE_ID, student.student_id)
-            item.setData(_ROLE_HAS_ID, bool(student.student_id))
-            # 档案页的圆点按"挂科总数"判，跟智育分析的口径筛选无关 ——
-            # 这一页是纵向的固定口径（见 ARCHIVE_SCOPE 的注释）
-            level = "danger" if student.failed_total else ""
-            item.setData(_ROLE_LEVEL, level)
-            item.setData(_ROLE_SEED, student.student_id or student.student)
-            item.setSizeHint(QSize(0, ITEM_HEIGHT))
-            item.setToolTip(
-                f"学号 {student.student_id}" if student.student_id
-                else "⚠ 表里没有学号，同名学生会共用同一份意愿"
-            )
-            self._list.addItem(item)
-            self._key_by_row[row] = student.key
+        for klass in sorted(by_class, key=lambda value: (not value, value.casefold())):
+            title = klass or "未填写班级"
+            heading = QListWidgetItem(title)
+            heading.setData(_ROLE_CLASS_GROUP, True)
+            heading.setData(_ROLE_CLASS_NAME, klass)
+            heading.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            heading.setToolTip(title)
+            self._list.addItem(heading)
+            for student in sorted(by_class[klass], key=lambda s: (s.student, s.student_id)):
+                row = self._list.count()
+                label = (f"{student.student}（{student.student_id}）"
+                         if student.student_id else student.student)
+                item = QListWidgetItem(label)
+                item.setData(_ROLE_INDEX, row)
+                item.setData(_ROLE_CLASS_NAME, klass)
+                item.setData(_ROLE_NAME, student.student)
+                item.setData(_ROLE_ID, student.student_id)
+                item.setData(_ROLE_HAS_ID, bool(student.student_id))
+                item.setData(_ROLE_LEVEL, "danger" if student.failed_total else "")
+                item.setData(_ROLE_SEED, student.student_id or student.student)
+                item.setSizeHint(QSize(0, ITEM_HEIGHT))
+                item.setToolTip(f"{label}\n{title}")
+                self._list.addItem(item)
+                self._key_by_row[row] = student.key
         self._list.blockSignals(blocked)
 
-        count = len(visible_students)
+        count = self.student_count
+        self._class_shortcuts.setEnabled(bool(self._class_names()))
         self._count_pill.setText(str(count))
         if count == 0:
-            if show_archived:
+            if self._show_archived:
                 self._note.setText("没有已归档的学生。")
             else:
                 self._note.setText("还没有档案。先在「📊 智育分析」导入成绩表或新建学生。")
@@ -487,7 +718,7 @@ class ArchivePage(QWidget):
                 self._empty.setText(
                     "👈  在左边点一名学生，这里显示他的学期时间轴和趋势。"
                 )
-        self._update_note_filter()
+        self._filter_list(search_text)
         self._sync_buttons()
 
     def _sync_buttons(self) -> None:
@@ -498,37 +729,55 @@ class ArchivePage(QWidget):
             self._delete_btn.setEnabled(has_sel)
 
     def _update_note_filter(self) -> None:
-        total = self._list.count()
+        total = self.student_count
         if total == 0:
             return
         shown = self.visible_count
-        if shown != total:
-            terms = len(self.all_terms())
-            self._note.setText(
-                f"筛出 {shown} / {total} 人　·　{terms} 个学期标签"
-            )
+        terms = len(self.all_terms())
+        self._note.setText(
+            f"筛出 {shown} / {total} 人　·　{terms} 个学期标签" if shown != total
+            else f"共 {total} 人　·　{terms} 个学期标签"
+        )
 
     def _on_search(self, text: str) -> None:
         keyword = (text or "").strip()
+        if keyword.startswith(ARCHIVED_SEARCH_TEXT) != self._show_archived:
+            self.reset_view()
+            self._fill_list()
+            return
+        self._filter_list(keyword)
+
+    def _filter_list(self, keyword: str) -> None:
+        if self._show_archived:
+            keyword = keyword.removeprefix(ARCHIVED_SEARCH_TEXT).strip()
+        needle = keyword.casefold()
+        counts: dict[str, int] = {}
+        headings: list[QListWidgetItem] = []
         for i in range(self._list.count()):
-            self._list.item(i).setHidden(True)
-        if keyword:
-            for item in self._list.findItems(keyword, Qt.MatchFlag.MatchContains):
-                item.setHidden(False)
-        else:
-            for i in range(self._list.count()):
-                self._list.item(i).setHidden(False)
+            item = self._list.item(i)
+            klass = item.data(_ROLE_CLASS_NAME)
+            if item.data(_ROLE_CLASS_GROUP):
+                headings.append(item)
+                continue
+            shown = needle in item.text().casefold() or needle in (klass or "未填写班级").casefold()
+            item.setHidden(not shown)
+            if shown:
+                counts[klass] = counts.get(klass, 0) + 1
+        for item in headings:
+            klass = item.data(_ROLE_CLASS_NAME)
+            count = counts.get(klass, 0)
+            item.setHidden(count == 0)
+            item.setText(f"{klass or '未填写班级'}   {count} 人")
+        selected = self._list.currentItem()
+        if selected is not None and selected.isHidden():
+            self._list.setCurrentRow(-1)
+            self.reset_view()
+        self._count_pill.setText(str(self.visible_count))
         self._update_note_filter()
 
     def _on_item_clicked(self, item: QListWidgetItem) -> None:
-        sid = item.data(_ROLE_ID)
-        name = item.data(_ROLE_NAME)
-        student = None
-        if self._archive and self._archive.students:
-            for s in self._archive.students.values():
-                if (sid and s.student_id == sid) or (not sid and name and s.student == name):
-                    student = s
-                    break
+        key = self._key_by_row.get(self._list.row(item))
+        student = self._archive.get(key) if key and self._archive is not None else None
         if student is not None:
             if self._detail_stack is not None:
                 self._detail_stack.setCurrentIndex(0)
@@ -594,6 +843,8 @@ class ArchivePage(QWidget):
                 widget.deleteLater()
 
         series = info.get("series") or []
+        self._timeline_scroll.setFixedHeight(min(330, max(84, 48 * len(series) + 12)))
+        self._timeline_scroll.verticalScrollBar().setValue(0)
         if not series:
             hint = QLabel("这个学生还没有可显示的学期记录。")
             hint.setObjectName("Muted")
@@ -792,30 +1043,16 @@ class ArchivePage(QWidget):
                 pass
         self._sync_buttons()
 
-    def open_current_profile(self) -> None:
-        """从肖像卡片上的按钮进入当前学生的个人专属侧写二级页面。"""
-        if self._current is None:
-            return
-        terms = getattr(self._current, "terms", []) or []
-        if not terms:
-            QMessageBox.information(
-                self, "个人侧写", "该学生暂无学期成绩记录，无法生成学期侧写。"
-            )
-            return
-        if len(terms) == 1:
-            self.open_semester_profile(terms[0])
-            return
+    def _back_to_overview(self) -> None:
+        self._detail_stack.setCurrentWidget(self._overview_page)
 
-        chosen, ok = QInputDialog.getItem(
-            self,
-            "选择学期",
-            f"请选择要查看 {self._current.student} 哪一学期的个人专属侧写：",
-            terms,
-            len(terms) - 1,
-            False,
-        )
-        if ok and chosen:
-            self.open_semester_profile(chosen)
+    def open_current_profile(self) -> None:
+        """打开当前学生的跨学期个人侧写。"""
+        if self._current is None or self._detail_stack is None:
+            return
+        class_name = self._class_by_sid.get(_bare_sid(self._current.student_id), "")
+        self._overview_page.set_context(self._store, self._username, self._current, class_name)
+        self._detail_stack.setCurrentWidget(self._overview_page)
 
     def open_semester_profile(self, semester: str) -> None:
         """切到二级页面（SemesterSideProfilePage）展示指定学期的侧写。"""
@@ -823,6 +1060,8 @@ class ArchivePage(QWidget):
             return
         sid = getattr(self._current, "student_id", "") or ""
         name = getattr(self._current, "student", "") or ""
+        from_overview = self._detail_stack.currentWidget() is self._overview_page
+        back = self._back_to_overview if from_overview else self._back_to_archive
         try:
             self._semester_page.set_context(
                 self._store,
@@ -830,7 +1069,7 @@ class ArchivePage(QWidget):
                 sid,
                 name,
                 semester,
-                on_back=self._back_to_archive,
+                on_back=back,
             )
         except Exception:
             logger.exception("打开学期侧写页失败")
@@ -875,17 +1114,10 @@ class ArchivePage(QWidget):
             target_student = build_empty_student_archive(key, name, sid)
             self.show_student(target_student)
 
-        target_term = semester or payload.get("semester") or payload.get("term")
-        if not target_term and target_student is not None:
-            terms = getattr(target_student, "terms", []) or []
-            if terms:
-                target_term = terms[-1]
-
-        if target_term:
-            self.open_semester_profile(str(target_term))
+        if semester:
+            self.open_semester_profile(semester)
         else:
-            if self._detail_stack is not None:
-                self._detail_stack.setCurrentIndex(0)
+            self.open_current_profile()
 
     # ---------------------------------------------------------------- 学生管理（增/删/改）
     def _save_archive(self) -> bool:
@@ -900,7 +1132,10 @@ class ArchivePage(QWidget):
             item_sid = item.data(_ROLE_ID)
             item_name = item.data(_ROLE_NAME)
             if (bare and item_sid == bare) or item_name == sid_or_name:
+                if item.isHidden():
+                    self._search.setText(ARCHIVED_SEARCH_TEXT if self._show_archived else "")
                 self._list.setCurrentItem(item)
+                self._list.scrollToItem(item)
                 self._on_item_clicked(item)
                 return True
         return False
@@ -1034,7 +1269,7 @@ class ArchivePage(QWidget):
         self._select_student_by_id(new_sid or new_name)
 
     def _delete_student(self) -> None:
-        if self._current is None:
+        if self._current is None or self._delete_progress is not None:
             return
         sid = getattr(self._current, "student_id", "") or ""
         name = getattr(self._current, "student", "") or ""
@@ -1043,7 +1278,7 @@ class ArchivePage(QWidget):
         box.setWindowTitle("删除学生")
         box.setText(
             f"要删除 {name}（{sid}）吗？仅归档只是从列表隐藏，数据全部保留；"
-            "彻底删除会清掉成绩、侧写、谈话记录与德育分。"
+            "彻底删除会清掉成绩、侧写、谈话记录、德育分和意愿。"
         )
         hard_btn = box.addButton(
             "彻底删除（成绩、侧写、谈话记录一起删）", QMessageBox.ButtonRole.DestructiveRole
@@ -1056,7 +1291,7 @@ class ArchivePage(QWidget):
             answer = QMessageBox.question(
                 self,
                 "确认彻底删除",
-                f"确定彻底删除 {name}（{sid}）吗？成绩、侧写、谈话记录与德育分会一起删除，无法恢复。",
+                f"确定彻底删除 {name}（{sid}）吗？关联数据会一起删除，无法恢复。",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -1066,19 +1301,99 @@ class ArchivePage(QWidget):
             self._delete_student_archive(sid, name)
 
     def _delete_student_hard(self, sid: str, name: str) -> None:
-        self._delete_hard_data(sid, name)
-        if self._book is not None and sid:
-            try:
-                self._book.remove(sid)
-            except Exception:
-                logger.exception("删除学生主档失败")
-                QMessageBox.critical(self, "删除学生", "这名学生没有删掉，请稍后再试。")
-                return
-        self._audit_student(
-            "student_delete", student_id=sid, detail=f"彻底删除学生 {name}（{sid}）"
+        store, username = self._store, self._username
+
+        def finished(deleted):
+            self._note.setText("删除完成。" if deleted else "该学生已不在本地记录中。")
+            self.student_deleted.emit(sid, name)
+
+        self._run_deletion(
+            "删除学生", "student.delete",
+            lambda control: purge_student(store, username, sid, name, control=control), finished,
+            audit=lambda deleted: audit_student_deletion(store, username, sid) if deleted else None,
         )
-        self.reset_view()
-        self.reload()
+
+    def _run_deletion(self, title, operation, remove, done, *, audit=None) -> None:
+        if self._delete_progress is not None:
+            return
+        root = self._store.root
+        control = StudentDeletionControl()
+        result: Future[Any] = Future()
+        deadline = monotonic() + DELETE_PREPARE_TIMEOUT
+        progress = _StudentDeletionProgress(self, title)
+        self._delete_progress = progress
+        timer = QTimer(progress)
+        timer.setInterval(DELETE_POLL_INTERVAL_MS)
+        progress.open()
+        applog.write(operation, "started", root=root)
+
+        def finish() -> None:
+            timer.stop()
+            self._delete_progress = None
+            progress.accept()
+            progress.deleteLater()
+
+        def work() -> None:
+            if not result.set_running_or_notify_cancel():
+                return
+            try:
+                deleted = remove(control)
+            except BaseException as error:
+                result.set_exception(error)
+                return
+            result.set_result(deleted)
+            applog.write(operation, "storage_finished", root=root)
+            if audit is not None:
+                audit(deleted)
+
+        def failed(error: BaseException) -> None:
+            finish()
+            applog.write(operation, f"failed: {type(error).__name__}", root=root)
+            message = str(error) if isinstance(error, CryptoError) else "删除未完成，请检查数据目录后重试。"
+            QMessageBox.critical(self, title, message)
+
+        slow_write = False
+
+        def poll() -> None:
+            nonlocal slow_write
+            # 以后台提交的结果为准。即使线程池的回调没有送达，也能结束进度。
+            if result.done():
+                try:
+                    deleted = result.result()
+                except BaseException as error:
+                    failed(error)
+                    return
+                finish()
+                applog.write(operation, "completed", root=root)
+                refresh_failed = False
+                try:
+                    self.reset_view()
+                    self.reload()
+                except Exception as error:
+                    applog.write(operation, f"refresh_failed: {type(error).__name__}", root=root)
+                    refresh_failed = True
+                done(deleted)
+                if refresh_failed:
+                    self._note.setText("删除已完成。重新打开档案页可刷新名单。")
+                return
+            if monotonic() < deadline or slow_write:
+                return
+            if control.cancel_before_write():
+                result.cancel()
+                failed(CryptoError("等待删除任务超时，本次未写入数据。请稍后重试。"))
+                return
+            slow_write = True
+            progress.show_slow_write()
+            applog.write(operation, "slow_write", root=root)
+
+        timer.timeout.connect(poll)
+        try:
+            run_async(self, work)
+        except Exception as error:
+            control.cancel_before_write()
+            failed(error)
+            return
+        timer.start()
 
     def _delete_student_archive(self, sid: str, name: str) -> None:
         if self._book is not None and sid:
@@ -1128,41 +1443,6 @@ class ArchivePage(QWidget):
                 )
         except Exception:
             logger.warning("补搬成绩历史失败", exc_info=True)
-
-    def _delete_hard_data(self, sid: str, name: str) -> None:
-        try:
-            db = GradeHistoryDB(store=self._store, username=self._username)
-            terms = sorted(
-                {
-                    str(row.get("semester") or "")
-                    for row in db.rows()
-                    if same_student_id(row.get("student_id"), sid)
-                }
-                - {""}
-            )
-            for term in terms:
-                db.delete_semester(sid, term)
-        except Exception:
-            logger.exception("删除成绩历史失败")
-
-        try:
-            ps = ProfileStore(store=self._store, username=self._username)
-            remove_side = getattr(ps, "remove", None)
-            if callable(remove_side):
-                remove_side(sid)
-            else:
-                ps.clear_side_text(sid)
-        except Exception:
-            logger.exception("删除侧写失败")
-
-        try:
-            delete_all_semester_sides(self._store, self._username, sid)
-        except Exception:
-            logger.exception("删除学期侧写失败")
-
-        if self._archive is not None:
-            self._archive.remove_student(sid, name)
-            self._save_archive()
 
     def _audit_student(self, action: str, student_id: str = "", detail: str = "") -> None:
         try:

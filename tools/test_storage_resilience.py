@@ -312,8 +312,9 @@ def test_release_upgrade_from_1_9_3_changes_only_version_metadata():
         "unchanged_payload": {"fake_key": "fake_value"},
     }
     migrated = migrator.migrate("1.9.3", data)
-    assert migrated["vault_version"] == "1.9.4"
-    assert migrated["__vault_version__"] == "1.9.4"
+    assert migrated["vault_version"] == migrator.CURRENT_VERSION
+    assert migrated["__vault_version__"] == migrator.CURRENT_VERSION
     assert migrated["unchanged_payload"] == data["unchanged_payload"]
-    assert migrated["_migration"]["hops"] == ["v1.9.3→v1.9.4"]
+    assert migrated["_migration"]["hops"][0] == "v1.9.3→v1.9.4"
+    assert migrated["_migration"]["hops"][-1].endswith(f"→v{migrator.CURRENT_VERSION}")
     assert data["vault_version"] == "1.9.3"

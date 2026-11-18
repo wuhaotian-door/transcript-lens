@@ -519,10 +519,10 @@ def test_empty_side_text_shows_the_generate_placeholder(page: ProfilePage) -> No
         assert mark not in SIDE_TEXT_EMPTY_HINT
 
 
-def test_saved_side_text_flips_the_hint_and_the_button(
+def test_saved_side_text_hides_empty_hint_and_updates_button(
     vault: CryptoStore, page: ProfilePage
 ) -> None:
-    """存过正文之后再渲染：正文回填、按钮变「重新生成」、气泡换成落库说明。"""
+    """读回已保存的正文时隐藏空态说明。"""
     archive = build_archive(_parsed([MATH], [76.0]), TERM_A)
     payload = _payload(_student_of(archive))
     page.show_student(payload)
@@ -531,7 +531,7 @@ def test_saved_side_text_flips_the_hint_and_the_button(
 
     assert page._side_text.toPlainText() == SIDE_TEXT
     assert page._ai_btn.text() == "重新生成"
-    assert page._side_hint.text() != SIDE_TEXT_EMPTY_HINT
+    assert page._side_hint.isHidden()
     assert ProfileStore(store=vault, username=USER).side_text(KEY) == SIDE_TEXT
 
     # 换一名没存过的学生 → 回到占位态（不串号）

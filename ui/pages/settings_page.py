@@ -232,7 +232,7 @@ class SettingsPage(QWidget):
         box.setContentsMargins(22, 20, 22, 20)
         box.setSpacing(14)
 
-        title = QLabel("⚙️  设置")
+        title = QLabel("设置")
         title.setObjectName("H1")
         box.addWidget(title)
 
@@ -244,31 +244,24 @@ class SettingsPage(QWidget):
 
         exp_title = QLabel("导出")
         exp_title.setObjectName("H2")
-        exp.addWidget(exp_title)
-
-        exp_note = QLabel(
-            "明文版含姓名，仅供本人留档；脱敏版不含姓名也不含学号，学生以 S 编号标识。"
-        )
-        exp_note.setObjectName("Muted")
-        exp_note.setWordWrap(True)
-        exp.addWidget(exp_note)
-
         exp_row = QHBoxLayout()
-        plain = QPushButton("导出明文 xlsx")
+        exp_row.addWidget(exp_title, 1)
+        plain = QPushButton("含姓名版")
+        plain.setToolTip("导出含学生姓名的 Excel 文件")
         plain.setObjectName("Ghost")
         plain.setMinimumHeight(38)
         plain.clicked.connect(lambda: self._do_export(anonymized=False))
         exp_row.addWidget(plain)
 
-        masked = QPushButton("导出脱敏 xlsx")
+        masked = QPushButton("脱敏版")
+        masked.setToolTip("导出移除姓名和学号的 Excel 文件")
         masked.setObjectName("Ghost")
         masked.setMinimumHeight(38)
         masked.clicked.connect(lambda: self._do_export(anonymized=True))
         exp_row.addWidget(masked)
-        exp_row.addStretch(1)
         exp.addLayout(exp_row)
 
-        self._exp_status = QLabel("先在「📊 智育分析」导入一份成绩表，才能导出。")
+        self._exp_status = QLabel("")
         self._exp_status.setObjectName("Muted")
         self._exp_status.setWordWrap(True)
         exp.addWidget(self._exp_status)
@@ -284,41 +277,32 @@ class SettingsPage(QWidget):
         clr_title.setObjectName("H2")
         clr.addWidget(clr_title)
 
-        clr_note = QLabel(
-            "删掉本账户的全部成绩记录、学生侧写和相关快照。账户和密码本身不受影响。\n"
-            "删除前会先问一次，并把要删的东西一条条列出来；这一步不可撤销 —— "
-            "删掉之后只能用原始成绩表重新导入。"
-        )
-        clr_note.setObjectName("Muted")
-        clr_note.setWordWrap(True)
-        clr.addWidget(clr_note)
-
         #: 侧写 / 生成物跟着成绩一起清（**默认勾选**，用户可以取消）
-        self._clear_profiles_box = QCheckBox("同时清除 AI 侧写正文和归档、班级快照")
+        self._clear_profiles_box = QCheckBox("同时删除侧写与档案快照")
         self._clear_profiles_box.setChecked(True)
         self._clear_profiles_box.setToolTip(
             "不勾选的话只清成绩记录，侧写正文和成长档案快照会留下（它们就对不上了）"
         )
-        clr.addWidget(self._clear_profiles_box)
-
+        clr_row = QHBoxLayout()
+        clr_row.addWidget(self._clear_profiles_box, 1)
         clear_btn = QPushButton("删除成绩库")
         clear_btn.setObjectName("Danger")
         clear_btn.setMinimumHeight(38)
         clear_btn.clicked.connect(self._do_clear)
-        clr.addWidget(clear_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+        clr_row.addWidget(clear_btn)
+        clr.addLayout(clr_row)
 
         self._clr_status = QLabel("")
         self._clr_status.setObjectName("Muted")
         self._clr_status.setWordWrap(True)
         clr.addWidget(self._clr_status)
-        box.addWidget(clr_card)
-
         box.addWidget(self._build_gpa_card())
 
-        box.addWidget(self._build_ai_card())
+        self._model_settings_card = self._build_ai_card()
+        box.addWidget(self._model_settings_card)
 
         box.addWidget(self._build_update_card())
-
+        box.addWidget(clr_card)
         box.addStretch(1)
 
     # ---------------------------------------------------------------- GPA 规则
@@ -338,19 +322,8 @@ class SettingsPage(QWidget):
 
         title = QLabel("GPA 换算规则")
         title.setObjectName("H2")
-        box.addWidget(title)
-
-        note = QLabel(
-            "GPA = Σ(绩点 × 学分) ÷ Σ学分。没有成绩的课不进分母；"
-            "缺考记 0 分，学分进分母、绩点按 0 算。"
-        )
-        note.setObjectName("Muted")
-        note.setWordWrap(True)
-        box.addWidget(note)
-
         row = QHBoxLayout()
-        row.addWidget(QLabel("换算方案"))
-        row.addSpacing(8)
+        row.addWidget(title, 1)
 
         self._gpa_combo = QComboBox()
         self._gpa_combo.setMinimumHeight(34)
@@ -369,7 +342,6 @@ class SettingsPage(QWidget):
             self._gpa_combo.setItemData(index, tip, Qt.ItemDataRole.ToolTipRole)
         self._gpa_combo.currentIndexChanged.connect(self._on_gpa_scheme_changed)
         row.addWidget(self._gpa_combo)
-        row.addStretch(1)
         box.addLayout(row)
 
         self._gpa_status = QLabel("")
@@ -438,6 +410,9 @@ class SettingsPage(QWidget):
             return DEFAULT_SCHEME
 
     # ---------------------------------------------------------------- AI 助手
+    def focus_model_settings(self) -> None:
+        self._scroll.ensureWidgetVisible(self._model_settings_card, 0, 18)
+
     def _build_ai_card(self) -> QFrame:
         """AI 助手（charter 第 6 章：**只留开关和接口，不实现任何调用**）。
 
@@ -447,24 +422,14 @@ class SettingsPage(QWidget):
         ★ 这里**一个网络请求都没有**，连 import 都没有 ——
           见 ``core/ai/cloud_adapter.py`` 顶部的说明。
         """
-        from core.ai.cloud_adapter import DESCRIPTION as CLOUD_DESC
-        from core.ai.local_assistant import DESCRIPTION as LOCAL_DESC
-
         card = make_card()
         box = QVBoxLayout(card)
         box.setContentsMargins(24, 20, 24, 20)
         box.setSpacing(10)
 
-        title = QLabel("AI 助手")
+        title = QLabel("模型与 AI")
         title.setObjectName("H2")
         box.addWidget(title)
-
-        note = QLabel(
-            "本地助手不联网；云端大模型仅在您主动点击「深度评估」时调用。"
-        )
-        note.setObjectName("Notice")
-        note.setWordWrap(True)
-        box.addWidget(note)
 
         # --- 本地助手 ---
         self._local_ai_box = QCheckBox("启用本地学习助手")
@@ -472,25 +437,20 @@ class SettingsPage(QWidget):
         self._local_ai_box.toggled.connect(self._on_local_ai_toggled)
         box.addWidget(self._local_ai_box)
 
-        local_hint = QLabel(LOCAL_DESC)
-        local_hint.setObjectName("Muted")
-        local_hint.setWordWrap(True)
-        box.addWidget(local_hint)
-
         # --- 云端助手 ---
-        self._cloud_ai_box = QCheckBox("允许辅导员手动启用云端大模型")
+        self._cloud_ai_box = QCheckBox("远程 AI 设置")
         self._cloud_ai_box.setChecked(False)
         self._cloud_ai_box.toggled.connect(self._on_cloud_ai_toggled)
         box.addWidget(self._cloud_ai_box)
 
-        cloud_hint = QLabel(CLOUD_DESC)
+        cloud_hint = QLabel("远程推理接口待接入。")
         cloud_hint.setObjectName("Muted")
         cloud_hint.setWordWrap(True)
         box.addWidget(cloud_hint)
 
         key_row = QHBoxLayout()
         self._ai_key_edit = QLineEdit()
-        self._ai_key_edit.setPlaceholderText("API Key（存加密库，不回显）")
+        self._ai_key_edit.setPlaceholderText("API Key")
         # ★ 密码模式：**绝不回显**（charter 铁律 2）
         self._ai_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self._ai_key_edit.setMinimumHeight(36)
@@ -517,14 +477,6 @@ class SettingsPage(QWidget):
         models_title = QLabel("本地模型")
         models_title.setObjectName("H3")
         box.addWidget(models_title)
-
-        models_note = QLabel(
-            "模型文件只下载到本机的数据目录，不上传任何东西。"
-            "本版本只做到「下载 + 认出来」，还没有接推理引擎。"
-        )
-        models_note.setObjectName("Muted")
-        models_note.setWordWrap(True)
-        box.addWidget(models_note)
 
         self._models_list = QLabel("（正在读取…）")
         self._models_list.setObjectName("Muted")
@@ -870,19 +822,9 @@ class SettingsPage(QWidget):
 
         title = QLabel("更新")
         title.setObjectName("H2")
-        box.addWidget(title)
-
-        note = QLabel(
-            "只在您点「检查更新」时才联网，只读一次版本号。"
-            "发现新版本后会先问您要下什么，点「开始下载」才会下载 —— "
-            "程序不会在后台自动下载或自动安装。"
-        )
-        note.setObjectName("Muted")
-        note.setWordWrap(True)
-        box.addWidget(note)
-
         row = QHBoxLayout()
-        self._ver_label = QLabel(f"当前版本 v{CURRENT_VERSION}")
+        row.addWidget(title, 1)
+        self._ver_label = QLabel(f"v{CURRENT_VERSION}")
         self._ver_label.setObjectName("H3")
         row.addWidget(self._ver_label)
         row.addSpacing(12)
@@ -893,12 +835,9 @@ class SettingsPage(QWidget):
         self._update_btn.setMinimumWidth(110)
         self._update_btn.clicked.connect(self._do_check_update)
         row.addWidget(self._update_btn)
-        row.addStretch(1)
         box.addLayout(row)
 
-        self._upd_status = QLabel(
-            "想确认有没有新版本，点一下「检查更新」。"
-        )
+        self._upd_status = QLabel("")
         self._upd_status.setObjectName("Muted")
         self._upd_status.setWordWrap(True)
         box.addWidget(self._upd_status)

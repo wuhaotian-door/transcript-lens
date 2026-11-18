@@ -70,15 +70,11 @@ No real grade sheets or credentials are in this repository — test data is limi
 
 ## Quick start
 
-**Download a build** from [Releases](https://gitee.com/wuhaotiansystem/transcript-lens/releases).
-Large builds are split into parts; concatenate them on Windows:
+**Install on 64-bit Windows 10/11.** Run the setup wizard you received and choose an installation
+folder. Launch from the chosen folder, or select the Start menu shortcut in the wizard. The standalone EXE also runs directly.
 
-```bat
-copy /b transcript-lens-v1.9.3.exe.part1+transcript-lens-v1.9.3.exe.part2+transcript-lens-v1.9.3.exe.part3 transcript-lens.exe
-```
-
-> The three parts concatenate to **240,408,108 bytes** (~229 MB). Just double-click the
-> result: on first launch it migrates data from the previous version automatically.
+See [GitHub Releases](https://github.com/wuhaotian-door/transcript-lens/releases) or
+[Gitee Releases](https://gitee.com/wuhaotiansystem/transcript-lens/releases) for publicly available builds.
 
 **From source** (Windows 10/11, Python 3.13):
 
@@ -104,8 +100,8 @@ or use **Model center → install inference backend**. Put GGUF files under
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build_exe.ps1 -Both
 ```
 
-Outputs land in `dist\`: `transcript-lens.exe` (single file) and
-`transcript-lens-debug\` (onedir with a console).
+The local executable is `dist\transcript-lens.exe`. The distributable single-file build is in `release\`.
+See the [Windows distribution guide](docs/DISTRIBUTION.md#windows-安装向导) for the setup wizard.
 
 A single-file build must unpack itself into a temp folder first; if security software
 blocks that step you get `[PYI-xxxx:ERROR] Could not create temporary directory!` —
@@ -117,7 +113,7 @@ use the onedir build or `set TEMP=<writable dir>` before launching.
 2. Confirm categories and credits → anchor check → save
 3. Review weighted scores and warnings; export
 4. **Scholarships** → import moral scores (bulk supported) → quotas → results
-5. **Coaching / Archive** → intentions, outline, AI profile and conversation
+5. **Archive** → open a student's overview for all imported semesters or a semester profile for details
 6. **Settings** → updates, GPA scheme, delete the grade store (with inventory and double confirmation)
 
 ## Layout

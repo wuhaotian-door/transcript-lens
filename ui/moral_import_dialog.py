@@ -120,6 +120,8 @@ class MoralImportPreviewDialog(QDialog):
     def _source_line(self) -> str:
         plan = self._plan
         text = f"文件：{plan.path.name}　表内共 {plan.total_rows} 行"
+        if plan.year:
+            text += f"　目标学年：{plan.year}" + (f"（{plan.school_year}）" if plan.school_year else "")
         if plan.classes:
             text += "　涉及班级：" + "、".join(plan.classes)
         else:
@@ -147,7 +149,7 @@ class MoralImportPreviewDialog(QDialog):
         for index, row in enumerate(rows):
             score = "" if row.score is None else _score_text(row.score)
             values = (
-                str(row.row_index),
+                str(row.row_index + 1),
                 row.student_id,
                 row.student,
                 row.class_name,
@@ -186,4 +188,4 @@ def _score_text(value: Any) -> str:
         return str(value)
     if number.is_integer():
         return str(int(number))
-    return f"{number:g}"
+    return str(number)

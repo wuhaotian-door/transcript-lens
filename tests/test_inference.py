@@ -562,7 +562,10 @@ def test_engine_missing_says_so_even_with_light_models(
         None, store=store, username="noengine", models=[_model(tmp_path)]
     )
     text = dialog.status_label.text()
-    assert "本地推理引擎" in text, text
+    assert "本机暂无推理核心" in text, text
+    assert not dialog.backend_setup_btn.isHidden()
+    assert dialog.send_button.isHidden()
+    assert dialog._model_picker.isHidden()
     assert "模型" in text, text
     assert dialog.input_edit.isEnabled() is False
     assert dialog.submit("你好") is False
@@ -636,7 +639,7 @@ def test_dialog_streams_answer_and_persists_encrypted_history(
     assert "帮我写个谈话提纲" in restored
     assert "你好呀" in restored
     assert len(again.messages()) == 2
-    assert any("加密" in child.text() for child in again.findChildren(type(again.status_label)))
+    assert not any("不会上传" in child.text() for child in again.findChildren(type(again.status_label)))
     again.close()
 
 

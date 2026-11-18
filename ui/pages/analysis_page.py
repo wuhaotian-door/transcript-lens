@@ -84,7 +84,9 @@ from core.archival import (
 )
 from core.calculator import MAX_SCORE, MIN_SCORE, CalculationScope, calculate_many
 from core.crypto_store import CryptoError, CryptoStore
+from core import applog
 from core.database import (
+    StudentStore,
     GRADE_HISTORY_FILE,
     USE_OVERWRITE,
     USE_SKIP,
@@ -93,9 +95,10 @@ from core.database import (
 )
 from core.excel_io import ExcelEngineError, friendly_error, read_frame
 from core.parser import Category
-from core.scholarship import ClassRecord, save_class, validate_class_name
+from core.scholarship import ACADEMIC_SCOPE, ACADEMIC_YEARS, ClassRecord, save_class, validate_class_name, validate_school_year
 from core.user_store import load_user_json, save_user_json
-from core.validator import describe_alerts, parse_and_validate
+from core.grade_import import grade_card_scope, parse_grade_frame
+from core.validator import describe_alerts
 from ui.flags import LEVEL_DANGER, LEVEL_WARNING, build_flags_by_index
 from ui.intentions import student_key
 from ui.review_dialog import confirm_courses
@@ -437,17 +440,18 @@ def grade_history_records(
     ★ 身份是 ``student_id``（学号），姓名只作为 ``student_name`` 随行捎带、
       供冲突弹窗显示；:class:`core.database.GradeHistoryDB` 不会把它落盘。
     """
+    valid_rows = list(getattr(parsed, "valid_rows", ()) or ())
     overall = results.get(CalculationScope.ALL) if results else None
-    if overall is not None:
-        pairs = [
-            (getattr(c, "name", ""), getattr(c, "score", None), getattr(c, "credit", None))
-            for c in getattr(overall, "course_scores", ()) or ()
-        ]
-    else:
-        pairs = [(getattr(c, "name", ""), None, None)
-                 for c in getattr(parsed, "courses", ()) or ()]
+    per_student = isinstance(overall, (list, tuple))
+    if per_student and len(overall) != len(valid_rows):
+        raise ValueError("成绩计算结果与有效学生行数不一致")
     records: list[dict[str, Any]] = []
-    for row in getattr(parsed, "valid_rows", ()) or ():
+    for index, row in enumerate(valid_rows):
+        if overall is None:
+            pairs = ((c.name, None, None) for c in parsed.courses)
+        else:
+            result = overall[index] if per_student else overall
+            pairs = ((c.name, c.score, c.credit) for c in result.course_scores)
         for name, score, credit in pairs:
             if not name:
                 continue
@@ -471,6 +475,11 @@ def conflicts_of(db: Any, records: list[dict[str, Any]], semester: str) -> list[
     ★ 没有学号的行直接跳过：冲突检测的键就是学号，没有它无从比对
       （这类行照样由 ``core.database`` 按自己的规则处理）。
     """
+    existing: dict[str, int] = {}
+    for row in db.rows():
+        if row["semester"] == semester:
+            sid = row["student_id"]
+            existing[sid] = existing.get(sid, 0) + 1
     questions: list[Any] = []
     seen: set[str] = set()
     for record in records or ():
@@ -478,14 +487,14 @@ def conflicts_of(db: Any, records: list[dict[str, Any]], semester: str) -> list[
         if not sid or sid in seen:
             continue
         seen.add(sid)
-        if not db.has_semester(sid, semester):
+        if sid not in existing:
             continue
         questions.append(
             ConflictQuestion(
                 sid,
                 (record.get("student_name") or record.get("student") or sid),
                 semester,
-                len(db.semester_rows(sid, semester)),
+                existing[sid],
             )
         )
     return questions
@@ -650,18 +659,19 @@ class AnalysisPage(QWidget):
 
         # --- 学期（纵向档案的标签；成长档案页的时间轴 / 趋势 Δ 全靠它）---
         head.addSpacing(10)
-        term_caption = QLabel("学期")
+        term_caption = QLabel("成绩范围")
         term_caption.setObjectName("H3")
         head.addWidget(term_caption)
         self._term_box = QComboBox()
-        self._term_box.addItems(SEMESTER_TERMS)
+        for year in ACADEMIC_YEARS:
+            self._term_box.addItems((year, year + "上", year + "下"))
         self._term_box.setMinimumHeight(38)
         self._term_box.setMinimumWidth(92)
         self._term_box.setToolTip(
-            "这一份成绩属于哪个学期。\n"
-            "成长档案的学期时间轴和趋势 Δ 按它排 —— "
-            "同一学期导入两次会各留一份，绝不互相覆盖。"
+            "整学年表选大一至大四，单学期成绩可标注上或下。\n"
+            "奖学金页按学年测算。"
         )
+        self._term_box.setCurrentText(SEMESTER_TERMS[0])
         head.addWidget(self._term_box)
         head.addStretch(1)
 
@@ -857,30 +867,23 @@ class AnalysisPage(QWidget):
         self._class_edit.setText(name)
         return name
 
-    def _build_class_record(self, class_name: str, source: str) -> Any:
+    def _build_class_record(self, class_name: str, source: str, school_year: str = "") -> ClassRecord:
         """把刚算完的结果整理成一个班级快照（给奖学金测算用）。
 
-        ★ 存的是**算好的数**（口径①的加权均分）+ 每门课的分数，
-          奖学金页以后测算时**不需要重新解析 Excel** ——
-          也就不会出现"两次解析结果不一致"。
-        ★ 每门课的分数要留着：特等奖的「每门 ≥90」得逐门看（charter 4.4）。
+        保存完整课程明细，让学年测算可在过滤选修后再处理同名课程。
         """
         students: list[dict[str, Any]] = []
+        parsed_rows = self._parsed.valid_rows if self._parsed else ()
         for row in self._rows:
-            result = self._result_at(CalculationScope.ALL, row.index)
+            result = self._result_at(ACADEMIC_SCOPE, row.index)
             if result is None:
                 continue
-            courses: list[dict[str, Any]] = []
-            for course in getattr(result, "course_scores", ()) or ():
-                courses.append(
-                    {
-                        "name": getattr(course, "name", ""),
-                        # ★ score 可能是 None（没选这门课）—— 原样存，
-                        #   奖学金那边靠 None 区分"没考"和"考了 0 分"（红线 2）
-                        "score": getattr(course, "score", None),
-                        "credit": getattr(course, "credit", None),
-                    }
-                )
+            exam = parsed_rows[row.index]
+            courses = [
+                {"name": course.name, "score": score, "credit": course.credit,
+                 "category": course.category.value}
+                for course, score in zip(self._parsed.courses, exam.score_list)
+            ]
             students.append(
                 {
                     "student": row.student,
@@ -896,6 +899,7 @@ class AnalysisPage(QWidget):
             source=source,
             term=self.term,
             students=students,
+            school_year=school_year,
         )
 
     def _do_import(self) -> None:
@@ -927,7 +931,8 @@ class AnalysisPage(QWidget):
 
         # core 的便捷入口：解析 + 锚点校验一次做完
         try:
-            parsed, anchor_report = parse_and_validate(raw)
+            parsed, anchor_report = parse_grade_frame(raw)
+            source_scope = grade_card_scope(raw, parsed)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(
                 self, "解析出错", f"{exc.__class__.__name__}: {exc}"
@@ -952,6 +957,28 @@ class AnalysisPage(QWidget):
         class_name = self._require_class_name()
         if class_name is None:
             return
+        if source_scope.class_name and source_scope.class_name != class_name:
+            QMessageBox.warning(self, "班级号不一致",
+                                f"成绩卡属于 {source_scope.class_name} 班，请核对班级号。")
+            return
+
+        import_term = self.term
+        if source_scope.school_year:
+            coverage = {"上": "上半学年", "下": "下半学年"}.get(source_scope.half, "完整学年")
+            year, ok = QInputDialog.getItem(
+                self, "确认所属学年",
+                f"{class_name} 班 · {source_scope.school_year} · {coverage}\n请选择归属学年",
+                ACADEMIC_YEARS, ACADEMIC_YEARS.index(self.term[:2]), editable=False,
+            )
+            if not ok:
+                return
+            import_term = year + source_scope.half
+            if self._username:
+                try:
+                    validate_school_year(self._store, self._username, class_name, year, source_scope.school_year)
+                except (CryptoError, OSError, ValueError) as exc:
+                    QMessageBox.warning(self, "学年无法确认", str(exc))
+                    return
 
         # ★ 红线 3：强制人工回显确认。没确认就绝不进入计算。
         #   顺带把"分数超出 0~100"的格子摆上来 —— 那些格子会被 calculator
@@ -969,6 +996,7 @@ class AnalysisPage(QWidget):
             )
             return
 
+        self._term_box.setCurrentText(import_term)
         self._status.setText("正在计算三档口径…")
         self._repolish(self._status)
         QWidget.repaint(self)
@@ -1003,14 +1031,15 @@ class AnalysisPage(QWidget):
                 archive=self._load_archive(),
                 source=_base_name(path),
             )
-        except Exception:  # noqa: BLE001 - 归档失败不该拦住看数字
+        except (CryptoError, OSError, ValueError, TypeError, AttributeError) as exc:
             self._archive = None
+            archive_error = type(exc).__name__
+            applog.write("import.archive", archive_error, root=self._store.root)
         else:
-            # ★ 顺手把归档写进加密库 —— 否则"成长档案"页一关程序就空了。
-            #   存不上不影响本页显示（成绩已经算完了）。
-            self._save_archive()
+            archive_error = ""
 
         self._parsed = parsed
+        self._loaded_class_name = class_name
         self._results = results
         self._anchor_report = anchor_report
         self._source = _base_name(path)
@@ -1026,10 +1055,15 @@ class AnalysisPage(QWidget):
         self._refresh_flags()
         self._fill_table()
         self._update_status()
+        if archive_error:
+            self._status.setText(self._status.text() + "\n⚠ 成绩已计算，旧档案无法读取，本次未覆盖档案。")
+        else:
+            self._save_archive()
         # ★ 把这一班存进加密库（奖学金测算按班级取成绩）。
         #   存不上**不拦界面** —— 成绩已经算完并显示了，存班级只是顺带的事；
         #   真失败会在状态行里明说，不静默。
-        self._save_class(class_name, self._source)
+        self._save_student_roster(class_name)
+        self._save_class(class_name, self._source, source_scope.school_year)
         # ★ v1.9 二期 D3：这一批写进成绩历史表（覆盖 / 跳过按刚才问的结果）。
         #   **放在最后**：上面那些显示用的状态都落定了，写库失败只影响这一张表，
         #   状态行里明说一句就行（和"班级存不上"同一个待遇，不打断用户看成绩）。
@@ -1102,29 +1136,56 @@ class AnalysisPage(QWidget):
             self, "成绩历史已保存", conflict_result_text(counts)
         )
 
+    def forget_class(self, name: str, removed: tuple[str, ...]) -> None:
+        self._archive = None
+        if getattr(self, "_loaded_class_name", "") == name:
+            self._loaded_class_name = ""
+            self._parsed = None
+            self._results = {}
+            self._flags = {}
+            self._rows = []
+            self._anchor_report = None
+            self._source = ""
+            self._fill_table()
+            self._detail.setText("该班级已删除，可导入其他班级的成绩。")
+            self._update_status()
+            self.roster_changed.emit(self.roster())
+        else:
+            for sid in removed:
+                self.forget_student(sid)
+
+    def forget_student(self, sid: str, name: str = "") -> None:
+        """移除已删除学生的临时分析结果，同时丢弃旧归档缓存。"""
+        if self._archive is not None:
+            self._archive.remove_student(sid, name)
+        key = student_key(sid, name)
+        positions = [row.index for row in self._rows if row.key != key]
+        if len(positions) == len(self._rows):
+            return
+        self._rows = [
+            dataclasses.replace(self._rows[old], index=new)
+            for new, old in enumerate(positions)
+        ]
+        self._results = {
+            scope: [rows[i] for i in positions] for scope, rows in self._results.items()
+        }
+        self._flags = {
+            scope: [flags[i] for i in positions] for scope, flags in self._flags.items()
+        }
+        self._fill_table()
+        if not self._rows:
+            self._detail.setText("当前导入结果已没有学生。")
+        self._update_status()
+
     def _load_archive(self) -> Archive | None:
         """从加密库读回纵向归档，作为本次导入的 append 底座。
 
-        读不出来就返回 ``None`` —— ``build_archive`` 会把 ``None``
-        当成"新建一份"，也就是"这是这个用户的第一次导入"，不是错误。
-
-        ★ 优先用内存里那份（同一会话里连续导入两个学期时省一次解密），
-          但内存那份可能是**上一个用户**的，所以 ``set_user`` 会把它清掉。
+        每次从磁盘读取，避免带回已删除的数据。已有档案无法读取时禁止覆盖。
         """
-        if self._archive is not None:
-            return self._archive
         if not self._username:
             return None
-        try:
-            payload = load_user_json(self._store, self._username, ARCHIVE_FILE)
-        except (CryptoError, ValueError, OSError):
-            return None
-        if not isinstance(payload, dict):
-            return None
-        try:
-            return Archive.from_dict(payload)
-        except Exception:  # noqa: BLE001 - 坏档案不该拦住看数字
-            return None
+        payload = load_user_json(self._store, self._username, ARCHIVE_FILE, strict=True)
+        return Archive.from_dict(payload) if payload is not None else None
 
     def _save_archive(self) -> None:
         """把纵向归档写进加密库（成长档案页靠它跨重启存活）。
@@ -1143,13 +1204,23 @@ class AnalysisPage(QWidget):
         except (CryptoError, ValueError, OSError) as exc:
             self._note_class_failure(f"归档没能存进加密库（{type(exc).__name__}）")
 
-    def _save_class(self, class_name: str, source: str) -> None:
+    def _save_student_roster(self, class_name: str) -> None:
+        if not self._username:
+            return
+        students = [(row.student_id, row.student) for row in self._rows if row.student_id and row.student]
+        try:
+            StudentStore(store=self._store, username=self._username).upsert_import_many(students, class_name)
+        except (CryptoError, OSError, ValueError) as exc:
+            applog.write("import.roster", type(exc).__name__, root=self._store.root)
+            self._status.setText(self._status.text() + "\n⚠ 成绩已计算，学生主档未能保存。")
+
+    def _save_class(self, class_name: str, source: str, school_year: str = "") -> None:
         """把本班成绩快照写进加密库，并广播 ``class_saved``。"""
         if not self._username:
             self._note_class_failure("还没登录，班级数据没地方存")
             return
         try:
-            record = self._build_class_record(class_name, source)
+            record = self._build_class_record(class_name, source, school_year)
             save_class(self._store, self._username, record)
         except (CryptoError, ValueError, OSError) as exc:
             self._note_class_failure(f"{type(exc).__name__}: {exc}")

@@ -236,6 +236,31 @@ QPushButton#Ghost:hover   { background: #EFF6FF; border-color: #3B82F6; color: #
 QPushButton#Ghost:pressed { background: #DBEAFE; border-color: #2563EB; color: #2563EB; }
 QPushButton#Ghost:focus   { border-color: #3B82F6; }
 
+QToolButton#ModelPicker, QToolButton#ClassShortcuts {
+    background: #F8FAFC;
+    color: #334155;
+    border: 1px solid #D8E2EF;
+    border-radius: 8px;
+    padding: 5px 22px 5px 10px;
+    text-align: left;
+}
+QToolButton#ModelPicker:hover, QToolButton#ClassShortcuts:hover,
+QToolButton#ModelPicker:focus, QToolButton#ClassShortcuts:focus {
+    background: #EFF6FF;
+    border-color: #3B82F6;
+}
+QToolButton#ClassShortcuts:disabled { color: #94A3B8; }
+
+QTextEdit#chatInputEdit {
+    background: #FFFFFF;
+    color: #1E293B;
+    border: 1px solid #CEDBED;
+    border-radius: 8px;
+    padding: 7px;
+}
+QTextEdit#chatInputEdit:focus { border-color: #3B82F6; }
+QTextEdit#chatInputEdit:disabled { background: #F4F7FB; color: #64748B; }
+
 QPushButton#Danger {
     background: #FFFFFF;
     color: #EF4444;
@@ -402,6 +427,70 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
 
 /* --------------------------------------------------------------- 只读框 */
+QFrame#ProfilePanel, QFrame#ProfilePortrait {
+    background: #FFFFFF;
+    border: 1px solid #DAE4F0;
+    border-radius: 10px;
+}
+QFrame#ProfilePortrait {
+    background: #F6FAFF;
+    border-top: 3px solid #93B5E0;
+}
+QLabel#ProfileMetric {
+    color: #264F88;
+    background: #EAF3FE;
+    border-radius: 6px;
+    padding: 7px 11px;
+    font-size: 14px;
+    font-weight: 600;
+}
+QLabel#ProfileMetric[attention="true"] {
+    color: #8B391A;
+    background: #FFF0E6;
+}
+QLabel#ProfileMeta {
+    color: #526780;
+    font-size: 13px;
+}
+QTextEdit#ProfileDocument, QTextEdit#ProfileConversation {
+    background: #FBFDFF;
+    color: #172D4B;
+    border: 1px solid #CEDDEF;
+    border-radius: 8px;
+    font-size: 14px;
+    selection-background-color: #CFE3FE;
+    selection-color: #132D50;
+}
+QTextEdit#ProfileDocument:focus, QTextEdit#ProfileConversation:focus {
+    border-color: #729ACA;
+}
+QScrollArea#ProfileScroll QScrollBar:vertical,
+QTextEdit#ProfileDocument QScrollBar:vertical,
+QTextEdit#ProfileConversation QScrollBar:vertical {
+    width: 12px;
+    margin: 2px;
+    background: #EDF3FA;
+}
+QScrollArea#ProfileScroll QScrollBar::handle:vertical,
+QTextEdit#ProfileDocument QScrollBar::handle:vertical,
+QTextEdit#ProfileConversation QScrollBar::handle:vertical {
+    background: #A7BBD3;
+    min-height: 32px;
+}
+QSplitter#semesterSplitter::handle:horizontal {
+    background: #D6E3F1;
+    margin: 8px 4px;
+    border-radius: 2px;
+}
+QSplitter#semesterSplitter::handle:vertical {
+    background: #D6E3F1;
+    margin: 4px 8px;
+    border-radius: 2px;
+}
+QSplitter#semesterSplitter::handle:hover {
+    background: #9AB8DA;
+}
+
 QTextEdit#Outline {
     background: #F8FAFC;
     border: 1px solid #E2E8F0;

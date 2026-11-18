@@ -394,7 +394,8 @@ def test_ai_tab_has_a_card_a_read_only_view_and_an_input_row(page: ProfilePage) 
     assert inputs and inputs[0].isEnabled() is False      # 没选学生 → 还不能发
     buttons = [button.text() for button in ai.findChildren(QPushButton)]
     assert "发送" in buttons
-    assert "打开模型中心" in buttons
+    assert "下载推理核心" in buttons
+    assert "模型中心…" in [action.text() for action in page._model_center_btn.menu().actions()]
 
 
 def test_ai_tab_container_never_carries_a_graphics_effect(page: ProfilePage) -> None:
@@ -637,17 +638,18 @@ def test_missing_engine_quotes_the_reason_from_engine_available(
     )
     _show(page)
 
-    assert page._chat_status.text() == reason
+    assert "本机暂无推理核心" in page._chat_status.text()
+    assert page._chat_status.toolTip() == reason
     assert page._chat_input.isEnabled() is False
     # 模型是有的（只是引擎没装）→ **不**弹「打开模型中心」的按钮：
     # 那按钮治的是"缺模型"，跟"缺引擎"是两回事（点了也解决不了）。
     assert page._model_center_btn.isHidden() is True
 
 
-def test_both_missing_reports_both_reasons(
+def test_both_missing_shows_only_install_action(
     page: ProfilePage, vault: CryptoStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """引擎和模型都没有时**两条都要说** —— 只报一条会把人带进坑里。"""
+    """缺少运行核心时先完成安装，再选择模型。"""
     _seed(vault, grades=False)
     page.set_chat_models([])
     monkeypatch.setattr(
@@ -656,8 +658,10 @@ def test_both_missing_reports_both_reasons(
     _show(page)
 
     status = page._chat_status.text()
-    assert "引擎没装" in status
-    assert "请先在模型中心下载模型" in status
+    assert "本机暂无推理核心" in status
+    assert "模型中心" in status
+    assert not page._backend_setup_btn.isHidden()
+    assert page._model_center_btn.isHidden() and page._chat_send.isHidden()
 
 
 def test_model_center_button_reports_a_missing_dialog_instead_of_crashing(

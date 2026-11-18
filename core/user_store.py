@@ -23,9 +23,21 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
-from core.crypto_store import CryptoError, CryptoStore, load_encrypted, save_encrypted
+from core.crypto_store import (
+    CryptoError,
+    CryptoStore,
+    StoreCorruptError,
+    app_salt_path,
+    load_encrypted,
+    save_encrypted,
+)
+
+
+# 名单删除和德育分导入都在后台工作。它们必须串行读写班级和德育分文件。
+ROSTER_WRITE_LOCK = RLock()
 
 __all__ = [
     "STAMP_KEY",
@@ -53,19 +65,25 @@ def load_user_json(
     username: str,
     filename: str,
     default: Any = None,
+    *,
+    strict: bool = False,
 ) -> Any:
     """读回一份 JSON 载荷。
 
     读不出来（没登录 / 文件没有 / 解密失败 / 内容坏了）**一律返回 ``default``**，
     不抛异常 —— 这些都是便利数据，坏掉不该拦住用户看成绩。
-    真实原因由调用方按需自己再读一次。
+    写操作可用 strict=True 区分「没有文件」与「已有文件读不出来」。
     """
     path = user_file(store, username, filename)
     if path is None or not path.exists():
         return default
+    if strict and not app_salt_path(store.root).is_file():
+        raise StoreCorruptError("本地加密盐文件缺失，已有数据暂时无法读取。")
     try:
         return load_encrypted(path, root=store.root)
     except (CryptoError, OSError, ValueError):
+        if strict:
+            raise
         return default
 
 

@@ -70,15 +70,11 @@
 
 ### 方式一：下载安装包
 
-到 [Releases](https://gitee.com/wuhaotiansystem/transcript-lens/releases) 下载。
-发布包超过单文件上限时会切成多个分片，Windows 下用命令行合并即可：
+在 64 位 Windows 10/11 上，双击收到的 `成绩透析镜v<版本号>-安装向导.exe`，按提示选择安装位置。
+可从安装目录启动，也可以在向导中选建开始菜单快捷方式。单文件 `成绩透析镜v<版本号>.exe` 可直接运行。
 
-```bat
-copy /b transcript-lens-v1.9.3.exe.part1+transcript-lens-v1.9.3.exe.part2+transcript-lens-v1.9.3.exe.part3 transcript-lens.exe
-```
-
-> 三片合并后是 **240,408,108 字节**（约 229 MB）。合并完直接双击即可，
-> 第一次启动会自动把上一版的数据迁移到 1.9.3。
+公开附件请以 [GitHub Releases](https://github.com/wuhaotian-door/transcript-lens/releases)
+或 [Gitee Releases](https://gitee.com/wuhaotiansystem/transcript-lens/releases) 实际发布的版本为准。
 
 ### 方式二：从源码运行
 
@@ -106,8 +102,8 @@ pip install llama-cpp-python
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build_exe.ps1 -Both
 ```
 
-产物在 `dist\`：`transcript-lens.exe`（单文件，给别人用）与
-`transcript-lens-debug\`（目录版，带控制台，排错用）。
+打包后，`dist\transcript-lens.exe` 是本地运行入口，`release\成绩透析镜v<版本号>.exe` 是单文件分发包。
+要制作安装向导，参见 [Windows 分发与安装](docs/DISTRIBUTION.md#windows-安装向导)。
 
 单文件版启动时要先把自己解包到临时目录，个别机器的安全软件会拦这一步，报
 `[PYI-xxxx:ERROR] Could not create temporary directory!`。遇到时改用目录版，
@@ -119,7 +115,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build_exe.ps1 -Both
 2. 核对课程类别与学分 → 确认锚点校验 → 落库
 3. 左侧名单按口径看加权、预警；导出分析表
 4. **奖学金测算** → 导入德育分（可批量）→ 配额 → 出结果
-5. **侧写辅导 / 成长档案** → 发展意愿、辅导提纲、AI 侧写与谈话
+5. **成长档案** → 个人专属侧写查看所有已导入学期，学期侧写查看该学期明细
 6. **设置** → 在线更新、GPA 方案、删除成绩库（会先盘点并二次确认）
 
 ## 项目结构
