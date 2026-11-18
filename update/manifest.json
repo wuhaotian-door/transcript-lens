@@ -3,14 +3,14 @@
   "version": "1.9.7",
   "published": "2026-11-18",
   "_doc": [
-    "程序更新清单。已部署的客户端从 Gitee master 读取，GitHub master 同步保存同一份清单。",
+    "GitHub 是主仓库。Gitee master 保存相同的清单，供现有客户端读取。",
     "用顶层 app 段提供经过公开下载验证的程序附件。单文件需要 url、size、sha256。分片时填写整包 size、sha256 和按拼接顺序排列的 parts。",
     "发布后通过公开直链下载并核对字节数与 SHA-256，再提交清单并检查客户端能够发现更新。"
   ],
   "app": {
-    "url": "https://github.com/wuhaotian-door/transcript-lens/releases/download/v1.9.7/v1.9.7.exe",
-    "size": 240754777,
-    "sha256": "911557094c1951f3bba806d474809621d86a3ed5ceabe981735a85ad6b54484c",
-    "notes": "全学期个人专属侧写，精简设置与个人中心，优化班级操作与学年奖学金测算。"
+    "url": "https://github.com/wuhaotian-door/transcript-lens/releases/download/v1.9.7/transcript-lens-v1.9.7.exe",
+    "size": 240754093,
+    "sha256": "8c5c8589faeed4ff5915ffb7e3941847d04ac6ac0db02f5bbeacd153f13ababb",
+    "notes": "修复下载在 100% 卡住和自动重启报错，显示预计剩余时间，并在安装准备完成后确认重启。"
   }
 }
