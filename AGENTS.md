@@ -1040,6 +1040,6 @@ v1.9.2 之后连着报了四个现场：登录卡住、迁移报错、exe 起不
 * 保留当前版本成品、校验文件和验证记录。不能因此删除用户数据、数据迁移备份、
   `%LOCALAPPDATA%/SGMS/` 内容、源码或尚未提交的改动；远端历史发行版也不在本地清理范围内。
 * 不再额外保留本项目本地旧 exe 备份；需要旧版时从已发布的发行版获取。
-* 本地入口固定为 `dist/transcript-lens.exe`。对外发布使用 `成绩透析镜v<版本>.exe`，
-  例如 `成绩透析镜v1.9.5.exe`。正式打包时读取 `core/version.py` 的 `CURRENT_VERSION`，在 `release/` 生成发布包。
+* 本地入口固定为 `dist/transcript-lens.exe`。对外发布使用 `成绩单透镜v<版本>.exe`，
+  例如 `成绩单透镜v1.9.5.exe`。正式打包时读取 `core/version.py` 的 `CURRENT_VERSION`，在 `release/` 生成发布包。
 * Windows 可执行文件和应用窗口共用 `ui/assets/app.ico`。

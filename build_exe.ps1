@@ -460,7 +460,7 @@ if (($Both -or $Target -eq 'release') -and -not $ShowConsole) {
     if ($LASTEXITCODE -ne 0 -or -not $version) { throw '读取发布版本号失败' }
     $releaseDir = Join-Path $Root 'release'
     New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
-    $releaseExe = Join-Path $releaseDir "成绩透析镜v${version}.exe"
+    $releaseExe = Join-Path $releaseDir "成绩单透镜v${version}.exe"
     Copy-Item -LiteralPath (Join-Path $Root 'dist\transcript-lens.exe') -Destination $releaseExe -Force
     $built += $releaseExe
 }

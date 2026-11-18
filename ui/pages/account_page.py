@@ -46,11 +46,12 @@ from PySide6.QtWidgets import (
 )
 
 from core.crypto_store import CryptoError, CryptoStore, WrongPasswordError
-from core.email_recovery import send_recovery_mail
+from core.email_recovery import mail_configured, send_recovery_mail
 from core.recovery import RecoveryError, enable_recovery, recovery_info
 from core.session_token import clear_token
 from core.version import CURRENT_VERSION
 from ui.anim import make_card
+from ui.recovery_code_dialog import show_recovery_code
 from ui.workers import run_async
 from ui.widgets.profile_reading import profile_scroll
 
@@ -97,6 +98,8 @@ class AccountPage(QWidget):
         super().__init__(parent)
         self._store = store if store is not None else CryptoStore(root)
         self._data_root = root
+        #: v1.9.8：没有发信配置时，新找回码直接显示，不寄邮件。
+        self._mail_ready = mail_configured(root)
         self._username = ""
         self._build()
 
@@ -218,7 +221,10 @@ class AccountPage(QWidget):
         self._recovery_note.show()
         self._regen_btn.setEnabled(True)
         if info["enabled"]:
-            self._recovery_note.setText(f"找回邮箱 {_mask_email(info['email'])}")
+            if info["email"]:
+                self._recovery_note.setText(f"找回邮箱 {_mask_email(info['email'])}")
+            else:
+                self._recovery_note.setText("找回码已设置（本机未绑定邮箱）")
             self._regen_btn.setText("重新生成找回码")
         else:
             self._recovery_note.setText("尚未设置找回码")
@@ -241,12 +247,12 @@ class AccountPage(QWidget):
             QMessageBox.warning(self, "还没有登录", "请先登录。")
             return
 
-        dialog = _PasswordDialog(self._username, parent=self)
+        dialog = _PasswordDialog(self._username, ask_email=self._mail_ready, parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         password = dialog.password
         email = dialog.email
-        if not password or not email:
+        if not password or (self._mail_ready and not email):
             return
 
         self._regen_btn.setEnabled(False)
@@ -258,21 +264,28 @@ class AccountPage(QWidget):
             session = self._store.login(self._username, password)
             # ② 生成新包裹（旧码立刻作废）
             code = enable_recovery(session, email, store=self._store)
-            # ③ 寄出
-            send_recovery_mail(email, code, username=self._username, root=self._data_root)
-            return email
+            # ③ 能发信就寄出；不能就交给界面直接显示（v1.9.8 本地模式）
+            if self._mail_ready:
+                send_recovery_mail(
+                    email, code, username=self._username, root=self._data_root
+                )
+            return code
 
-        def _done(target: str) -> None:
+        def _done(code: str) -> None:
             self._regen_btn.setEnabled(True)
             self._regen_btn.setText("重新生成找回码")
             self._refresh_recovery()
-            self._set_regen(f"新的找回码已寄到 {_mask_email(target)}，旧的已作废。")
-            QMessageBox.information(
-                self,
-                "新的找回码已寄出",
-                f"新找回码已经发到：\n{target}\n\n"
-                "旧的那串立刻作废，请把旧邮件删掉，只留新的这一封。",
-            )
+            if self._mail_ready:
+                self._set_regen(f"新的找回码已寄到 {_mask_email(email)}，旧的已作废。")
+                QMessageBox.information(
+                    self,
+                    "新的找回码已寄出",
+                    f"新找回码已经发到：\n{email}\n\n"
+                    "旧的那串立刻作废，请把旧邮件删掉，只留新的这一封。",
+                )
+            else:
+                self._set_regen("新的找回码已生成（本机未配置邮箱，只在屏幕上显示），旧的已作废。")
+                show_recovery_code(self, code)
 
         def _failed(exc: BaseException) -> None:
             self._regen_btn.setEnabled(True)
@@ -336,12 +349,17 @@ class AccountPage(QWidget):
             except Exception:  # noqa: BLE001 - 清不掉也要能继续用
                 token_note = ""
             self._set_pwd_status(f"「{name}」的密码已更新。{token_note}")
+            code_hint = (
+                "· 邮箱里的找回码依然有效 —— 它包的是同一把库密钥。\n"
+                if self._mail_ready
+                else "· 你保存的那串找回码依然有效 —— 它包的是同一把库密钥。\n"
+            )
             QMessageBox.information(
                 self,
                 "密码已修改",
                 f"账户「{name}」的密码已经改好。\n\n"
                 "· 成绩库没有被重新加密，一条数据都没动。\n"
-                "· 邮箱里的**找回码依然有效** —— 它包的是同一把库密钥。\n"
+                + code_hint
                 + (f"· {token_note}\n" if token_note else ""),
             )
 
@@ -445,12 +463,22 @@ class _ChangePasswordDialog(QDialog):
 
 
 class _PasswordDialog(QDialog):
-    """要密码 + 找回邮箱的小框。密码只在内存里待一会儿，不落盘、不打日志。"""
+    """要密码（能发信时再要一个邮箱）的小框。
 
-    def __init__(self, username: str, parent: QWidget | None = None) -> None:
+    密码只在内存里待一会儿，不落盘、不打日志。
+    """
+
+    def __init__(
+        self,
+        username: str,
+        *,
+        ask_email: bool = True,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.password = ""
         self.email = ""
+        self._ask_email = bool(ask_email)
         self.setWindowTitle("重新生成找回码")
         self.setModal(True)
         self.setMinimumWidth(460)
@@ -463,7 +491,14 @@ class _PasswordDialog(QDialog):
         title.setObjectName("H2")
         box.addWidget(title)
 
-        note = QLabel("新找回码发送成功后，旧找回码失效。")
+        if self._ask_email:
+            note_text = "新找回码发送成功后，旧找回码失效。"
+        else:
+            note_text = (
+                "本机没有配置发信服务：新找回码生成后会直接显示在屏幕上，请当场保存。"
+                "旧的立刻失效。"
+            )
+        note = QLabel(note_text)
         note.setObjectName("Muted")
         note.setWordWrap(True)
         box.addWidget(note)
@@ -474,18 +509,20 @@ class _PasswordDialog(QDialog):
         self._pass.setMinimumHeight(36)
         box.addWidget(self._pass)
 
-        box.addWidget(QLabel("接收找回码的邮箱"))
+        #: 邮箱框只在能真发信时才需要用；本地模式下不创建、不显示。
         self._email = QLineEdit()
-        self._email.setPlaceholderText("you@163.com")
-        self._email.setMinimumHeight(36)
-        box.addWidget(self._email)
+        if self._ask_email:
+            box.addWidget(QLabel("接收找回码的邮箱"))
+            self._email.setPlaceholderText("you@163.com")
+            self._email.setMinimumHeight(36)
+            box.addWidget(self._email)
 
         buttons = QDialogButtonBox()
         cancel = QPushButton("取消")
         cancel.setObjectName("Ghost")
         cancel.clicked.connect(self.reject)
         buttons.addButton(cancel, QDialogButtonBox.ButtonRole.RejectRole)
-        ok = QPushButton("生成并寄出")
+        ok = QPushButton("生成并寄出" if self._ask_email else "生成找回码")
         ok.setObjectName("Primary")
         ok.setDefault(True)
         ok.clicked.connect(self._accept)
@@ -498,11 +535,13 @@ class _PasswordDialog(QDialog):
         if not self._pass.text():
             QMessageBox.warning(self, "还差一点", "请输入密码。")
             return
-        try:
-            email = normalize_email(self._email.text())
-        except EmailCodeError as exc:
-            QMessageBox.warning(self, "邮箱不对", str(exc))
-            return
+        email = ""
+        if self._ask_email:
+            try:
+                email = normalize_email(self._email.text())
+            except EmailCodeError as exc:
+                QMessageBox.warning(self, "邮箱不对", str(exc))
+                return
         self.password = self._pass.text()
         self.email = email
         self.accept()

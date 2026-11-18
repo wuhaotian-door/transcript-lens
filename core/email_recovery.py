@@ -432,6 +432,26 @@ def get_sender(root: str | Path | None = None) -> EmailSender:
     return NotImplementedSender()
 
 
+def mail_configured(root: str | Path | None = None) -> bool:
+    """本机能不能真发信。
+
+    v1.9.8 起这是**注册流程的分岔口**：
+
+    * ``True`` —— 走原来的"邮箱验证码 + 找回码寄到邮箱"；
+    * ``False`` —— 走**本地模式**：不要求邮箱，注册成功后把找回码直接显示在
+      屏幕上让用户当场保存（安装包不带 ``email.json``，公开仓库也不该带
+      凭据，所以这是新用户的默认路径）。
+
+    ★ 配置文件**写坏了**也算 False：一个坏掉的 JSON 不该让注册彻底卡死
+      —— 用户至少还能在本地模式里建号、拿到找回码。
+    """
+    try:
+        config = load_config(root)
+    except EmailSendError:
+        return False
+    return config.provider == "smtp" and config.configured
+
+
 # ---------------------------------------------------------------------------
 # 业务入口
 # ---------------------------------------------------------------------------

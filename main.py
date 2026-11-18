@@ -86,6 +86,7 @@ CHECK_MODULES: tuple[str, ...] = (
     "ui.flags",
     "ui.review_dialog",
     "ui.recover_dialog",
+    "ui.recovery_code_dialog",
     "ui.login_window",
     "ui.main_window",
     "ui.moral_import_dialog",

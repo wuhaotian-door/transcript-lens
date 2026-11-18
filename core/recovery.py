@@ -324,18 +324,23 @@ def recovery_info(store: CryptoStore, username: str) -> dict[str, Any]:
 def enable_recovery(session: UserSession, email: str, *, store: CryptoStore) -> str:
     """生成（或重新生成）恢复码，**返回那串码**。
 
-    调用方必须立刻把它交给 :func:`core.email_recovery.send_recovery_mail`
-    寄出去 —— 本地**不留明文**，这次不寄就永远拿不到了。
+    调用方必须立刻把它交给用户 —— 寄到邮箱，或者在屏幕上直接展示让用户抄下来
+    （见 v1.9.8 的本地模式）。本地**不留明文**，这次不交出去就永远拿不到了。
+
+    ★ ``email`` 可以为空：v1.9.8 起，本机没有配置发信服务时注册不强制邮箱，
+      找回码直接显示在界面上。空邮箱只是"没绑定邮箱"，包裹本身照常工作。
 
     ★ 旧码会被直接覆盖作废（同一个文件只有一个包裹）。
 
     Raises:
-        RecoveryError: 库密钥为空（说明 session 不是登录得来的）。
+        RecoveryError: 库密钥为空（说明 session 不是登录得来的）；
+            或者给了非空邮箱但格式不对。
     """
     if not session.key:
         raise RecoveryError("这个会话没有库密钥，无法生成恢复码（请重新登录）")
 
-    target = normalize_email(email)
+    email_text = str(email or "").strip()
+    target = normalize_email(email_text) if email_text else ""
     code = generate_recovery_code()
     canonical = normalize_recovery_code(code)
     salt = new_salt()

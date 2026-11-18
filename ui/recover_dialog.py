@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.crypto_store import CryptoError, CryptoStore
+from core.email_recovery import mail_configured
 from core.recovery import (
     RECOVERY_CODE_LENGTH,
     RecoveryError,
@@ -75,6 +76,8 @@ class RecoverDialog(QDialog):
         self._store = store
         self._data_root = root
         self._busy = False
+        #: v1.9.8：没有发信配置时，找回码是注册时**显示在屏幕上**的那一串。
+        self._mail_ready = mail_configured(root)
         self.username = ""
 
         self.setWindowTitle("找回密码")
@@ -93,11 +96,19 @@ class RecoverDialog(QDialog):
         title.setObjectName("H1")
         box.addWidget(title)
 
-        hint = QLabel(
-            "找回码在你注册成功时收到的那封邮件里"
-            "（主题：【成绩单透镜】密码找回码）。\n"
-            "把它整串复制过来即可，横杠带不带都行。"
-        )
+        if self._mail_ready:
+            hint_text = (
+                "找回码在你注册成功时收到的那封邮件里"
+                "（主题：【成绩单透镜】密码找回码）。\n"
+                "把它整串复制过来即可，横杠带不带都行。"
+            )
+        else:
+            hint_text = (
+                "本机没有配置发信服务，找回码不会寄邮件 —— 它在你注册成功时"
+                "直接显示在屏幕上（注册时如果没保存，就没有了）。\n"
+                "把它整串填进来即可，横杠带不带都行。"
+            )
+        hint = QLabel(hint_text)
         hint.setObjectName("Notice")
         hint.setWordWrap(True)
         box.addWidget(hint)
@@ -176,13 +187,16 @@ class RecoverDialog(QDialog):
             return
         info = recovery_info(self._store, name)
         if info["enabled"]:
-            self._email_label.setText(_mask_email(info["email"]))
+            if info["email"]:
+                self._email_label.setText(_mask_email(info["email"]))
+            else:
+                self._email_label.setText("（本机未绑定邮箱）")
             self._status.setText("")
         else:
             self._email_label.setText("（没有绑定找回码）")
             self._status.setText(
-                f"「{name}」没有可用的找回码 —— 注册时那封邮件没寄出去，"
-                "或者账户是旧版本建的。没有它，密码忘了就打不开了。"
+                f"「{name}」没有可用的找回码 —— 账户是旧版本建的，"
+                "或者注册时没有完成。没有它，密码忘了就打不开了。"
             )
 
     # ---------------------------------------------------------------- 动作
