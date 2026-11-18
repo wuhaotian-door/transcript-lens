@@ -395,7 +395,7 @@ def test_ai_tab_has_a_card_a_read_only_view_and_an_input_row(page: ProfilePage) 
     buttons = [button.text() for button in ai.findChildren(QPushButton)]
     assert "发送" in buttons
     assert "下载推理核心" in buttons
-    assert "模型中心…" in [action.text() for action in page._model_center_btn.menu().actions()]
+    assert "前往模型中心" in [action.text() for action in page._model_center_btn.menu().actions()]
 
 
 def test_ai_tab_container_never_carries_a_graphics_effect(page: ProfilePage) -> None:

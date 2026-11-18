@@ -1,15 +1,4 @@
-"""六个页面。
-
-     analysis_page      📊 智育分析     ← 唯一接真逻辑
-     profile_page       🎯 侧写辅导     ← 核心新增（三层）
-     archive_page       📈 成长档案     占位
-     scholarship_page   💰 奖学金测算   纯壳，零逻辑
-     settings_page      ⚙️ 设置         导出 / 清库 / AI / 更新
-     account_page       👤 个人中心
-
-★ 命名提醒：Spec 六 把「侧写辅导」定名为 ``profile_page``，
-  所以"个人中心"是 :mod:`ui.pages.account_page`。别搜错。
-"""
+"""主窗口页面及独立侧写组件。"""
 
 from ui.pages.account_page import AccountPage
 from ui.pages.analysis_page import AnalysisPage

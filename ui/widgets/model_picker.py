@@ -15,7 +15,6 @@ def model_label(model) -> str:
 class ModelPicker(QToolButton):
     model_selected = Signal(object)
     library_requested = Signal()
-    settings_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -35,8 +34,7 @@ class ModelPicker(QToolButton):
             action.triggered.connect(lambda _checked=False, value=model: self.model_selected.emit(value))
         if models:
             self._menu.addSeparator()
-        self._menu.addAction("模型中心…", self.library_requested.emit)
-        self._menu.addAction("模型配置…", self.settings_requested.emit)
+        self._menu.addAction("前往模型中心", self.library_requested.emit)
         label = model_label(selected) if selected is not None else ""
         self.setText(f"当前模型  {label[:22]}{'…' if len(label) > 22 else ''}" if label else "选择模型")
-        self.setToolTip(label or "选择本地模型，或前往模型配置")
+        self.setToolTip(label or "选择本地模型，或前往模型中心")

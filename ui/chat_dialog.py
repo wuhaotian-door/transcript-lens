@@ -412,8 +412,7 @@ class ChatDialog(QDialog):
 
         self._model_picker = ModelPicker(self)
         self._model_picker.model_selected.connect(self._pick_model)
-        self._model_picker.library_requested.connect(self._open_model_center)
-        self._model_picker.settings_requested.connect(self._open_model_settings)
+        self._model_picker.library_requested.connect(self._open_model_settings)
         action_row.addWidget(self._model_picker)
         action_row.addStretch()
 
@@ -461,13 +460,13 @@ class ChatDialog(QDialog):
     def _open_model_settings(self) -> None:
         parent = self.parentWidget()
         request = getattr(parent, "model_settings_requested", None)
-        navigate = getattr(parent.window(), "_go_model_settings", None) if parent else None
-        if request is not None:
-            self.close()
-            request.emit()
-        elif callable(navigate):
-            self.close()
-            navigate()
+        navigate = getattr(parent.window(), "_go_model_center", None) if parent else None
+        if callable(navigate):
+            if self.close():
+                if request is not None:
+                    request.emit()
+                else:
+                    navigate()
         else:
             self._open_model_center()
 

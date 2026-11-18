@@ -40,6 +40,7 @@
 
 from __future__ import annotations
 
+import logging
 import traceback
 
 from PySide6.QtCore import QTimer, Qt, Signal
@@ -67,6 +68,7 @@ from ui.frameless import (
     toggle_maximize,
 )
 from ui.intentions import load_intentions
+from ui.pages.model_center_page import ModelCenterPage
 from ui.pages import (
     AccountPage,
     AnalysisPage,
@@ -79,6 +81,7 @@ from ui.pages import (
 __all__ = ["APP_NAME", "MainWindow", "NAV_ITEMS", "PROFILE_NAV_KEY", "TOPBAR_HEIGHT"]
 
 #: 本模块的日志器。补档失败**只记 warning**，绝不影响导入结果、绝不弹窗。
+logger = logging.getLogger(__name__)
 
 #: 程序名（侧栏顶部）
 APP_NAME = "成绩单透镜"
@@ -104,6 +107,7 @@ NAV_ITEMS: tuple[tuple[str, str], ...] = (
     ("analysis", "📊  智育分析"),
     ("archive", "📈  成长档案"),
     ("scholarship", "💰  奖学金测算"),
+    ("models", "🧩  模型中心"),
     ("settings", "⚙️  设置"),
     ("account", "👤  个人中心"),
 )
@@ -175,10 +179,10 @@ class MainWindow(QMainWindow):
         right.addWidget(self._stack, 1)
         body.addLayout(right, 1)
 
-        # --- 五个页面 ---
         self.analysis_page = AnalysisPage(self._store)
         self.archive_page = ArchivePage(self._store)
         self.scholarship_page = ScholarshipPage(self._store)
+        self.model_center_page = ModelCenterPage(self._store)
         self.settings_page = SettingsPage(self._store, self._data_root)
         self.account_page = AccountPage(self._store, self._data_root)
         self.profile_page = None
@@ -187,6 +191,7 @@ class MainWindow(QMainWindow):
             self.analysis_page,
             self.archive_page,
             self.scholarship_page,
+            self.model_center_page,
             self.settings_page,
             self.account_page,
         ):
@@ -296,24 +301,33 @@ class MainWindow(QMainWindow):
         self.analysis_page.class_saved.connect(self._on_class_saved)
         self.archive_page.student_deleted.connect(self._on_student_deleted, Qt.ConnectionType.QueuedConnection)
         self.archive_page.class_deleted.connect(self._on_class_deleted, Qt.ConnectionType.QueuedConnection)
-        self.archive_page.model_settings_requested.connect(self._go_model_settings)
+        self.archive_page.model_settings_requested.connect(self._go_model_center)
         # ★ v1.9.1：设置页删完成绩库 → 别的页面读的是**同一个库**，
         #   不刷新就会继续显示已经删掉的学生（AGENTS §18：一处真源 + 信号刷新）。
         #   ★ 这条信号原先**没有接收方**（第一波只把发射端做出来了）。
         self.settings_page.library_cleared.connect(self._on_library_cleared)
+        self.settings_page.gpa_scheme_changed.connect(self._refresh_gpa_scheme)
 
     # ---------------------------------------------------------------- 对外
     def set_user(self, username: str) -> None:
-        """设置当前用户，并把五个页面各自的用户相关状态刷新一遍。"""
+        """设置当前用户并刷新各页的用户相关状态。"""
         self._username = username or ""
         self._user_label.setText(self._username or "（未登录）")
         self.analysis_page.set_user(self._username)
         self.archive_page.set_user(self._username)
         self.scholarship_page.set_user(self._username)
+        self.model_center_page.set_user(self._username)
         self.settings_page.set_user(self._username)
+        self._refresh_gpa_scheme()
         self.account_page.set_user(self._username)
         if self.profile_page is not None:
             self.profile_page.set_user(self._username)
+
+    def _refresh_gpa_scheme(self, _scheme_id: str = "") -> None:
+        try:
+            self.archive_page.set_gpa_scheme(self.settings_page.gpa_definition())
+        except (TypeError, ValueError, RuntimeError):
+            logger.exception("刷新档案 GPA 失败")
 
     def _on_class_saved(self, class_name: str) -> None:
         """刚导入了一个班 —— 让奖学金页和成长档案页立刻能看到新数据。
@@ -332,9 +346,8 @@ class MainWindow(QMainWindow):
         except Exception:  # noqa: BLE001
             traceback.print_exc()
 
-    def _go_model_settings(self) -> None:
-        self.goto(self._stack.indexOf(self.settings_page))
-        self.settings_page.focus_model_settings()
+    def _go_model_center(self) -> None:
+        self.goto(self._stack.indexOf(self.model_center_page))
 
     def _on_class_deleted(self, class_name: str, removed: tuple[str, ...]) -> None:
         self.analysis_page.forget_class(class_name, removed)

@@ -202,6 +202,11 @@ class ArchivePage(QWidget):
         self._book = open_student_book(self._store, self._username) if self._username else None
         self.reload()
 
+    def set_gpa_scheme(self, scheme: Any) -> None:
+        self._overview_page.set_gpa_scheme(scheme)
+        if self._semester_page is not None:
+            self._semester_page.set_gpa_scheme(scheme)
+
     def set_archive(self, archive: Archive | None) -> None:
         """直接塞一份现成的归档（智育分析页刚导入完时用，省一次解密）。"""
         self._archive = archive

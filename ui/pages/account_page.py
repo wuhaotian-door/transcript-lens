@@ -35,6 +35,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -63,7 +64,7 @@ __all__ = ["AccountPage"]
 MIN_PASSWORD_LENGTH = 8
 
 _ABOUT = (
-    ("程序", "成绩单透镜 · transcript-lens"),
+    ("程序", "成绩单透镜"),
     # ★ v1.8 修正：这里原来硬编码 "v1.0"（charter v1.8 第五节点名的旧 bug）。
     ("版本", f"v{CURRENT_VERSION}"),
 )
@@ -117,70 +118,88 @@ class AccountPage(QWidget):
         title.setObjectName("H1")
         box.addWidget(title)
 
-        account = make_card()
-        account_box = QVBoxLayout(account)
-        account_box.setContentsMargins(20, 16, 20, 16)
-        account_box.setSpacing(10)
-        row = QHBoxLayout()
-        info = QVBoxLayout()
-        info.setSpacing(3)
-        heading = QLabel("当前账号")
-        heading.setObjectName("ProfileMeta")
-        info.addWidget(heading)
+        account = make_card(shadow=False)
+        account_row = QHBoxLayout(account)
+        account_row.setContentsMargins(22, 18, 22, 18)
+        identity = QVBoxLayout()
+        identity.setSpacing(4)
+        current = QLabel("当前账号")
+        current.setObjectName("ProfileMeta")
+        identity.addWidget(current)
         self._user_label = QLabel("未登录")
         self._user_label.setObjectName("H2")
         self._user_label.setWordWrap(True)
-        info.addWidget(self._user_label)
-        row.addLayout(info, 1)
+        identity.addWidget(self._user_label)
+        account_row.addLayout(identity, 1)
+
         switch = QPushButton("切换账号")
         switch.setObjectName("Ghost")
-        switch.setMinimumHeight(34)
+        switch.setMinimumHeight(36)
         switch.clicked.connect(self._do_switch)
-        row.addWidget(switch)
-        self._pwd_btn = QPushButton("修改密码")
-        self._pwd_btn.setObjectName("Ghost")
-        self._pwd_btn.setMinimumHeight(34)
-        self._pwd_btn.clicked.connect(self._do_change_password)
-        row.addWidget(self._pwd_btn)
-        account_box.addLayout(row)
-        self._pwd_status = QLabel("")
-        self._pwd_status.setObjectName("Muted")
-        self._pwd_status.setWordWrap(True)
-        account_box.addWidget(self._pwd_status)
+        account_row.addWidget(switch)
         box.addWidget(account)
 
-        recovery = make_card()
-        rec_box = QVBoxLayout(recovery)
-        rec_box.setContentsMargins(20, 16, 20, 16)
-        rec_box.setSpacing(10)
-        rec = QHBoxLayout()
-        recovery_text = QVBoxLayout()
-        recovery_text.setSpacing(3)
-        recovery_text.addWidget(self._section("密码找回"))
-        self._recovery_note = QLabel("")
+        security = make_card(shadow=False)
+        security_box = QVBoxLayout(security)
+        security_box.setContentsMargins(22, 16, 22, 16)
+        security_box.setSpacing(12)
+        security_box.addWidget(self._section("账号安全"))
+
+        self._pwd_btn = QPushButton("修改密码")
+        self._pwd_btn.clicked.connect(self._do_change_password)
+        self._pwd_status = QLabel()
+        security_box.addLayout(self._action_row("登录密码", self._pwd_btn, self._pwd_status))
+
+        divider = QFrame()
+        divider.setFixedHeight(1)
+        divider.setStyleSheet("background: #E2E8F0; border: none;")
+        security_box.addWidget(divider)
+
+        self._regen_btn = QPushButton("生成找回码")
+        self._regen_btn.clicked.connect(self._do_regen)
+        self._regen_status = QLabel()
+        self._recovery_note = QLabel()
         self._recovery_note.setObjectName("Muted")
         self._recovery_note.setWordWrap(True)
-        recovery_text.addWidget(self._recovery_note)
-        rec.addLayout(recovery_text, 1)
-        self._regen_btn = QPushButton("生成找回码")
-        self._regen_btn.setObjectName("Ghost")
-        self._regen_btn.setMinimumHeight(34)
-        self._regen_btn.clicked.connect(self._do_regen)
-        rec.addWidget(self._regen_btn)
-        rec_box.addLayout(rec)
-        self._regen_status = QLabel("")
-        self._regen_status.setObjectName("Muted")
-        self._regen_status.setWordWrap(True)
-        rec_box.addWidget(self._regen_status)
-        box.addWidget(recovery)
+        security_box.addLayout(self._action_row(
+            "密码找回", self._regen_btn, self._regen_status, self._recovery_note,
+        ))
+        box.addWidget(security)
 
-        about = QLabel("  ·  ".join(value for _, value in _ABOUT))
-        about.setObjectName("ProfileMeta")
-        about.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        about.setWordWrap(True)
+        about = make_card(shadow=False)
+        about_row = QHBoxLayout(about)
+        about_row.setContentsMargins(22, 14, 22, 14)
+        about_row.addWidget(self._section("关于"))
+        version = QLabel("  ·  ".join(value for _, value in _ABOUT))
+        version.setObjectName("Muted")
+        version.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        version.setWordWrap(True)
+        about_row.addWidget(version, 1)
         box.addWidget(about)
         box.addStretch()
         outer.addWidget(profile_scroll(body))
+
+    @staticmethod
+    def _action_row(
+        text: str, button: QPushButton, status: QLabel, detail: QLabel | None = None,
+    ) -> QHBoxLayout:
+        row = QHBoxLayout()
+        content = QVBoxLayout()
+        content.setSpacing(4)
+        title = QLabel(text)
+        title.setObjectName("H3")
+        content.addWidget(title)
+        if detail is not None:
+            content.addWidget(detail)
+        status.setObjectName("Muted")
+        status.setWordWrap(True)
+        status.hide()
+        content.addWidget(status)
+        row.addLayout(content, 1)
+        button.setObjectName("Ghost")
+        button.setMinimumSize(128, 36)
+        row.addWidget(button)
+        return row
 
     @staticmethod
     def _section(text: str) -> QLabel:
@@ -191,10 +210,12 @@ class AccountPage(QWidget):
     # ---------------------------------------------------------------- 状态
     def _refresh_recovery(self) -> None:
         if not self._username:
-            self._recovery_note.setText("还没有登录。")
+            self._recovery_note.clear()
+            self._recovery_note.hide()
             self._regen_btn.setEnabled(False)
             return
         info = recovery_info(self._store, self._username)
+        self._recovery_note.show()
         self._regen_btn.setEnabled(True)
         if info["enabled"]:
             self._recovery_note.setText(f"找回邮箱 {_mask_email(info['email'])}")
@@ -270,6 +291,7 @@ class AccountPage(QWidget):
     def _set_regen(self, text: str, *, error: bool = False) -> None:
         self._regen_status.setObjectName("Danger" if error else "Muted")
         self._regen_status.setText(text)
+        self._regen_status.setVisible(bool(text))
         self._regen_status.style().unpolish(self._regen_status)
         self._regen_status.style().polish(self._regen_status)
 
@@ -340,6 +362,7 @@ class AccountPage(QWidget):
     def _set_pwd_status(self, text: str, *, error: bool = False) -> None:
         self._pwd_status.setObjectName("Danger" if error else "Muted")
         self._pwd_status.setText(text)
+        self._pwd_status.setVisible(bool(text))
         self._pwd_status.style().unpolish(self._pwd_status)
         self._pwd_status.style().polish(self._pwd_status)
 

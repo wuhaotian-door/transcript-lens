@@ -653,19 +653,15 @@ def test_field_aliases_and_objects() -> None:
     assert gpa_of([Course(85, 2.0)]) == pytest.approx(3.7)
 
 
-def test_only_scheme_one_is_available() -> None:
+def test_all_presets_are_available() -> None:
     options = scheme_options()
-    assert [o["id"] for o in options] == [SCHEME_STANDARD_4, "scheme2", "scheme3", "scheme4"]
-    assert options[0]["available"] is True
-    assert all(o["available"] is False for o in options[1:])
-    assert all("待定" in o["label"] for o in options[1:])
-
-    assert available_schemes() == [SCHEME_STANDARD_4]
+    assert [o["id"] for o in options] == available_schemes()
+    assert len(options) == 6
+    assert all(o["available"] is True for o in options)
     assert DEFAULT_SCHEME == SCHEME_STANDARD_4
     assert is_available(DEFAULT_SCHEME) is True
     assert is_available("scheme2") is False
     assert is_available(None) is True            # None = 缺省方案
-    assert scheme_label("scheme2") == "方案 2（待定）"
     assert scheme_label("不认识") == "不认识"      # 原样返回，界面上看得出不对
 
 
@@ -908,22 +904,20 @@ def test_settings_text_has_no_markdown(store: CryptoStore) -> None:
             assert token not in text, f"界面文案里有 Markdown 记号：{text!r}"
 
 
-def test_settings_gpa_combo_shows_only_scheme_one_as_usable(store: CryptoStore) -> None:
+def test_settings_gpa_combo_can_save_a_new_preset(store: CryptoStore) -> None:
     pytest.importorskip("PySide6")
 
     _, page = _settings_page(store)
     combo = page._gpa_combo
 
-    assert combo.count() == len(scheme_options())
+    assert combo.count() == len(scheme_options()) + 1
     assert combo.currentData() == DEFAULT_SCHEME
     assert page._gpa_status.text().startswith("当前方案")
 
     model = combo.model()
-    assert model.item(0).isEnabled() is True
-    assert all(model.item(i).isEnabled() is False for i in range(1, combo.count()))
-
-    page._on_gpa_scheme_changed(0)
-    assert load_scheme(store, USER) == DEFAULT_SCHEME
+    assert all(model.item(i).isEnabled() for i in range(combo.count()))
+    combo.setCurrentIndex(combo.findData("standard4_band"))
+    assert load_scheme(store, USER) == "standard4_band"
     assert user_file(store, USER, GPA_SETTINGS_FILE).exists()
 
 # ---------------------------------------------------------------------------

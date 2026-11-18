@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from core.gpa import DEFAULT_SCHEME, resolve_scheme, scheme_label
 from ui.anim import make_card
 from ui.pages.profile_shared import (
     course_rows_from_archive, group_grades_by_term, history_rows_for,
@@ -16,8 +17,8 @@ from ui.pages.profile_shared import (
 from ui.widgets.profile_reading import profile_scroll
 
 
-def _number(value: float | None) -> str:
-    return "—" if value is None else f"{value:.2f}"
+def _number(value: float | None, precision: int = 2) -> str:
+    return "—" if value is None else f"{value:.{precision}f}"
 
 
 class StudentOverviewPage(QWidget):
@@ -31,6 +32,9 @@ class StudentOverviewPage(QWidget):
         self._username = ""
         self._summary = ""
         self._terms: list[str] = []
+        self._gpa_scheme = resolve_scheme(DEFAULT_SCHEME)
+        self._grouped = []
+        self._overall = []
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -85,6 +89,11 @@ class StudentOverviewPage(QWidget):
         section = QLabel("各学期")
         section.setObjectName("H2")
         box.addWidget(section)
+        self._scheme_caption = QLabel()
+        self._scheme_caption.setObjectName("ProfileMeta")
+        self._scheme_caption.setWordWrap(True)
+        self._scheme_caption.setTextFormat(Qt.TextFormat.PlainText)
+        box.addWidget(self._scheme_caption)
         self._empty = QLabel("暂无成绩记录。")
         self._empty.setObjectName("Muted")
         box.addWidget(self._empty)
@@ -107,6 +116,10 @@ class StudentOverviewPage(QWidget):
         layout.addWidget(panel, 1)
         outer.addWidget(profile_scroll(body))
 
+    def set_gpa_scheme(self, scheme) -> None:
+        self._gpa_scheme = resolve_scheme(scheme)
+        self._render_summary(keep_selection=True)
+
     def set_context(self, store, username: str, student, class_name: str = "") -> None:
         self._store, self._username = store, username
         identity = [student.student, student.student_id, class_name]
@@ -118,27 +131,36 @@ class StudentOverviewPage(QWidget):
         else:
             rows = history_rows_for(store, username, student.student_id)
             overall = rows
-        grouped = group_grades_by_term(rows)
+        self._grouped = group_grades_by_term(rows)
+        self._overall = overall
+        self._render_summary()
+
+    def _render_summary(self, *, keep_selection: bool = False) -> None:
+        selected_row = self._table.currentRow() if keep_selection and self._table.selectedItems() else -1
+        scheme_name = scheme_label(self._gpa_scheme)
+        self._scheme_caption.setText(f"GPA 方案 · {scheme_name}")
+        self._metrics[2].setToolTip(scheme_name)
+        precision = self._gpa_scheme["round"]
         table = []
         context = []
-        for term, courses in grouped:
+        for term, courses in self._grouped:
             count = sum(row["score"] is not None for row in courses)
             weighted = rows_weighted_mean(courses)
-            gpa = rows_gpa(courses)
+            gpa = rows_gpa(courses, self._gpa_scheme)
             failed = sum(score_is_failed(row["score"]) for row in courses)
             label = term or "未标注学期"
             table.append((term, label, count, weighted, gpa, failed))
             context.append(f"{label}：有成绩 {count} 门，加权均分 {_number(weighted)}，"
-                           f"GPA {_number(gpa)}，挂科 {failed} 门。")
+                           f"GPA {_number(gpa, precision)}，挂科 {failed} 门。")
 
         # 完整学年与对应的分学期归档同在时，累计和变化用既有归档口径去重。
-        effective_terms = {row.get("term") or row.get("semester") or "" for row in overall}
+        effective_terms = {row.get("term") or row.get("semester") or "" for row in self._overall}
         averages = [mean for term, _, _, mean, _, _ in table
                     if term in effective_terms and mean is not None]
         delta = f"{averages[-1] - averages[-2]:+.2f}" if len(averages) > 1 else "—"
         for label, value in zip(self._metrics, (
-            f"{len(table)} 个学期", _number(rows_weighted_mean(overall)),
-            _number(rows_gpa(overall)), delta,
+            f"{len(table)} 个学期", _number(rows_weighted_mean(self._overall)),
+            _number(rows_gpa(self._overall, self._gpa_scheme), precision), delta,
         )):
             label.setText(value)
 
@@ -146,15 +168,17 @@ class StudentOverviewPage(QWidget):
         self._table.clearSelection()
         self._table.setRowCount(len(table))
         for index, (_, term, count, weighted, gpa, failed) in enumerate(table):
-            for col, value in enumerate((term, str(count), _number(weighted), _number(gpa), str(failed))):
+            for col, value in enumerate((term, str(count), _number(weighted), _number(gpa, precision), str(failed))):
                 cell = QTableWidgetItem(value)
                 cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self._table.setItem(index, col, cell)
+        if 0 <= selected_row < len(table):
+            self._table.selectRow(selected_row)
         self._empty.setVisible(not table)
         self._table.setVisible(bool(table))
         self._semester.setVisible(bool(table))
         self._sync_selection()
-        self._summary = "\n".join(context)
+        self._summary = "\n".join([f"GPA 方案：{scheme_name}", *context]) if context else ""
         self._talk.setEnabled(bool(context))
 
     def _sync_selection(self) -> None:

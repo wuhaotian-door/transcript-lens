@@ -69,6 +69,7 @@ from core.ai.inference import (
     list_local_models,
 )
 from core.database import ProfileStore
+from core.gpa import DEFAULT_SCHEME, resolve_scheme, scheme_label
 from ui.anim import make_card
 from ui.intentions import student_key
 from ui.pages import profile_shared
@@ -397,7 +398,6 @@ class SemesterSideProfile(QWidget):
         self._model_picker = ModelPicker(side)
         self._model_picker.model_selected.connect(self._choose_model)
         self._model_picker.library_requested.connect(self._on_model_center_clicked)
-        self._model_picker.settings_requested.connect(self.model_settings_requested.emit)
         tools.addWidget(self._model_picker)
         tools.addStretch(1)
         self._install_core_btn = QPushButton("下载推理核心", side)
@@ -834,11 +834,18 @@ class SemesterSideProfile(QWidget):
         self._refresh_ai_controls()
 
     def _on_model_center_clicked(self) -> None:
+        if callable(getattr(self.window(), "_go_model_center", None)):
+            self.model_settings_requested.emit()
+            return
         try:
             from ui.model_center_dialog import open_model_center
             open_model_center(self)
         except Exception:
             logger.exception("打开模型中心失败")
+        self._refresh_ai_controls()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
         self._refresh_ai_controls()
 
 
@@ -856,6 +863,7 @@ class SemesterSideProfilePage(SemesterSideProfile):
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
+        self._gpa_scheme = resolve_scheme(DEFAULT_SCHEME)
         super().__init__(parent)
         self._on_back: Any = None
         # 允许改字再保存（父类默认只读，任务书要求可编辑）
@@ -868,6 +876,10 @@ class SemesterSideProfilePage(SemesterSideProfile):
         self._ai_actions.addStretch()
         self._ai_actions.addWidget(self._talk_button)
         self.backRequested.connect(self._on_back_clicked)
+
+    def set_gpa_scheme(self, scheme: Any) -> None:
+        self._gpa_scheme = resolve_scheme(scheme)
+        self._refresh_gpa(self._term_rows())
 
     # -- 契约入口 ---------------------------------------------------------
     def set_context(
@@ -1014,7 +1026,8 @@ class SemesterSideProfilePage(SemesterSideProfile):
             return
         index = max(0, box.indexOf(self._stat_note))
         self._extra_weighted = self._add_metric(5, "本学期加权均分（口径②）：—")
-        self._extra_gpa = self._add_metric(6, "绩点（方案一）：—")
+        self._extra_gpa = self._add_metric(6)
+        self._extra_gpa.setTextFormat(Qt.TextFormat.PlainText)
         self._extra_trend = QLabel("趋势：—", portrait)
         self._extra_weak = QLabel("短板科目：—", portrait)
         self._extra_improve = QLabel("可提升科目：—", portrait)
@@ -1050,6 +1063,12 @@ class SemesterSideProfilePage(SemesterSideProfile):
                 item.setForeground(QColor('#9A471C' if text == '挂科' else '#0F766E'))
             self._table.setItem(index, 3, item)
 
+    def _refresh_gpa(self, rows: list[dict[str, Any]]) -> None:
+        gpa = profile_shared.rows_gpa(rows, self._gpa_scheme)
+        precision = self._gpa_scheme["round"]
+        value = "—" if gpa is None else f"{gpa:.{precision}f}"
+        self._extra_gpa.setText(f"GPA {value}\n{scheme_label(self._gpa_scheme)}")
+
     def _refresh_portrait(self, rows: list[dict[str, Any]]) -> None:
         """父类画出算术平均等；这里补加权、绩点、趋势、短板、可提升。"""
         super()._refresh_portrait(rows)
@@ -1063,10 +1082,7 @@ class SemesterSideProfilePage(SemesterSideProfile):
             + (f"{weighted:.2f}" if weighted is not None else "—")
         )
 
-        gpa = profile_shared.rows_gpa(rows)
-        self._extra_gpa.setText(
-            "绩点（方案一）：" + (f"{gpa:.2f}" if gpa is not None else "—")
-        )
+        self._refresh_gpa(rows)
 
         average = profile_shared.rows_arithmetic_mean(rows)
         previous = self._previous_term_average()

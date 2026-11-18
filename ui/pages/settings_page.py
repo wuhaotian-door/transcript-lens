@@ -1,13 +1,10 @@
-"""⚙️ 设置页 —— 导出 / 删除成绩库 / GPA 规则 / AI 开关 / 更新检查。
-
-五件事都**真的接通了 core**，不是死按钮：
+"""设置页。管理成绩导出、GPA 换算、软件更新和成绩库。
 
 * 导出     → :mod:`core.exporter`（明文版 / 脱敏版两个按钮）
 * 删除成绩库 → :func:`core.database.clear_library`，**先盘点 → 二次确认 → 才删**
   （v1.9.1 修掉了"导入完成绩还说没有成绩库"那个误报：判据从"文件在不在"改成
   "``grade_history`` 表里真有没有记录 / 侧写 / 快照"）
-* GPA 规则 → :mod:`core.gpa`（方案 1 标准 4.0；方案 2/3/4 列出来但禁用）
-* AI       → 只有开关和占位，**一个网络请求都没有**（charter 七节）
+* GPA 规则 → :mod:`core.gpa`（内置及用户自定义方案）
 * 更新     → :mod:`core.updater`，**只在点按钮时**联网一次，不自动下载
 
 ★ **本页没有激活码卡片**（v1.8 已删除整套激活码系统）。见
@@ -22,34 +19,41 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import Qt, QUrl, Signal
+from PySide6.QtCore import QSignalBlocker, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QFrame,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
+    QHeaderView,
     QLineEdit,
     QMessageBox,
-    QProgressBar,
     QPushButton,
     QScrollArea,
+    QSpinBox,
+    QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from core.ai.local_assistant import PLACEHOLDER as LOCAL_PLACEHOLDER
-from core.ai.local_assistant import MODEL_LOADED_PLACEHOLDER
-from core.ai.model_downloader import ModelDownloader, model_dir
-from core.crypto_store import CryptoStore
+from core.ai.model_downloader import model_dir
+from core.crypto_store import CryptoError, CryptoStore
 from core.database import clear_library, library_inventory
 from core.exporter import export_anonymized_xlsx, export_plain_xlsx
 from core import update_apply
-from core.gpa import DEFAULT_SCHEME, load_scheme, save_scheme, scheme_options
+from core.gpa import (
+    DEFAULT_SCHEME, MAX_CUSTOM_SCHEMES, SchemeError, custom_id, grade_point,
+    load_settings, resolve_scheme, save_settings, scheme_options, validate_scheme,
+)
 from core.updater import (
     CURRENT_VERSION,
     GITEE_RELEASES_PAGE,
@@ -58,7 +62,6 @@ from core.updater import (
     check_for_update,
 )
 from ui.anim import make_card
-from ui.model_center_dialog import open_model_center
 from ui.update_dialog import (
     ModuleChoiceDialog,
     ask_restart,
@@ -67,10 +70,7 @@ from ui.update_dialog import (
 )
 from ui.workers import run_async
 
-__all__ = ["AI_SETTINGS_FILE", "SettingsPage", "clear_confirm_text", "clear_summary_text"]
-
-#: AI 设置在加密库里的文件名
-AI_SETTINGS_FILE = "ai_settings.json.enc"
+__all__ = ["SettingsPage", "clear_confirm_text", "clear_summary_text"]
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +133,167 @@ def clear_summary_text(report: dict[str, Any]) -> str:
     return text
 
 
+class GpaSchemeDialog(QDialog):
+    """编辑分档或线性换算并预览单科绩点。"""
+
+    def __init__(self, definition: dict[str, Any] | None, parent: QWidget) -> None:
+        super().__init__(parent)
+        source = definition or {}
+        self._scheme_id = source.get("id") or custom_id()
+        self.setWindowTitle("编辑 GPA 方案" if definition else "新建 GPA 方案")
+        self.resize(520, 560)
+        box = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._name = QLineEdit(source.get("name", ""))
+        self._name.setMaxLength(40)
+        form.addRow("方案名称", self._name)
+        self._mode = QComboBox()
+        self._mode.addItem("分档换算", "table")
+        self._mode.addItem("线性换算", "linear")
+        self._mode.setCurrentIndex(self._mode.findData(source.get("kind", "table")))
+        form.addRow("换算方式", self._mode)
+        self._precision = QSpinBox()
+        self._precision.setRange(0, 6)
+        self._precision.setValue(source.get("round", 2))
+        form.addRow("显示小数位数", self._precision)
+        box.addLayout(form)
+
+        self._modes = QStackedWidget()
+        table_page = QWidget()
+        table_box = QVBoxLayout(table_page)
+        table_box.setContentsMargins(0, 0, 0, 0)
+        self._rows = QTableWidget(0, 2)
+        self._rows.setHorizontalHeaderLabels(("最低分（含）", "绩点"))
+        self._rows.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._rows.setMinimumHeight(145)
+        for floor, point in source.get("rows", ((90, 4), (60, 1), (0, 0))):
+            self._insert_row(self._rows.rowCount(), str(floor), str(point))
+        table_box.addWidget(self._rows, 1)
+        actions = QHBoxLayout()
+        add = QPushButton("增加一档")
+        add.clicked.connect(self._add_row)
+        actions.addWidget(add)
+        remove = QPushButton("删除所选档")
+        remove.clicked.connect(self._remove_row)
+        actions.addWidget(remove)
+        actions.addStretch()
+        table_box.addLayout(actions)
+        self._modes.addWidget(table_page)
+
+        linear_page = QWidget()
+        linear = QFormLayout(linear_page)
+        linear.setContentsMargins(0, 0, 0, 0)
+        self._linear = {}
+        for key, caption, default in (
+            ("a", "系数（乘以成绩）", 0.1), ("b", "截距（加到结果）", -5),
+            ("min_point", "最低绩点", 0), ("max_point", "最高绩点", 5),
+        ):
+            field = QLineEdit(str(source.get(key, default)))
+            linear.addRow(caption, field)
+            self._linear[key] = field
+            field.textChanged.connect(self._refresh)
+        self._modes.addWidget(linear_page)
+        self._modes.setCurrentIndex(self._mode.currentIndex())
+        box.addWidget(self._modes, 1)
+
+        preview = QFormLayout()
+        mapping = "，".join(f"{label}={score:g}" for label, score in source.get("grade_map", {}).items())
+        self._mapping = QLineEdit(mapping)
+        self._mapping.setPlaceholderText("例如 优=95，良=85（选填）")
+        preview.addRow("等级映射", self._mapping)
+        self._sample = QLineEdit("85")
+        self._result = QLabel()
+        preview.addRow("试算成绩", self._sample)
+        preview.addRow("试算绩点", self._result)
+        box.addLayout(preview)
+        feedback = QScrollArea()
+        feedback.setWidgetResizable(True)
+        feedback.setFrameShape(QFrame.Shape.NoFrame)
+        feedback.setMaximumHeight(82)
+        self._errors = QLabel()
+        self._errors.setStyleSheet("color: #B42318;")
+        self._errors.setTextFormat(Qt.TextFormat.PlainText)
+        self._errors.setWordWrap(True)
+        feedback.setWidget(self._errors)
+        box.addWidget(feedback)
+
+        self._buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        self._buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存")
+        self._buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
+        box.addWidget(self._buttons)
+
+        self._mode.currentIndexChanged.connect(self._modes.setCurrentIndex)
+        self._mode.currentIndexChanged.connect(self._refresh)
+        for field in (self._name, self._mapping, self._sample):
+            field.textChanged.connect(self._refresh)
+        self._precision.valueChanged.connect(self._refresh)
+        self._rows.itemChanged.connect(self._refresh)
+        self._refresh()
+
+    def _insert_row(self, row: int, floor: str, point: str) -> None:
+        self._rows.insertRow(row)
+        self._rows.setItem(row, 0, QTableWidgetItem(floor))
+        self._rows.setItem(row, 1, QTableWidgetItem(point))
+
+    def _add_row(self) -> None:
+        row = max(0, self._rows.rowCount() - 1)
+        self._insert_row(row, "", "")
+        self._rows.setCurrentCell(row, 0)
+        self._rows.editItem(self._rows.item(row, 0))
+        self._refresh()
+
+    def _remove_row(self) -> None:
+        row = self._rows.currentRow()
+        if row >= 0:
+            self._rows.removeRow(row)
+            self._refresh()
+
+    def definition(self) -> dict[str, Any]:
+        kind = self._mode.currentData()
+        data = {"id": self._scheme_id, "name": self._name.text(),
+                "kind": kind, "round": self._precision.value()}
+        if kind == "table":
+            data["rows"] = [
+                tuple(self._rows.item(row, col).text() if self._rows.item(row, col) else ""
+                      for col in range(2))
+                for row in range(self._rows.rowCount())
+            ]
+        else:
+            data.update({key: field.text() for key, field in self._linear.items()})
+        if self._mapping.text().strip():
+            mapping = {}
+            for entry in self._mapping.text().replace("，", ",").split(","):
+                label, _, score = entry.partition("=")
+                if not label.strip() or not score.strip() or label.strip() in mapping:
+                    raise SchemeError("等级映射格式为「优=95，良=85」，每个等级只填写一次。")
+                mapping[label.strip()] = score.strip()
+            data["grade_map"] = mapping
+        return data
+
+    def _validated(self) -> dict[str, Any] | None:
+        try:
+            data = self.definition()
+            errors = validate_scheme(data)
+        except SchemeError as exc:
+            errors = [str(exc)]
+        self._errors.setText("\n".join(errors))
+        self._buttons.button(QDialogButtonBox.StandardButton.Save).setEnabled(not errors)
+        return data if not errors else None
+
+    def _refresh(self) -> None:
+        data = self._validated()
+        point = grade_point(self._sample.text(), data) if data else None
+        self._result.setText("—" if point is None else f"{point:.{data['round']}f}")
+
+    def accept(self) -> None:
+        if self._validated() is not None:
+            super().accept()
+
 class SettingsPage(QWidget):
     """设置页。
 
@@ -146,6 +307,7 @@ class SettingsPage(QWidget):
     #: ★ 档案页 / 智育分析页接到它就该 ``reload()`` —— 数据层已经干净了，
     #:   界面不刷新会继续显示一份"已经删掉的成绩"（AGENTS §18：一处真源 + 信号刷新）。
     library_cleared = Signal(int, int, int)
+    gpa_scheme_changed = Signal(str)
 
     def __init__(
         self,
@@ -156,19 +318,18 @@ class SettingsPage(QWidget):
         super().__init__(parent)
         self._store = store if store is not None else CryptoStore(root)
         self._username = ""
+        self._gpa_settings = load_settings()
         #: 由主窗口注入：返回当前要导出的记录列表（可能为空）
         self._export_provider: Callable[[], list[dict[str, Any]]] | None = None
         #: 更新检查正在进行中（防止连点，也防止回调里重复开弹窗）
         self._checking = False
-        #: 最近一次检查拿到的 Release 描述原文。AI 模型清单和更新向导
-        #: 都要从它里面解析直链 —— 存在这儿，省得再发一次请求。
-        self._release_body = ""
         self._build()
 
     # ---------------------------------------------------------------- 外部
     def set_user(self, username: str) -> None:
         self._username = username or ""
-        self._load_gpa_scheme()
+        self._gpa_settings = load_settings(self._store, self._username)
+        self._sync_gpa_card()
 
     def set_export_provider(self, provider: Callable[[], list[dict[str, Any]]]) -> None:
         self._export_provider = provider
@@ -204,14 +365,7 @@ class SettingsPage(QWidget):
 
     # ---------------------------------------------------------------- 搭界面
     def _build(self) -> None:
-        """搭页面。
-
-        ★ 五张卡片摞起来**比一屏高**（实测 sizeHint 1187px > 页面 1119px），
-          所以必须套一层 ``QScrollArea``。不套的话「更新」那张卡片会被
-          挤出可视区 —— 用户根本看不到验收标准里那个「检查更新」按钮，
-          而界面上没有任何东西提示"下面还有内容"（AGENTS.md 4c 那一类事故：
-          断言全绿、界面上却是坏的）。
-        """
+        """排列导出、GPA、更新和成绩库操作。"""
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -298,508 +452,128 @@ class SettingsPage(QWidget):
         clr.addWidget(self._clr_status)
         box.addWidget(self._build_gpa_card())
 
-        self._model_settings_card = self._build_ai_card()
-        box.addWidget(self._model_settings_card)
-
         box.addWidget(self._build_update_card())
         box.addWidget(clr_card)
         box.addStretch(1)
 
     # ---------------------------------------------------------------- GPA 规则
     def _build_gpa_card(self) -> QFrame:
-        """「GPA 换算规则」下拉框（v1.9.1 新增）。
-
-        ★ 换算表**一行都不在界面里**：真源是 :data:`core.gpa.SCHEMES`
-          （方案 1 标准 4.0 已实现，方案 2/3/4 是预留位，列出来但**禁用**）。
-        ★ 选择存**应用级**加密设置（``gpa_settings.json.enc``）——
-          自动登录（没有密码）时也读得回来，和班级快照同一层。
-        ★ 界面上不出现 Markdown 记号（AGENTS §24）：说明文字里的 ``**`` 会原样显示。
-        """
         card = make_card()
         box = QVBoxLayout(card)
         box.setContentsMargins(24, 20, 24, 20)
         box.setSpacing(10)
-
         title = QLabel("GPA 换算规则")
         title.setObjectName("H2")
-        row = QHBoxLayout()
-        row.addWidget(title, 1)
+        box.addWidget(title)
 
+        row = QHBoxLayout()
         self._gpa_combo = QComboBox()
         self._gpa_combo.setMinimumHeight(34)
-        self._gpa_combo.setMinimumWidth(240)
-        for item in scheme_options():
-            self._gpa_combo.addItem(str(item.get("label") or item.get("id")), item.get("id"))
-            index = self._gpa_combo.count() - 1
-            tip = str(item.get("note") or "")
-            if not item.get("available"):
-                # ★ "待定"的方案**整项禁用**：不只是不选中 —— 用户看得见它、
-                #   点不动它，就不会以为"是不是我选错了才没反应"。
-                holder = self._gpa_combo.model().item(index)
-                if holder is not None:
-                    holder.setEnabled(False)
-                tip = f"{tip}（待定：换算表没定，暂不可选）"
-            self._gpa_combo.setItemData(index, tip, Qt.ItemDataRole.ToolTipRole)
         self._gpa_combo.currentIndexChanged.connect(self._on_gpa_scheme_changed)
-        row.addWidget(self._gpa_combo)
+        row.addWidget(self._gpa_combo, 1)
+        self._gpa_edit = QPushButton("编辑")
+        self._gpa_edit.setObjectName("Ghost")
+        self._gpa_edit.clicked.connect(lambda: self._edit_gpa_scheme(self.gpa_definition()))
+        row.addWidget(self._gpa_edit)
+        self._gpa_delete = QPushButton("删除")
+        self._gpa_delete.setObjectName("Ghost")
+        self._gpa_delete.clicked.connect(self._delete_gpa_scheme)
+        row.addWidget(self._gpa_delete)
         box.addLayout(row)
 
         self._gpa_status = QLabel("")
         self._gpa_status.setObjectName("Muted")
         self._gpa_status.setWordWrap(True)
+        self._gpa_status.setTextFormat(Qt.TextFormat.PlainText)
         box.addWidget(self._gpa_status)
-
-        self._apply_scheme_to_combo(DEFAULT_SCHEME)
+        self._sync_gpa_card()
         return card
 
-    def _scheme_note(self, scheme: Any) -> str:
-        for item in scheme_options():
-            if str(item.get("id")) == str(scheme):
-                return str(item.get("note") or "")
-        return ""
+    def _sync_gpa_card(self) -> None:
+        current = self.load_gpa_scheme()
+        with QSignalBlocker(self._gpa_combo):
+            self._gpa_combo.clear()
+            for item in scheme_options(self._gpa_settings["custom"]):
+                self._gpa_combo.addItem(item.get("label") or item["name"], item["id"])
+            self._gpa_combo.addItem("自定义…")
+            self._gpa_combo.setCurrentIndex(self._gpa_combo.findData(current))
+        self._gpa_combo.setEnabled(bool(self._username))
+        is_custom = current.startswith("custom:")
+        self._gpa_edit.setVisible(is_custom)
+        self._gpa_delete.setVisible(is_custom)
 
-    def _apply_scheme_to_combo(self, scheme: Any) -> None:
-        """把下拉框拨到某个方案上（**不触发保存** —— 回填不是用户操作）。"""
-        combo = getattr(self, "_gpa_combo", None)
-        if combo is None:
-            return
-        target = combo.findData(str(scheme))
-        if target < 0:
-            target = combo.findData(DEFAULT_SCHEME)
-        blocked = combo.blockSignals(True)
-        try:
-            if target >= 0:
-                combo.setCurrentIndex(target)
-        finally:
-            combo.blockSignals(blocked)
-        self._gpa_status.setText("当前方案：" + self._scheme_note(scheme))
-
-    def _load_gpa_scheme(self) -> None:
-        """跟着 ``set_user()`` 把这个人上次选的方案拨回来（读不到就是方案 1）。"""
-        if not self._username:
-            self._apply_scheme_to_combo(DEFAULT_SCHEME)
-            return
-        try:
-            scheme = load_scheme(self._store, self._username)
-        except Exception:  # noqa: BLE001 - 读不出来就用默认方案，不弹窗
-            scheme = DEFAULT_SCHEME
-        self._apply_scheme_to_combo(scheme)
-
-    def _on_gpa_scheme_changed(self, _index: int) -> None:
-        combo = self._gpa_combo
-        scheme = combo.currentData()
-        if not scheme:
-            return
-        note = self._scheme_note(scheme)
-        try:
-            save_scheme(self._store, self._username, scheme)
-        except Exception as exc:  # noqa: BLE001 - 存不上要说出来，但不打断
-            self._gpa_status.setText(
-                f"当前选择没有存上（{type(exc).__name__}），本次仍然按它算。"
-            )
-            return
-        self._gpa_status.setText("当前方案：" + note)
+        definition = self.gpa_definition()
+        if definition["kind"] == "table":
+            rule = "，".join(f"≥{floor:g} → {point:g}" for floor, point in definition["rows"])
+        else:
+            a, b = definition["a"], definition["b"]
+            rule = (f"成绩 × {a:g} {b:+g}，绩点范围 "
+                    f"{definition['min_point']:g}–{definition['max_point']:g}")
+        note = definition.get("note", "")
+        if not note and definition.get("grade_map"):
+            note = "、".join(f"{label} {score:g}" for label, score in definition["grade_map"].items()) + "。"
+        self._gpa_status.setText(f"当前方案：{rule}。{note}")
 
     def load_gpa_scheme(self) -> str:
-        """读回这个人选的方案 id（自检 / 其它页面用；读不到就是方案 1）。"""
-        if not self._username:
-            return DEFAULT_SCHEME
+        return self._gpa_settings["scheme"]
+
+    def gpa_definition(self) -> dict[str, Any]:
+        return resolve_scheme(self.load_gpa_scheme(), self._gpa_settings["custom"])
+
+    def _save_gpa_settings(self, **changes: Any) -> bool:
         try:
-            return load_scheme(self._store, self._username)
-        except Exception:  # noqa: BLE001
-            return DEFAULT_SCHEME
+            self._gpa_settings = save_settings(self._store, self._username, **changes)
+        except (OSError, ValueError, CryptoError) as exc:
+            self._sync_gpa_card()
+            self._gpa_status.setText(f"GPA 设置保存失败：{exc}")
+            return False
+        self._sync_gpa_card()
+        self.gpa_scheme_changed.emit(self.load_gpa_scheme())
+        return True
 
-    # ---------------------------------------------------------------- AI 助手
-    def focus_model_settings(self) -> None:
-        self._scroll.ensureWidgetVisible(self._model_settings_card, 0, 18)
-
-    def _build_ai_card(self) -> QFrame:
-        """AI 助手（charter 第 6 章：**只留开关和接口，不实现任何调用**）。
-
-        ★ 两个开关默认都是**关**的。云端那个打开时会要求填 API Key，
-          并且 Key 存进加密库（不是明文配置、不进仓库）。
-
-        ★ 这里**一个网络请求都没有**，连 import 都没有 ——
-          见 ``core/ai/cloud_adapter.py`` 顶部的说明。
-        """
-        card = make_card()
-        box = QVBoxLayout(card)
-        box.setContentsMargins(24, 20, 24, 20)
-        box.setSpacing(10)
-
-        title = QLabel("模型与 AI")
-        title.setObjectName("H2")
-        box.addWidget(title)
-
-        # --- 本地助手 ---
-        self._local_ai_box = QCheckBox("启用本地学习助手")
-        self._local_ai_box.setChecked(False)
-        self._local_ai_box.toggled.connect(self._on_local_ai_toggled)
-        box.addWidget(self._local_ai_box)
-
-        # --- 云端助手 ---
-        self._cloud_ai_box = QCheckBox("远程 AI 设置")
-        self._cloud_ai_box.setChecked(False)
-        self._cloud_ai_box.toggled.connect(self._on_cloud_ai_toggled)
-        box.addWidget(self._cloud_ai_box)
-
-        cloud_hint = QLabel("远程推理接口待接入。")
-        cloud_hint.setObjectName("Muted")
-        cloud_hint.setWordWrap(True)
-        box.addWidget(cloud_hint)
-
-        key_row = QHBoxLayout()
-        self._ai_key_edit = QLineEdit()
-        self._ai_key_edit.setPlaceholderText("API Key")
-        # ★ 密码模式：**绝不回显**（charter 铁律 2）
-        self._ai_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self._ai_key_edit.setMinimumHeight(36)
-        self._ai_key_edit.setEnabled(False)
-        self._ai_key_edit.setMinimumWidth(280)
-        key_row.addWidget(self._ai_key_edit, 1)
-
-        self._ai_save_btn = QPushButton("保存 AI 设置")
-        self._ai_save_btn.setObjectName("Ghost")
-        self._ai_save_btn.setMinimumHeight(36)
-        self._ai_save_btn.setEnabled(False)
-        self._ai_save_btn.clicked.connect(self._do_save_ai)
-        key_row.addWidget(self._ai_save_btn)
-        box.addLayout(key_row)
-
-        self._ai_status = QLabel("")
-        self._ai_status.setObjectName("Muted")
-        self._ai_status.setWordWrap(True)
-        box.addWidget(self._ai_status)
-
-        # --- 本地模型管理（charter v1.8 第八节 / 任务书 4.2）----------------
-        box.addSpacing(6)
-
-        models_title = QLabel("本地模型")
-        models_title.setObjectName("H3")
-        box.addWidget(models_title)
-
-        self._models_list = QLabel("（正在读取…）")
-        self._models_list.setObjectName("Muted")
-        self._models_list.setWordWrap(True)
-        box.addWidget(self._models_list)
-
-        model_row = QHBoxLayout()
-        self._model_center_btn = QPushButton("模型中心")
-        self._model_center_btn.setObjectName("Ghost")
-        self._model_center_btn.setMinimumHeight(36)
-        self._model_center_btn.setMinimumWidth(110)
-        self._model_center_btn.setToolTip(
-            "看远端清单，勾选要装的模型，一个个下（绝不自作主张下载）"
-        )
-        self._model_center_btn.clicked.connect(self._do_open_model_center)
-        model_row.addWidget(self._model_center_btn)
-
-        self._backend_setup_btn = QPushButton("下载推理核心")
-        self._backend_setup_btn.setObjectName("Ghost")
-        self._backend_setup_btn.setMinimumHeight(36)
-        self._backend_setup_btn.setMinimumWidth(120)
-        self._backend_setup_btn.setToolTip("安装或检查本地推理核心")
-        self._backend_setup_btn.clicked.connect(self._do_open_backend_setup)
-        model_row.addWidget(self._backend_setup_btn)
-
-        self._model_download_btn = QPushButton("下载新模型")
-        self._model_download_btn.setObjectName("Ghost")
-        self._model_download_btn.setMinimumHeight(36)
-        self._model_download_btn.setMinimumWidth(130)
-        self._model_download_btn.clicked.connect(self._do_download_model)
-        model_row.addWidget(self._model_download_btn)
-
-        self._model_delete_btn = QPushButton("删除模型")
-        self._model_delete_btn.setObjectName("Ghost")
-        self._model_delete_btn.setMinimumHeight(36)
-        self._model_delete_btn.setMinimumWidth(110)
-        self._model_delete_btn.clicked.connect(self._do_delete_model)
-        model_row.addWidget(self._model_delete_btn)
-        model_row.addStretch(1)
-        box.addLayout(model_row)
-
-        self._model_progress = QProgressBar()
-        self._model_progress.setRange(0, 100)
-        self._model_progress.setValue(0)
-        self._model_progress.setTextVisible(True)
-        self._model_progress.setMinimumHeight(22)
-        self._model_progress.setVisible(False)
-        box.addWidget(self._model_progress)
-
-        self._model_status = QLabel("")
-        self._model_status.setObjectName("Muted")
-        self._model_status.setWordWrap(True)
-        box.addWidget(self._model_status)
-
-        self._model_downloader = ModelDownloader()
-        self._model_downloader.progress.connect(self._on_model_progress)
-        self._model_downloader.finished.connect(self._on_model_finished)
-        self._model_downloader.error.connect(self._on_model_error)
-        self._refresh_models()
-        return card
-
-    # ---------------------------------------------------------------- 本地模型
-    def _refresh_models(self) -> None:
-        """把"已下载哪些模型"刷到界面上（**纯文本，不写 Markdown**）。"""
-        try:
-            installed = self._model_downloader.list_installed()
-        except Exception as exc:  # noqa: BLE001 - 读不出来不该让设置页崩
-            self._models_list.setText(f"读取本地模型失败：{type(exc).__name__}")
+    def _on_gpa_scheme_changed(self, index: int) -> None:
+        if index < 0 or not self._username:
             return
-        if not installed:
-            self._models_list.setText(
-                "还没有下载任何本地模型。点「下载新模型」从发行版页面提供的地址下载。"
-            )
-            self._model_delete_btn.setEnabled(False)
+        scheme = self._gpa_combo.itemData(index)
+        if scheme is None:
+            self._sync_gpa_card()
+            self._edit_gpa_scheme()
+        elif scheme != self.load_gpa_scheme():
+            self._save_gpa_settings(scheme=scheme)
+
+    def _edit_gpa_scheme(self, definition: dict[str, Any] | None = None) -> None:
+        items = self._gpa_settings["custom"]
+        if definition is None and len(items) >= MAX_CUSTOM_SCHEMES:
+            self._gpa_status.setText("自定义方案最多 10 个，请先删除不用的方案。")
             return
-        parts = []
-        for info in installed:
-            size = ModelDownloader.human_size(info.path)
-            parts.append(f"· {info.name}（{size}）")
-        self._models_list.setText("已下载 " + str(len(installed)) + " 个：\n" + "\n".join(parts))
-        self._model_delete_btn.setEnabled(True)
-
-        try:
-            from core.ai.runtime_setup import is_backend_available
-            backend_ok = bool(is_backend_available())
-        except Exception:
-            backend_ok = False
-        if hasattr(self, "_backend_setup_btn"):
-            if backend_ok:
-                self._backend_setup_btn.setText("推理核心已就绪")
-                self._backend_setup_btn.setEnabled(False)
-            else:
-                self._backend_setup_btn.setText("下载推理核心")
-                self._backend_setup_btn.setEnabled(True)
-
-    def _do_open_backend_setup(self) -> None:
-        """打开本地推理核心安装窗口。"""
-        try:
-            from ui.widgets.backend_setup import open_backend_setup
-            open_backend_setup(self)
-        except Exception as exc:  # noqa: BLE001
-            self._model_status.setText(f"打开推理核心安装失败：{type(exc).__name__}")
-        self._refresh_models()
-
-    def _do_open_model_center(self) -> None:
-        """打开模型中心：读远端清单 → 勾选 → 串行下载。
-
-        ★ **只有用户点这个按钮才会联网**，程序自己永远不会去下载模型。
-        """
-        try:
-            open_model_center(self, on_installed=self._on_models_installed)
-        except Exception as exc:  # noqa: BLE001 - 打不开也不该让设置页崩
-            QMessageBox.warning(
-                self,
-                "模型中心打不开",
-                "模型中心没能打开：" + type(exc).__name__ + "。",
-            )
-
-    def _on_models_installed(self, model_ids: list[Any]) -> None:
-        """模型中心这一轮装好了东西 —— 刷新本地模型那块并报一句。"""
-        self._refresh_models()
-        names = [str(item) for item in model_ids if str(item)]
-        if names:
-            self._model_status.setText(
-                "模型中心装好了 " + str(len(names)) + " 个模型：" + "、".join(names)
-            )
-
-    def _model_catalog(self) -> list[Any]:
-        """可用模型清单（带 Release 描述里的直链，拿不到就只有本地已装的）。"""
-        body = getattr(self, "_release_body", "")
-        try:
-            return self._model_downloader.list_available_models(body)
-        except Exception:  # noqa: BLE001
-            return self._model_downloader.list_available_models("")
-
-    def _do_download_model(self) -> None:
-        """选一个模型并下载（**只在用户点这里之后才联网**）。"""
-        if self._model_downloader.busy:
-            QMessageBox.information(self, "正在下载", "已经有一个下载在进行中了。")
+        dialog = GpaSchemeDialog(definition, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        saved = dialog.definition()
+        if definition is None:
+            existing = {item["id"] for item in items}
+            while saved["id"] in existing:
+                saved["id"] = custom_id()
+            items = [*items, saved]
+        else:
+            items = [saved if item["id"] == saved["id"] else item for item in items]
+        self._save_gpa_settings(scheme=saved["id"], custom=items)
 
-        catalog = self._model_catalog()
-        if not catalog:
-            QMessageBox.information(
-                self, "没有可下载的模型", "发行版里还没有列出任何 AI 模型。"
-            )
+    def _delete_gpa_scheme(self) -> None:
+        scheme = self.load_gpa_scheme()
+        if not scheme.startswith("custom:"):
             return
-
-        labels = [info.display for info in catalog]
-        choice, ok = QInputDialog.getItem(
-            self, "选择要下载的模型", "可用模型：", labels, 0, False
-        )
-        if not ok or not choice:
-            return
-        index = labels.index(choice)
-        info = catalog[index]
-        if not info.url:
-            QMessageBox.information(
-                self,
-                "这个模型还没有下载地址",
-                f"「{info.name}」在发行版说明里没有提供直链。\n\n"
-                "请点「检查更新」查看发行版页面，或联系维护者补充下载地址。",
-            )
-            return
-
+        name = self.gpa_definition()["name"]
         answer = QMessageBox.question(
-            self,
-            "开始下载",
-            f"即将下载：{info.label or info.name}"
-            + (f"（{info.size}）" if info.size else "")
-            + f"\n\n保存位置：\n{model_dir(info.name)}\n\n现在开始下载吗？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-
-        self._model_progress.setVisible(True)
-        self._model_progress.setValue(0)
-        self._model_status.setText(f"正在下载「{info.name}」…")
-        if not self._model_downloader.download(info.url, info.name):
-            self._model_status.setText("没能开始下载。")
-            self._model_progress.setVisible(False)
-
-    def _on_model_progress(self, percent: int) -> None:
-        if percent < 0:
-            # 总大小未知 → 不确定态
-            self._model_progress.setRange(0, 0)
-            return
-        self._model_progress.setRange(0, 100)
-        self._model_progress.setValue(percent)
-        got = self._model_downloader.downloaded_bytes
-        total = self._model_downloader.total_bytes
-        text = f"正在下载「{self._model_downloader.model_name}」… {percent}%"
-        if total:
-            text += (
-                f"　{ModelDownloader.human_size(got)}"
-                f" / {ModelDownloader.human_size(total)}"
-            )
-        self._model_status.setText(text)
-
-    def _on_model_finished(self, path: str) -> None:
-        self._model_progress.setRange(0, 100)
-        self._model_progress.setValue(100)
-        self._model_progress.setVisible(False)
-        self._model_status.setText(f"模型已下载：{path}")
-        self._refresh_models()
-        QMessageBox.information(
-            self,
-            "模型已下载",
-            f"已保存到：\n{path}\n\n"
-            "提醒：本版本还没有接推理引擎，点「评估」仍会显示"
-            f"「{MODEL_LOADED_PLACEHOLDER}」。",
-        )
-
-    def _on_model_error(self, message: str) -> None:
-        self._model_progress.setVisible(False)
-        self._model_status.setText(message)
-        # 取消不是错误 —— 不弹红色报错框
-        if "取消" not in message:
-            QMessageBox.critical(self, "下载失败", message)
-
-    def _do_delete_model(self) -> None:
-        installed = self._model_downloader.list_installed()
-        if not installed:
-            QMessageBox.information(self, "没有可删除的模型", "本机还没有下载过模型。")
-            return
-        names = [info.name for info in installed]
-        choice, ok = QInputDialog.getItem(
-            self, "删除模型", "要删除哪个模型：", names, 0, False
-        )
-        if not ok or not choice:
-            return
-        answer = QMessageBox.question(
-            self,
-            "确认删除",
-            f"确定要删除本地模型「{choice}」吗？\n\n"
-            "删除之后要重新下载才能再用（不影响成绩和任何其它数据）。",
+            self, "删除 GPA 方案", f"确定删除「{name}」并切回默认方案？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        if self._model_downloader.delete(choice):
-            self._model_status.setText(f"已删除模型「{choice}」。")
-        else:
-            self._model_status.setText(f"删除「{choice}」失败，文件可能正被占用。")
-        self._refresh_models()
-
-    def _on_local_ai_toggled(self, checked: bool) -> None:
-        self._ai_save_btn.setEnabled(True)
-        self._ai_status.setText(
-            "本地学习助手已打开 —— 但本版本还没接模型，点「评估」只会显示"
-            f"「{LOCAL_PLACEHOLDER}」。" if checked
-            else "本地学习助手已关闭。"
-        )
-
-    def _on_cloud_ai_toggled(self, checked: bool) -> None:
-        self._ai_key_edit.setEnabled(checked)
-        self._ai_save_btn.setEnabled(True)
-        if checked:
-            self._ai_key_edit.setFocus()
-            self._ai_status.setText(
-                "请填入 API Key 并保存。云端**只会在您点「深度评估」时**被调用，"
-                "而且传出去的只有 S 编号 / 均分 / 学分 / 分数区间 / 意愿标签，"
-                "不含姓名和学号。"
-            )
-        else:
-            self._ai_status.setText("云端大模型已关闭。")
-
-    def _do_save_ai(self) -> None:
-        """把 AI 开关（和 Key）存进加密库。**Key 绝不写日志、绝不回显。**"""
-        cloud_on = self._cloud_ai_box.isChecked()
-        key = self._ai_key_edit.text().strip()
-        if cloud_on and not key:
-            QMessageBox.warning(self, "还差 API Key",
-                                "启用云端大模型需要填 API Key。")
-            self._ai_key_edit.setFocus()
-            return
-        payload: dict[str, Any] = {
-            "local_enabled": self._local_ai_box.isChecked(),
-            "cloud_enabled": cloud_on,
-        }
-        if key:
-            payload["api_key"] = key
-        elif not cloud_on:
-            payload["api_key"] = ""
-
-        try:
-            self._save_ai_payload(payload)
-        except Exception as exc:  # noqa: BLE001 - 存不上要说清楚
-            QMessageBox.critical(self, "保存失败", f"{type(exc).__name__}: {exc}")
-            return
-
-        self._ai_key_edit.clear()
-        self._ai_save_btn.setEnabled(False)
-        self._ai_status.setText(
-            "AI 设置已保存到加密库。"
-            + ("（云端已启用，Key 已存）" if cloud_on else "（云端未启用）")
-        )
-        QMessageBox.information(
-            self, "已保存",
-            "AI 设置已加密存盘。\n\n"
-            "提醒：本版本只预留接口，点「深度评估」只会显示占位提示，"
-            "不会发起任何请求。",
-        )
-
-    def _save_ai_payload(self, payload: dict[str, Any]) -> None:
-        from core.crypto_store import CryptoError
-        from core.user_store import save_user_json
-
-        if not self._username:
-            raise CryptoError("还没登录，AI 设置没地方存")
-        save_user_json(self._store, self._username, AI_SETTINGS_FILE, payload)
-
-    def load_ai_settings(self) -> dict[str, Any]:
-        """读回 AI 设置（自检/其它页面用）。Key **不参与任何显示**。"""
-        from core.user_store import load_user_json
-
-        if not self._username:
-            return {}
-        data = load_user_json(self._store, self._username, AI_SETTINGS_FILE, {})
-        return data if isinstance(data, dict) else {}
+        items = [item for item in self._gpa_settings["custom"] if item["id"] != scheme]
+        if self._save_gpa_settings(scheme=DEFAULT_SCHEME, custom=items):
+            self._gpa_status.setText("已切回默认方案。" + self._gpa_status.text())
 
     # ---------------------------------------------------------------- 更新
     def _build_update_card(self) -> QFrame:
@@ -884,11 +658,6 @@ class SettingsPage(QWidget):
           把"更新下载"加进了白名单，第六节给了完整流程。
           **但"不自动下载"这条没变** —— 每一步都要用户点一下。
         """
-        # 把描述留下来：AI 模型清单和下载直链都从它里面解析
-        self._release_body = result.body or ""
-        if self._release_body:
-            self._refresh_models()
-
         if result.status == STATUS_ERROR:
             self._set_update_status(
                 "检查失败，请手动访问仓库查看是否有新版本。", error=True
@@ -963,7 +732,6 @@ class SettingsPage(QWidget):
                     f"「{info.name}」没有下载完，主程序更新不受影响。", error=True
                 )
                 break
-            self._refresh_models()
 
         if ask_restart(self, plan, Path(downloaded), root=root):
             # ★ 交接已经完成，**必须**退出 —— 不退出的话旧进程还占着

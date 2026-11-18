@@ -1550,26 +1550,9 @@ def rows_weighted_mean(
     return weighted_average(included)
 
 
-def rows_gpa(rows: Iterable[dict[str, Any]], scheme: str = DEFAULT_SCHEME) -> float | None:
-    """GPA（方案一；``core.gpa.gpa_of``，无可算课返回 ``None``）。"""
-    courses = [
-        {
-            "course_name": str(row.get("course", "") or ""),
-            "score": row.get("score"),
-            "credit": row.get("credit"),
-        }
-        for row in rows or ()
-        if _to_float(row.get("score")) is not None and _to_float(row.get("credit")) is not None
-    ]
-    if not courses:
-        return None
-    try:
-        return gpa_of(courses, scheme=scheme)
-    except TypeError:
-        return gpa_of(courses, scheme)
-    except Exception:  # noqa: BLE001 - GPA 是派生值，算不出来不该拦住整页
-        logger.warning("算 GPA 失败", exc_info=True)
-        return None
+def rows_gpa(rows: Iterable[dict[str, Any]], scheme: Any = DEFAULT_SCHEME) -> float | None:
+    """把成绩和学分原样交给所选 GPA 方案。"""
+    return gpa_of(rows, scheme=scheme)
 
 
 def score_is_failed(value: Any) -> bool:

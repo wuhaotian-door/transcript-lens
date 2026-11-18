@@ -1924,8 +1924,7 @@ class ProfilePage(QWidget):
         row.setSpacing(8)
         self._model_center_btn = ModelPicker(self)
         self._model_center_btn.model_selected.connect(self._choose_chat_model)
-        self._model_center_btn.library_requested.connect(self._open_model_center)
-        self._model_center_btn.settings_requested.connect(self._open_chat_model_settings)
+        self._model_center_btn.library_requested.connect(self._open_chat_model_settings)
         row.addWidget(self._model_center_btn)
         row.addStretch()
 
@@ -1944,7 +1943,7 @@ class ProfilePage(QWidget):
         return profile_scroll(pane)
 
     def _open_chat_model_settings(self) -> None:
-        navigate = getattr(self.window(), "_go_model_settings", None)
+        navigate = getattr(self.window(), "_go_model_center", None)
         if callable(navigate):
             navigate()
         else:

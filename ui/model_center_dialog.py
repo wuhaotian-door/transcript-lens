@@ -846,11 +846,16 @@ class ModelCenterDialog(QDialog):
 
     downloadFinished = Signal(list)
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None, *, embedded: bool = False) -> None:
         super().__init__(parent)
+        self._embedded = embedded
+        self._columns = 2 if embedded else GRID_COLUMNS
         self.setWindowTitle(DIALOG_TITLE)
-        self.setModal(True)
-        self.resize(1040, 660)
+        if embedded:
+            self.setWindowFlags(Qt.WindowType.Widget)
+        else:
+            self.setModal(True)
+            self.resize(1040, 660)
 
         #: 清单里的全部模型（含"本机已有"补进来的那些）
         self._models: list[RemoteModel] = []
@@ -888,7 +893,10 @@ class ModelCenterDialog(QDialog):
         self._relay: _ProgressRelay | None = None
 
         self._build_ui()
-        self._load_manifest()
+        if embedded:
+            self.refresh_local_models()
+        else:
+            self._load_manifest()
 
     # ------------------------------------------------------------------
     # 对外
@@ -905,17 +913,20 @@ class ModelCenterDialog(QDialog):
 
     def _build_ui(self) -> None:
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(18, 18, 18, 18)
+        margin = 0 if self._embedded else 18
+        outer.setContentsMargins(margin, margin, margin, margin)
         outer.setSpacing(10)
 
         intro = QLabel(INTRO_TEXT)
         intro.setObjectName("Muted")
         intro.setWordWrap(True)
+        if self._embedded:
+            intro.setText("选择模型后点击「下载选中」。")
         outer.addWidget(intro)
 
         # ★ v1.9.2：推理引擎没装时，在说明文字下方、滚动区上方插一张安装卡片
         #   （AGENTS §36：三态卡片是**唯一**入口；这里不复制安装流程）。
-        self._backend_card = self._make_backend_card()
+        self._backend_card = None if self._embedded else self._make_backend_card()
         if self._backend_card is not None:
             outer.addWidget(self._backend_card)
 
@@ -934,7 +945,9 @@ class ModelCenterDialog(QDialog):
         self._grid = QGridLayout(self._grid_host)
         self._grid.setContentsMargins(2, 2, 2, 12)
         self._grid.setSpacing(CARD_SPACING)
-        for column in range(GRID_COLUMNS):
+        if self._embedded:
+            self._grid.setAlignment(Qt.AlignmentFlag.AlignTop)
+        for column in range(self._columns):
             self._grid.setColumnStretch(column, 1)
         # ★ v1.9.2：**不要**再给第 0 行（组标题行）挂 stretch —— 那会让"视口高度一变，
         #   卡片整体往下顶同样多"，而安装卡片的折行高度在首次显示后会自己差 2px，
@@ -963,7 +976,7 @@ class ModelCenterDialog(QDialog):
         row = QHBoxLayout()
         row.setSpacing(8)
 
-        self._refresh_btn = QPushButton("刷新清单")
+        self._refresh_btn = QPushButton("加载模型清单" if self._embedded else "刷新清单")
         self._refresh_btn.setObjectName("Ghost")
         self._refresh_btn.setMinimumHeight(36)
         self._refresh_btn.setMinimumWidth(110)
@@ -986,16 +999,17 @@ class ModelCenterDialog(QDialog):
         )
         self._copy_btn.clicked.connect(self._on_copy_link)
 
-        self._close_btn = QPushButton("关闭")
+        self._close_btn = QPushButton("取消下载" if self._embedded else "关闭")
         self._close_btn.setObjectName("Ghost")
         self._close_btn.setMinimumHeight(36)
         self._close_btn.setMinimumWidth(90)
-        self._close_btn.clicked.connect(self.reject)
+        self._close_btn.clicked.connect(self._cancel_download if self._embedded else self.reject)
 
         row.addWidget(self._refresh_btn)
         row.addWidget(self._download_btn)
         row.addWidget(self._copy_btn)
         row.addStretch(1)
+        self._close_btn.setVisible(not self._embedded)
         row.addWidget(self._close_btn)
         outer.addLayout(row)
 
@@ -1106,17 +1120,20 @@ class ModelCenterDialog(QDialog):
             on_error=self._on_manifest_error,
         )
 
+    def load_catalog(self) -> None:
+        self._load_manifest()
+
     def _on_manifest(self, result: Any) -> None:
         self._refresh_btn.setEnabled(True)
+        self._refresh_btn.setText("刷新清单")
         try:
             models, warnings, status = result
         except (TypeError, ValueError):  # pragma: no cover - 防手滑改坏契约
             self._status.setText("清单的返回格式不对，这次没读成。")
             return
 
-        self._models = merged_with_local(models, dest_dir=self.models_root)
-        self._choices = build_choices(self._models, **self._machine_kwargs())
-        self._populate()
+        self._models = list(models)
+        self._reload_choices()
 
         text = status
         if warnings:
@@ -1185,7 +1202,7 @@ class ModelCenterDialog(QDialog):
         label.setObjectName("Muted")
         label.setWordWrap(True)
         label.setMinimumWidth(240)
-        self._grid.addWidget(label, self._grid_row, 0, 1, GRID_COLUMNS)
+        self._grid.addWidget(label, self._grid_row, 0, 1, self._columns)
         # ★ 占位也要占掉一行 —— 不然下一次 _clear_cards 之后的卡片会排到
         #   这行文字上面，两张东西叠在一起。
         self._grid_row += 1
@@ -1208,7 +1225,7 @@ class ModelCenterDialog(QDialog):
             # 第一组上面不要空出一截；后面的组各留一行间距。
             spacer = QWidget()
             spacer.setFixedHeight(CARD_SPACING)
-            self._grid.addWidget(spacer, self._grid_row, 0, 1, GRID_COLUMNS)
+            self._grid.addWidget(spacer, self._grid_row, 0, 1, self._columns)
             self._grid_row += 1
 
         header = QWidget()
@@ -1229,11 +1246,13 @@ class ModelCenterDialog(QDialog):
         line.setFixedHeight(1)
         line.setStyleSheet("background: #E2E8F0; border: none;")
         header_layout.addWidget(line, 1)
-        self._grid.addWidget(header, self._grid_row, 0, 1, GRID_COLUMNS)
+        self._grid.addWidget(header, self._grid_row, 0, 1, self._columns)
         self._grid_row += 1
 
     def _add_card(self, choice: ModelChoice) -> None:
         card = ModelCard(self, choice)
+        if self._embedded:
+            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         model_id = choice.model.id
 
         # 选中态：出现过的听用户的（_checked_ids），第一次出现的听清单的。
@@ -1248,9 +1267,9 @@ class ModelCenterDialog(QDialog):
         # 卡片按固定列数排；组标题各占一整行，所以行号自己数最稳
         # （别用 self._grid.count()，那里面还混着标题和占位行）。
         index = len(self._card_order)
-        if index and index % GRID_COLUMNS == 0:
+        if index and index % self._columns == 0:
             self._grid_row += 1
-        self._grid.addWidget(card, self._grid_row, index % GRID_COLUMNS)
+        self._grid.addWidget(card, self._grid_row, index % self._columns)
         self._card_map[model_id] = card
         self._card_order.append(card)
 
@@ -1380,10 +1399,16 @@ class ModelCenterDialog(QDialog):
           不传的话这里读的是默认用户目录，测试里桩掉 ``model_dir`` 就不管用了
           —— 那会让"卸载完卡片上的徽章没掉"这类 bug 溜过去。
         """
-        self._choices = build_choices(
-            self._models, dest_dir=self.models_root, **self._machine_kwargs()
-        )
+        models = merged_with_local(self._models, dest_dir=self.models_root)
+        options = self._machine_kwargs()
+        options["dest_dir"] = self.models_root
+        self._choices = build_choices(models, **options)
         self._populate()
+
+    def refresh_local_models(self) -> None:
+        """切回模型页时从磁盘刷新，保留当前清单和选中的模型。"""
+        if not self._busy:
+            self._reload_choices()
 
     @property
     def models_root(self) -> Path:
@@ -1564,6 +1589,9 @@ class ModelCenterDialog(QDialog):
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
+        if self._embedded:
+            self._close_btn.setEnabled(busy)
+            self._close_btn.setVisible(busy)
         self._refresh_btn.setEnabled(not busy)
         self._copy_btn.setEnabled(not busy)
         self._download_btn.setEnabled(
@@ -1575,6 +1603,15 @@ class ModelCenterDialog(QDialog):
                 (not busy) and card._is_installed()
             )
             card.setEnabled(not busy)
+
+    def _cancel_download(self) -> None:
+        self._cancel = True
+        self._close_btn.setEnabled(False)
+        self._status.setText("正在取消下载…")
+
+    def reject(self) -> None:
+        if not self._embedded:
+            super().reject()
 
     def _next_in_queue(self) -> None:
         if self._cancel or self._queue_index >= len(self._queue):
@@ -1698,7 +1735,7 @@ class ModelCenterDialog(QDialog):
         if self._downloaded:
             self.downloadFinished.emit(list(self._downloaded))
 
-        if not interrupted:
+        if not interrupted and not self._embedded:
             self._show_summary()
         if self._close_when_idle:
             self._close_when_idle = False
@@ -1754,13 +1791,10 @@ def open_model_center(
 ) -> int:
     """打开模型中心（模态）。返回 ``QDialog.exec()`` 的结果码。
 
-    ★ **对外签名冻结**（v1.9 的调用方就这么调，一个字都不许改）——
-      见 ``ui/pages/settings_page.py`` 的 ``_do_open_model_center``。
-
     Args:
-        parent: 父窗口（一般传设置页）。
+        parent: 父窗口。
         on_installed: 可选回调。有模型装好时会带着 id 列表被调一次，
-            设置页拿它刷新"本地模型"那块。
+            调用方可据此刷新本地模型。
 
     Returns:
         对话框的结果码（``QDialog.Accepted`` / ``QDialog.Rejected``）。

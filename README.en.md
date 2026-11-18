@@ -72,6 +72,7 @@ No real grade sheets or credentials are in this repository — test data is limi
 
 **Install on 64-bit Windows 10/11.** Run the setup wizard you received and choose an installation
 folder. Launch from the chosen folder, or select the Start menu shortcut in the wizard. The standalone EXE also runs directly.
+If installation or startup fails, right-click the corresponding EXE and choose **Run as administrator**.
 
 See [GitHub Releases](https://github.com/wuhaotian-door/transcript-lens/releases) or
 [Gitee Releases](https://gitee.com/wuhaotiansystem/transcript-lens/releases) for publicly available builds.
@@ -143,7 +144,7 @@ The version lives only in `core/version.py`; bumping it requires adding a migrat
 
 ## Known limitations
 
-- GPA implements **scheme 1 (standard 4.0 table)** only; other schemes are placeholders
+- The GPA settings include six presets and up to ten custom table-based or linear schemes.
 - A missing moral score counts as 0 (and is labelled); empty cells are not 0
 - Blank score ≠ 0: unselected courses stay out of the denominator, an absent mark `0` counts
 - Scores above 100 drop out of the weighted denominator (still listed) — the UI forces confirmation
