@@ -1,16 +1,16 @@
 {
   "schema": 1,
-  "version": "1.9.7",
-  "published": "2026-11-18",
+  "version": "1.9.8",
+  "published": "2026-11-19",
   "_doc": [
     "GitHub 是主仓库。Gitee master 保存相同的清单，供现有客户端读取。",
     "用顶层 app 段提供经过公开下载验证的程序附件。单文件需要 url、size、sha256。分片时填写整包 size、sha256 和按拼接顺序排列的 parts。",
     "发布后通过公开直链下载并核对字节数与 SHA-256，再提交清单并检查客户端能够发现更新。"
   ],
   "app": {
-    "url": "https://github.com/wuhaotian-door/transcript-lens/releases/download/v1.9.7/transcript-lens-v1.9.7-gpa.exe",
-    "size": 240764386,
-    "sha256": "3ab54eca1bfdd3557b540d456675ef14067fbd7d12c5b1c1791735b84748bb08",
-    "notes": "新增可配置 GPA 和独立模型中心，优化个人中心与设置，保留在线更新修复。已装 v1.9.7 的用户请手动覆盖安装。"
+    "url": "https://github.com/wuhaotian-door/transcript-lens/releases/download/v1.9.8/transcript-lens-v1.9.8.exe",
+    "size": 240772472,
+    "sha256": "b0ba1e5ff7f3e5ef28e9c31ca207805db7a40e3edc3a5adc0c1d9dd96ac38c83",
+    "notes": "注册邮箱选填，留空时保存屏幕上的 24 位找回码。忘记密码后，用找回码重设密码。个人中心支持用旧密码或找回码改密。软件与 Windows 安装向导统一为「成绩单透镜」。"
   }
 }
