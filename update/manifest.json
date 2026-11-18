@@ -8,9 +8,9 @@
     "发布后通过公开直链下载并核对字节数与 SHA-256，再提交清单并检查客户端能够发现更新。"
   ],
   "app": {
-    "url": "https://github.com/wuhaotian-door/transcript-lens/releases/download/v1.9.7/transcript-lens-v1.9.7.exe",
-    "size": 240754093,
-    "sha256": "8c5c8589faeed4ff5915ffb7e3941847d04ac6ac0db02f5bbeacd153f13ababb",
-    "notes": "修复下载在 100% 卡住和自动重启报错，显示预计剩余时间，并在安装准备完成后确认重启。"
+    "url": "https://github.com/wuhaotian-door/transcript-lens/releases/download/v1.9.7/transcript-lens-v1.9.7-gpa.exe",
+    "size": 240764386,
+    "sha256": "3ab54eca1bfdd3557b540d456675ef14067fbd7d12c5b1c1791735b84748bb08",
+    "notes": "新增可配置 GPA 和独立模型中心，优化个人中心与设置，保留在线更新修复。已装 v1.9.7 的用户请手动覆盖安装。"
   }
 }
