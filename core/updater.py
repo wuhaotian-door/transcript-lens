@@ -179,7 +179,7 @@ STATUS_ERROR = "error"
 # ---------------------------------------------------------------------------
 
 #: 每次 ``read()`` 读多少字节（任务书 2.1 指定 8192）。
-CHUNK_SIZE = 8192
+CHUNK_SIZE = 256 * 1024
 
 #: 下载超时（秒/块）。**不是整个文件的总超时** —— 230MB 按块读，
 #: 每块之间给 30 秒，断流就抛。任务书 2.1 指定 30s。
@@ -1154,6 +1154,8 @@ def download_exe(
         raise DownloadError(f"下载失败：{exc}") from exc
 
     mode = "ab"
+    checksum = normalize_sha256(expected_sha256)
+    digest = hashlib.sha256() if checksum else None
     with response:
         status = int(getattr(response, "status", 200) or 200)
         if offset and status != 206:
@@ -1165,6 +1167,10 @@ def download_exe(
 
         written = offset
         try:
+            if offset and digest is not None:
+                with part.open("rb") as existing:
+                    for chunk in iter(lambda: existing.read(CHUNK_SIZE), b""):
+                        digest.update(chunk)
             with open(part, mode) as sink:
                 while True:
                     if cancel is not None and cancel():
@@ -1173,6 +1179,8 @@ def download_exe(
                     if not chunk:
                         break
                     sink.write(chunk)
+                    if digest is not None:
+                        digest.update(chunk)
                     written += len(chunk)
                     if progress_callback is not None:
                         progress_callback(written, total)
@@ -1193,7 +1201,8 @@ def download_exe(
             "请到发行版页面手动下载。"
         )
 
-    if expected_sha256 and not verify_checksum(part, expected_sha256):
+    if expected_sha256 and (digest is None or digest.hexdigest() != checksum):
+        part.unlink(missing_ok=True)
         raise DownloadError(
             "下载完成但 SHA256 校验不一致 —— 文件可能在传输中损坏，"
             "或与发行版声明的不符。已丢弃，请重试或到页面手动下载。"

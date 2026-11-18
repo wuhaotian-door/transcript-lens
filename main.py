@@ -1765,8 +1765,8 @@ def _apply_mechanism_report() -> list[str]:
       grep ``apply_update.bat`` 这个词 —— 后者在文件被改名之后照样通过。
       这里断言的是脚本**内容**里必须有的四件事：
 
-      1. ``copy /Y`` 把新 exe 复制到目标（替换的核心动作）；
-      2. ``del`` 清掉交接文件和临时 exe；
+      1. ``move /Y`` 原位替换已暂存的程序；
+      2. ``del`` 清掉交接文件；
       3. ``start`` 把新版本拉起来；
       4. 重试循环存在（刚退出的进程可能还占着文件锁几秒）。
 
@@ -1786,7 +1786,8 @@ def _apply_mechanism_report() -> list[str]:
         text = render_apply_bat("/tmp/new.exe", "/tmp/target.exe", "/tmp/update.json",
                                 "/tmp/apply.log")
         required = {
-            "copy /Y": 'copy /Y "%SRC%" "%DST%"',
+            "move /Y": 'move /Y "%SRC%" "%DST%"',
+            "记录替换结果": "Installed; starting new instance",
             "del 交接文件": 'del "%JSN%"',
             "start 新 exe": 'start "" "%DST%"',
             "重试循环": "for /L %%i in (1,1,60) do (",
@@ -1804,7 +1805,7 @@ def _apply_mechanism_report() -> list[str]:
         else:
             lines.append(
                 f"ok    {'启动替换机制存在（bat 内容）':<32} "
-                f"{len(text)} 字符，5 个关键动作齐全且全 ASCII"
+                f"{len(text)} 字符，关键动作齐全且全 ASCII"
             )
 
         lines.append(

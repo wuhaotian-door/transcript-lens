@@ -918,10 +918,10 @@ class SettingsPage(QWidget):
                 )
             return
 
-        self._run_update_wizard(result, plan)
+        self._run_update_wizard(plan)
 
-    def _run_update_wizard(self, result: UpdateCheck, plan: Any) -> None:
-        """第一步选模块 → 第二步下载 → 第三步问重启。"""
+    def _run_update_wizard(self, plan: Any) -> None:
+        """选择、下载、准备安装并确认重启。"""
         chooser = ModuleChoiceDialog(plan, self)
         if chooser.exec() != chooser.DialogCode.Accepted:
             self._set_update_status("已取消：没有下载任何内容。")
@@ -931,43 +931,23 @@ class SettingsPage(QWidget):
         destination = (
             update_apply.update_dir() / f"transcript-lens_v{plan.version}.exe"
         )
+        target = update_apply.current_exe()
+        root = self._store.root
+
+        def prepare(path: Path) -> None:
+            update_apply.prepare_update(path, target, plan.version, sha256=plan.main_sha256, root=root)
+
         downloaded = download_release(
-            self,
-            plan.main_url,
-            destination,
-            label=(
-                f"正在下载主程序 v{plan.version}（{plan.main_size}）\n"
-                + (
-                    f"这次发布切成 {len(plan.main_parts)} 片，会逐片校验再拼起来。\n"
-                    if plan.main_parts
-                    else ""
-                )
-                + "下载中断可以重新点「开始下载」续传。"
-            ),
+            self, plan.main_url, destination,
+            label=f"正在下载主程序 v{plan.version}",
             expected_sha256=plan.main_sha256,
             parts=plan.main_parts,
             expected_size=plan.main_bytes,
+            prepare=prepare if target is not None else None,
         )
         if downloaded is None:
-            self._set_update_status("下载已取消，当前程序没有任何改动。", error=True)
+            self._set_update_status("更新未完成，可重新检查更新。", error=True)
             return
-
-        # ★ 下载完就写 update.json —— 这样点「稍后」之后，
-        #   下次启动 apply_pending_update 才接得上（见 ui/update_dialog 开头的说明）。
-        if update_apply.is_frozen():
-            try:
-                update_apply.write_pending_update(
-                    downloaded,
-                    update_apply.current_exe() or "",
-                    plan.version,
-                    from_version=CURRENT_VERSION,
-                    sha256=plan.main_sha256,
-                )
-            except Exception as exc:  # noqa: BLE001
-                QMessageBox.warning(
-                    self, "记录更新状态失败",
-                    f"{exc}\n\n新版本已经下载好了，但重启后可能不会自动替换。",
-                )
 
         # --- 选中的 AI 模型（可选，失败不影响主程序更新）-------------------
         for info in plan.selected(chooser.chosen_models()):
@@ -985,17 +965,17 @@ class SettingsPage(QWidget):
                 break
             self._refresh_models()
 
-        if ask_restart(self, plan, Path(downloaded)):
+        if ask_restart(self, plan, Path(downloaded), root=root):
             # ★ 交接已经完成，**必须**退出 —— 不退出的话旧进程还占着
             #   exe 文件锁，bat 会重试 60 秒然后放弃。
             self._set_update_status("正在重启以完成更新…")
             app = QApplication.instance()
             if app is not None:
                 app.quit()
+        elif target is not None:
+            self._set_update_status(f"v{plan.version} 已准备好，下次启动时完成安装。")
         else:
-            self._set_update_status(
-                f"v{plan.version} 已下载完成。下次启动程序时会自动完成替换。"
-            )
+            self._set_update_status(f"v{plan.version} 已下载。")
 
     # ---------------------------------------------------------------- 导出
     def _do_export(self, *, anonymized: bool) -> None:

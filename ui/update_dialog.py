@@ -1,47 +1,12 @@
-"""自动更新向导（charter v1.8 第六节）—— 三步：选模块 → 下载 → 重启。
-
-★ 这个文件里**没有一行网络代码**：请求在 :mod:`core.updater`，
-  文件交接在 :mod:`core.update_apply`。这里只管"问用户"和"显示进度"。
-
-三步的界面形态（任务书 2.2）：
-
-1. **选模块** —— 版本说明 + 勾选框（主程序默认勾上，AI 模块默认不勾）
-2. **下载中** —— 进度条 + 百分比 + 速度（KB/s）+ 可取消
-3. **下载完成** —— "✅ 更新已完成（v1.8）／是否立即重启应用完成更新？"
-   → [稍后] / [立即重启]
-
-★ ``update.json`` 到底什么时候写（任务书 §2.2 有个自相矛盾的地方）
-================================================================
-
-任务书把"写 update.json"列在**点「立即重启」之后**的动作里，
-可它同时又写"点「稍后」→ 关闭弹窗 → 下次启动时检测 update.json 并执行替换"。
-**"稍后"那条路要成立，update.json 就必须在用户做选择之前已经躺在盘上了** ——
-否则下次启动什么也检测不到，那个功能等于没写。
-
-所以这里的次序是：
-
-* **下载完成的那一刻**写 ``update.json``（这时"更新已完成"是真的）；
-* 点「立即重启」→ 备份旧 exe → 生成 bat → 拉起 bat → 退出；
-* 点「稍后」→ 什么都不做，直接关窗。下次启动
-  :func:`core.update_apply.apply_pending_update` 会接上（它**自己也会先备份**）。
-
-两条路都写到了 update.json，两条路都有备份 —— 任务书那两句话的要求
-一条都没丢。
-
-★ 源码模式下**不做替换**
-======================
-
-``sys.frozen`` 为假时根本没有 exe 可换。那种情况下第三步只显示
-"已下载到 …（源码运行，未执行自动替换）"，**不给「立即重启」按钮** ——
-一个会去覆盖 ``python.exe`` 的按钮比没有按钮危险得多。
-"""
+"""更新向导。显示下载和安装进度，准备就绪后询问是否重启。"""
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal
 from PySide6.QtWidgets import (
@@ -63,12 +28,12 @@ from core import update_apply
 from core.ai.model_downloader import ModelInfo, catalog_from_release
 from core.updater import (
     DownloadCancelled,
-    DownloadError,
     ManifestPart,
     UpdateCheck,
     download_exe,
     download_parts,
     parse_release_body,
+    verify_checksum,
 )
 from core.version import CURRENT_VERSION
 
@@ -188,7 +153,8 @@ def plan_from_release(check: UpdateCheck, release: Any = None) -> UpdatePlan:
 
 
 class _DownloadSignals(QObject):
-    progress = Signal(int, int)          # 已下载，总大小（0 = 未知）
+    progress = Signal('qint64', 'qint64')  # 已下载，总大小（0 = 未知）
+    installing = Signal()
     done = Signal(str)
     failed = Signal(str)
     cancelled = Signal()
@@ -205,6 +171,7 @@ class _DownloadTask(QRunnable):
         *,
         parts: tuple[ManifestPart, ...] = (),
         expected_size: int = 0,
+        prepare: Callable[[Path], None] | None = None,
     ) -> None:
         super().__init__()
         self._url = url
@@ -214,12 +181,20 @@ class _DownloadTask(QRunnable):
         self._cancel = cancel
         self._parts = parts
         self._size = expected_size
+        self._prepare = prepare
         self.setAutoDelete(True)
 
     def run(self) -> None:  # pragma: no cover - 后台线程
-        def _report(done: int, total: int | None) -> None:
-            self._signals.progress.emit(done, int(total or 0))
+        last_emit = -math.inf
 
+        def _report(done: int, total: int | None) -> None:
+            nonlocal last_emit
+            now = time.monotonic()
+            if now - last_emit >= _UI_TICK or (total and done == total):
+                self._signals.progress.emit(done, int(total or 0))
+                last_emit = now
+
+        installing = False
         try:
             if self._parts:
                 # v1.8.1：清单把主程序切成几片（Gitee 单附件 ≤100MB）——
@@ -233,6 +208,12 @@ class _DownloadTask(QRunnable):
                     expected_size=self._size,
                     min_bytes=0,
                 )
+            elif (
+                self._sha and self._dest.is_file()
+                and (not self._size or self._dest.stat().st_size == self._size)
+                and verify_checksum(self._dest, self._sha)
+            ):
+                path = self._dest
             else:
                 path = download_exe(
                     self._url,
@@ -240,14 +221,19 @@ class _DownloadTask(QRunnable):
                     _report,
                     cancel=self._cancel,
                     expected_sha256=self._sha,
-                    min_bytes=0 if self._sha else 1024 * 1024,
+                    min_bytes=self._size or (0 if self._sha else 1024 * 1024),
                 )
+            if self._cancel():
+                raise DownloadCancelled("已取消")
+            if self._prepare is not None:
+                installing = True
+                self._signals.installing.emit()
+                self._prepare(path)
         except DownloadCancelled:
             self._signals.cancelled.emit()
-        except (DownloadError, OSError, ValueError) as exc:
-            self._signals.failed.emit(str(exc))
-        except Exception as exc:  # noqa: BLE001
-            self._signals.failed.emit(f"{type(exc).__name__}: {exc}")
+        except Exception as exc:
+            stage = "安装准备失败" if installing else "下载失败"
+            self._signals.failed.emit(f"{stage}\n{exc}")
         else:
             self._signals.done.emit(str(path))
 
@@ -261,9 +247,11 @@ class DownloadProgressDialog(QDialog):
         self.setModal(True)
         self.setMinimumWidth(460)
         self._cancelled = False
+        self._installing = False
+        self._finished = False
         self._started = time.monotonic()
         self._last_tick = 0.0
-        self._last_bytes = 0
+        self._last_bytes: int | None = None
         self._last_time = self._started
         self._speed = 0.0
         self._total = 0
@@ -304,13 +292,23 @@ class DownloadProgressDialog(QDialog):
     def cancelled(self) -> bool:
         return self._cancelled
 
+    def reject(self) -> None:
+        if self._finished:
+            super().reject()
+        elif not self._installing:
+            self._on_cancel()
+
     def _on_cancel(self) -> None:
+        if self._installing or self._cancelled:
+            return
         self._cancelled = True
         self._cancel_btn.setEnabled(False)
         self._cancel_btn.setText("正在取消…")
         self._detail.setText("正在停止下载…已下载的部分会保留，下次可以续传。")
 
     def on_progress(self, done: int, total: int) -> None:
+        if self._installing or self._cancelled:
+            return
         self._done = done
         self._total = total
         if total > 0:
@@ -331,8 +329,11 @@ class DownloadProgressDialog(QDialog):
         #   "4530151 KB/s"。界面上给一个明显是假的数字，
         #   比暂时显示"计算中…"更糟。
         elapsed = now - self._last_time
-        if elapsed >= _SPEED_MIN_WINDOW:
-            instant = (done - self._last_bytes) / elapsed
+        if self._last_bytes is None:
+            self._last_bytes = done
+            self._last_time = now
+        elif elapsed >= _SPEED_MIN_WINDOW:
+            instant = max(0, done - self._last_bytes) / elapsed
             # 指数平滑：瞬时速度跳得太厉害，看着像坏的
             self._speed = (
                 instant if self._speed <= 0 else (0.7 * self._speed + 0.3 * instant)
@@ -350,11 +351,37 @@ class DownloadProgressDialog(QDialog):
         else:
             speed = "计算中…"
         if self._total > 0:
-            pct = self._done * 100 / self._total
-            return (
-                f"{pct:.1f}%　{_mb(self._done)} / {_mb(self._total)}　{speed}"
-            )
+            if self._done >= self._total:
+                return "下载完成，正在校验文件…"
+            remaining = self._total - self._done
+            eta = _duration(remaining / self._speed) if self._speed > 0 else "计算中…"
+            return f"{_mb(self._done)} / {_mb(self._total)}　{speed}　预计剩余 {eta}"
         return f"已下载 {_mb(self._done)}（总大小未知）　{speed}"
+
+    def show_installing(self) -> None:
+        self._installing = True
+        self.setWindowTitle("正在安装更新")
+        self._head.setText("正在安装更新")
+        self._detail.setText("正在备份当前版本并准备替换…")
+        self._bar.setRange(0, 0)
+        self._bar.setTextVisible(False)
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.setText("请稍候")
+
+    def finish(self) -> None:
+        self._finished = True
+        self.close()
+
+
+def _duration(seconds: float) -> str:
+    whole = max(1, math.ceil(seconds))
+    minutes, sec = divmod(whole, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} 小时 {minutes} 分钟"
+    if minutes:
+        return f"{minutes} 分 {sec:02d} 秒"
+    return f"{sec} 秒"
 
 
 def _rate(bytes_per_second: float) -> str:
@@ -371,10 +398,6 @@ def _rate(bytes_per_second: float) -> str:
         return f"{value / 1024:.0f} KB/s"
     return f"{value:.0f} B/s"
 
-    def mark_done(self) -> None:
-        self._bar.setRange(0, 100)
-        self._bar.setValue(100)
-        self._detail.setText("下载完成，正在校验…")
 
 
 def _mb(value: float) -> str:
@@ -396,6 +419,7 @@ def download_release(
     expected_sha256: str = "",
     parts: tuple[ManifestPart, ...] = (),
     expected_size: int = 0,
+    prepare: Callable[[Path], None] | None = None,
 ) -> str | None:
     """模态下载一个文件，返回**下载好的路径**；取消或失败返回 ``None``。
 
@@ -414,10 +438,10 @@ def download_release(
     outcome: dict[str, Any] = {"path": None, "error": None, "cancelled": False}
 
     signals.progress.connect(dialog.on_progress)
+    signals.installing.connect(dialog.show_installing)
 
     def _done(path: str) -> None:
         outcome["path"] = path
-        dialog.mark_done()
         loop.quit()
 
     def _failed(message: str) -> None:
@@ -440,15 +464,15 @@ def download_release(
         lambda: dialog.cancelled,
         parts=parts,
         expected_size=expected_size,
+        prepare=prepare,
     )
-    QThreadPool.globalInstance().start(task)
-
     dialog.show()
+    QThreadPool.globalInstance().start(task)
     loop.exec()
-    dialog.close()
+    dialog.finish()
 
     if outcome["error"]:
-        QMessageBox.critical(parent, "下载失败", str(outcome["error"]))
+        QMessageBox.critical(parent, "更新未完成", str(outcome["error"]))
         return None
     if outcome["cancelled"] or outcome["path"] is None:
         return None
@@ -618,80 +642,18 @@ def ask_restart(
 
     box = QMessageBox(parent)
     box.setIcon(QMessageBox.Icon.Information)
-    box.setWindowTitle("更新已完成")
-    box.setText(
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ 更新已完成（v{plan.version}）\n\n"
-        "是否立即重启应用完成更新？\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━"
-    )
-    box.setInformativeText(
-        "点「立即重启」会把当前版本备份一份，然后自动替换并重新打开。"
-    )
+    box.setWindowTitle("更新已准备好")
+    box.setText(f"v{plan.version} 已准备好安装。")
+    box.setInformativeText("重启应用以完成更新。旧程序已备份。")
     later = box.addButton("稍后", QMessageBox.ButtonRole.RejectRole)
     now = box.addButton("立即重启", QMessageBox.ButtonRole.AcceptRole)
     box.setDefaultButton(now)
+    box.setEscapeButton(later)
     box.exec()
-
     if box.clickedButton() is not now:
-        # ★ 「稍后」：什么都不做。update.json 已经在盘上，
-        #   下次启动 core.update_apply.apply_pending_update 会接上。
-        del later
         return False
 
-    return _handoff(parent, plan, downloaded, root=root)
-
-
-def _handoff(
-    parent: QWidget | None,
-    plan: UpdatePlan,
-    downloaded: Path,
-    *,
-    root: str | Path | None = None,
-) -> bool:
-    """备份 → 写 bat → 拉起 → 告诉调用方退出。**任何一步失败都拒绝替换。**"""
-    target = update_apply.current_exe()
-    if target is None:  # pragma: no cover - 上面已经判过 frozen
-        QMessageBox.warning(parent, "无法自动替换", "找不到当前程序文件。")
-        return False
-
-    # 1) 备份（**失败就拒绝替换** —— 任务书 2.4）
-    try:
-        saved = update_apply.backup_current_exe(
-            target, old_version=CURRENT_VERSION, root=root
-        )
-    except Exception as exc:  # noqa: BLE001
-        QMessageBox.critical(
-            parent,
-            "备份失败，已取消更新",
-            f"没能备份当前版本：\n{exc}\n\n"
-            "为安全起见**没有**执行替换，当前程序原样可用。",
-        )
-        return False
-
-    # 2) 生成替换脚本并拉起
-    json_path = update_apply.update_json_path()
-    log_path = update_apply.update_dir() / update_apply.APPLY_LOG_NAME
-    try:
-        script = update_apply.write_apply_bat(
-            downloaded, target, json_path, log_path=log_path
-        )
-        update_apply.launch_apply(
-            script, downloaded, target, json_path, log_path=log_path
-        )
-    except Exception as exc:  # noqa: BLE001
-        QMessageBox.critical(
-            parent,
-            "准备替换脚本失败",
-            f"{exc}\n\n当前程序照常运行；旧版本已备份在：\n{saved}",
-        )
-        return False
-
-    QMessageBox.information(
-        parent,
-        "正在更新",
-        f"旧版本已备份到：\n{saved}\n\n"
-        "程序即将关闭并自动替换为新版本，稍后会自动重新打开。\n"
-        "如果没有自动打开，请手动双击程序图标。",
-    )
-    return True
+    result = update_apply.apply_pending_update(root=root)
+    if not result.handed_off:
+        QMessageBox.warning(parent, "未能重启应用", result.detail or "请重新检查更新。")
+    return result.handed_off
