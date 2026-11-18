@@ -67,6 +67,7 @@ from email.utils import formataddr, formatdate
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from core import applog
 from core.crypto_store import CryptoError, default_root
 
 __all__ = [
@@ -87,6 +88,7 @@ __all__ = [
     "save_config",
     "send_recovery_mail",
     "send_verification_mail",
+    "try_send_recovery_mail",
 ]
 
 #: 隐式 SSL 的默认端口（163 / QQ 都用 465）
@@ -260,12 +262,16 @@ class SmtpSender:
             raise EmailNotConfiguredError("还没填 SMTP 服务器地址（endpoint）")
         host, _, port_text = raw.partition(":")
         host = host.strip()
-        if not host:
-            raise EmailNotConfiguredError(f"SMTP 地址不对：{raw!r}")
+        if not host or any(character.isspace() or character in "/@" for character in host):
+            raise EmailNotConfiguredError("SMTP 地址须采用主机名:端口格式。")
         try:
             port = int(port_text) if port_text.strip() else DEFAULT_SSL_PORT
         except ValueError as exc:
             raise EmailNotConfiguredError(f"SMTP 端口不是数字：{port_text!r}") from exc
+        if host.lower().rstrip(".") == "imap.163.com" or port in (143, 993):
+            raise EmailNotConfiguredError("IMAP 用于收信。网易 163 发信请填 smtp.163.com:465。")
+        if not 1 <= port <= 65535:
+            raise EmailNotConfiguredError("SMTP 端口必须在 1 到 65535 之间。")
         return host, port
 
     def _build_message(self, message: MailMessage) -> MIMEText:
@@ -447,9 +453,12 @@ def mail_configured(root: str | Path | None = None) -> bool:
     """
     try:
         config = load_config(root)
+        if config.provider != "smtp" or not config.configured:
+            return False
+        SmtpSender(config)._split_endpoint()
     except EmailSendError:
         return False
-    return config.provider == "smtp" and config.configured
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +507,22 @@ def send_recovery_mail(
         ),
     )
     get_sender(root).send(message)
+
+
+def try_send_recovery_mail(
+    to: str,
+    recovery_secret: str,
+    *,
+    username: str = "",
+    root: str | Path | None = None,
+) -> bool:
+    """报告投递结果，失败时由调用方当场显示刚生成的找回码。"""
+    try:
+        send_recovery_mail(to, recovery_secret, username=username, root=root)
+    except EmailSendError as exc:
+        applog.write("recovery.mail", type(exc).__name__, root=root)
+        return False
+    return True
 
 
 def send_verification_mail(

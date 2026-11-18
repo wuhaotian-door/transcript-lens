@@ -46,7 +46,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.crypto_store import CryptoError, CryptoStore, WrongPasswordError
-from core.email_recovery import mail_configured, send_recovery_mail
+from core.email_recovery import mail_configured, try_send_recovery_mail
 from core.recovery import RecoveryError, enable_recovery, recovery_info
 from core.session_token import clear_token
 from core.version import CURRENT_VERSION
@@ -259,23 +259,22 @@ class AccountPage(QWidget):
         self._regen_btn.setText("生成中…")
         self._set_regen("正在校验密码并生成新的找回码…")
 
-        def _work() -> str:
+        def _work() -> tuple[str, bool]:
             # ① 验密码 —— 顺带拿到库密钥（生成找回码必须有它）
             session = self._store.login(self._username, password)
             # ② 生成新包裹（旧码立刻作废）
             code = enable_recovery(session, email, store=self._store)
-            # ③ 能发信就寄出；不能就交给界面直接显示（v1.9.8 本地模式）
-            if self._mail_ready:
-                send_recovery_mail(
-                    email, code, username=self._username, root=self._data_root
-                )
-            return code
+            delivered = bool(email) and try_send_recovery_mail(
+                email, code, username=self._username, root=self._data_root
+            )
+            return code, delivered
 
-        def _done(code: str) -> None:
+        def _done(result: tuple[str, bool]) -> None:
+            code, delivered = result
             self._regen_btn.setEnabled(True)
             self._regen_btn.setText("重新生成找回码")
             self._refresh_recovery()
-            if self._mail_ready:
+            if delivered:
                 self._set_regen(f"新的找回码已寄到 {_mask_email(email)}，旧的已作废。")
                 QMessageBox.information(
                     self,
@@ -284,7 +283,8 @@ class AccountPage(QWidget):
                     "旧的那串立刻作废，请把旧邮件删掉，只留新的这一封。",
                 )
             else:
-                self._set_regen("新的找回码已生成（本机未配置邮箱，只在屏幕上显示），旧的已作废。")
+                delivery_notice = "邮件未能发出。" if email else ""
+                self._set_regen(f"旧找回码已作废。{delivery_notice}请保存屏幕上的新找回码。")
                 show_recovery_code(self, code)
 
         def _failed(exc: BaseException) -> None:

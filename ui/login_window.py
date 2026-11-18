@@ -72,8 +72,8 @@ from core.crypto_store import (
 from core import applog
 from core.email_recovery import (
     mail_configured,
-    send_recovery_mail,
     send_verification_mail,
+    try_send_recovery_mail,
 )
 from core.recovery import (
     EMAIL_CODE_LENGTH,
@@ -710,7 +710,7 @@ class LoginWindow(QWidget):
             "正在校验验证码…" if self._mail_ready else "正在创建账户并生成找回码…"
         )
 
-        def _work() -> str:
+        def _work() -> tuple[str, bool]:
             # ① 邮箱验证（只在能真发信时需要；本地模式跳过）
             if self._mail_ready:
                 check_email_code(email, code, root=self._data_root)
@@ -719,14 +719,13 @@ class LoginWindow(QWidget):
             # ③ ★ 立刻生成找回码 —— 库密钥此刻还在手里，
             #    这是唯一能埋下"第二把钥匙"的时机。
             recovery_code = enable_recovery(session, email, store=self._store)
-            # ④ 能发信就寄出去；不能就交给界面直接显示（本地模式）
-            if self._mail_ready:
-                send_recovery_mail(
-                    email, recovery_code, username=name, root=self._data_root
-                )
-            return recovery_code
+            delivered = bool(email) and try_send_recovery_mail(
+                email, recovery_code, username=name, root=self._data_root
+            )
+            return recovery_code, delivered
 
-        def _done(recovery_code: str) -> None:
+        def _done(result: tuple[str, bool]) -> None:
+            recovery_code, delivered = result
             self._register_btn.setEnabled(True)
             self._register_btn.setText("注  册")
             for widget in (self._new_user, self._new_email, self._new_code,
@@ -736,7 +735,7 @@ class LoginWindow(QWidget):
             self._user_box.setCurrentText(name)
             self._pass_edit.clear()
             self._stack.setCurrentIndex(0)
-            if self._mail_ready:
+            if delivered:
                 self._set_status(f"账户「{name}」已建好，请输入密码登录。")
                 QMessageBox.information(
                     self,
@@ -746,8 +745,9 @@ class LoginWindow(QWidget):
                     "建议现在就把它星标或加个标签，别让它躺在垃圾邮件里。",
                 )
             else:
+                delivery_notice = "邮件未能发出。" if email else ""
                 self._set_status(
-                    f"账户「{name}」已建好。确认保存好找回码后，输入密码登录。"
+                    f"账户「{name}」已建好。{delivery_notice}保存找回码后即可登录。"
                 )
                 show_recovery_code(self, recovery_code)
 

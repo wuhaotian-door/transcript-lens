@@ -46,9 +46,9 @@ Name: "shell"; Description: "{cm:ShellIntegration}"; Flags: unchecked
 Name: "shell\desktopicon"; Description: "{cm:CreateDesktopIcon}"; Flags: unchecked dontinheritcheck
 
 [InstallDelete]
-; 旧版（成绩透析镜）留下的快捷方式：改名后必须清掉，否则开始菜单/桌面会同时出现两个名字
-Type: files; Name: "{userprograms}\成绩透析镜.lnk"
-Type: files; Name: "{userdesktop}\成绩透析镜.lnk"
+; 创建新版快捷方式时清理同位置的旧名快捷方式。
+Type: files; Name: "{userprograms}\成绩透析镜.lnk"; Tasks: shell
+Type: files; Name: "{userdesktop}\成绩透析镜.lnk"; Tasks: shell\desktopicon
 
 [Icons]
 Name: "{userprograms}\成绩单透镜"; Filename: "{app}\transcript-lens.exe"; WorkingDir: "{app}"; Tasks: shell

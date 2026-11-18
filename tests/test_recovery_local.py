@@ -130,6 +130,15 @@ def test_mail_configured_false_when_provider_is_not_smtp(data_root: Path) -> Non
     assert mail_configured(data_root) is False
 
 
+@pytest.mark.parametrize("endpoint", ["", "imap.163.com:993", "smtp.163.com:65536"])
+def test_invalid_mail_endpoint_uses_local_registration(data_root: Path, endpoint: str) -> None:
+    save_config(
+        MailConfig(provider="smtp", endpoint=endpoint, api_key="dummy-key", sender="a@example.com"),
+        root=data_root,
+    )
+    assert mail_configured(data_root) is False
+
+
 # ---------------------------------------------------------------------------
 # 二、空邮箱也能建立找回码 —— 而且换完密码数据还在
 # ---------------------------------------------------------------------------
@@ -212,7 +221,7 @@ def test_login_window_shows_mail_block_when_configured(
     from ui.login_window import LoginWindow
 
     save_config(
-        MailConfig(provider="smtp", api_key="k", sender="a@example.com"),
+        MailConfig(provider="smtp", endpoint="smtp.163.com:465", api_key="k", sender="a@example.com"),
         root=data_root,
     )
     win = LoginWindow(store=store, root=data_root)
@@ -221,6 +230,46 @@ def test_login_window_shows_mail_block_when_configured(
         assert win._mail_box.isHidden() is False
     finally:
         win.deleteLater()
+
+
+@pytest.mark.parametrize("smtp_enabled", [False, True])
+def test_register_shows_valid_recovery_code_when_mail_cannot_deliver(
+    app: QApplication, store: CryptoStore, data_root: Path, monkeypatch, smtp_enabled: bool
+) -> None:
+    from core import email_recovery
+    from ui import login_window
+
+    if smtp_enabled:
+        save_config(
+            MailConfig(provider="smtp", endpoint="smtp.163.com:465", api_key="dummy-key",
+                       sender="a@example.com"),
+            root=data_root,
+        )
+    checked = []
+    shown = []
+    monkeypatch.setattr(login_window, "check_email_code", lambda *args, **kwargs: checked.append(args))
+    monkeypatch.setattr(login_window, "show_recovery_code", lambda _parent, code: shown.append(code))
+    monkeypatch.setattr(login_window, "run_async",
+                        lambda _parent, work, *, on_done, on_error: on_done(work()))
+
+    def reject_delivery(*args, **kwargs):
+        raise email_recovery.EmailSendError("test mail unavailable")
+
+    monkeypatch.setattr(email_recovery, "send_recovery_mail", reject_delivery)
+    window = login_window.LoginWindow(store=store, root=data_root)
+    try:
+        window._new_user.setText("test_registration")
+        window._new_pass.setText(PASSWORD)
+        window._new_pass2.setText(PASSWORD)
+        window._new_email.setText("test@example.com")
+        window._new_code.setText("123456")
+        window._do_register()
+        assert bool(checked) == smtp_enabled
+        assert len(shown) == 1
+        assert check_recovery_code(store, "test_registration", shown[0])
+        store.login("test_registration", PASSWORD)
+    finally:
+        window.deleteLater()
 
 
 # ---------------------------------------------------------------------------
