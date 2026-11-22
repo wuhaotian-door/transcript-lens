@@ -306,7 +306,7 @@ onefile 的 exe 启动时会**再起一个子进程**（bootloader + 真正的�
 
 真源：`docs/DEV_SUMMARY.md` **第四节 联网红线**（即旧 v1.8 charter 第四节）。
 
-### ✅ 允许（**只有这四件**）
+### ✅ 允许
 
 | 场景 | 条件 | 实现 |
 |---|---|---|
@@ -314,6 +314,7 @@ onefile 的 exe 启动时会**再起一个子进程**（bootloader + 真正的�
 | 辅导员手动启用云端大模型 | 设置页手动开 + 填 API Key，**只在点「深度评估」时**调用 | `core/ai/`（骨架） |
 | **更新检查** | 用户点「检查更新」→ `urllib.request` 只读一次 Gitee 版本号 | `core/updater.py` |
 | **更新下载 / AI 模型下载** | 用户点「开始下载」并勾选文件 → 流式下载 | `core/updater.download_exe` |
+| **启动环境补装** | 本地检测缺失项，用户确认下载后才访问固定组件地址，并校验 SHA-256 | `core/startup_environment.py` |
 
 ★ **v1.8 把"更新下载"加进了白名单，但 ❌ 那一条没变**：
 
@@ -933,6 +934,8 @@ parse_excel(path, engine=engine_for(path))   # 调用方传引擎进去
   时间/操作/学生ID/学期/课程名，**不记分数**（见 §16 例外）。
 
 ## 36. ★ 推理后端一键安装（v1.9.2）
+
+* Windows x64 分发版通过 `core/startup_environment.py` 补装。启动检查只访问本机；用户明确确认后下载并校验固定的 CPU 组件和缺失的入门模型。程序自带 Python 和 Excel 依赖，分发版补装无需系统 Python。模型中心也使用同一推理核心安装入口。源码版保留下方的 pip 安装流程。
 
 * `core/ai/runtime_setup.py`：**零 HTTP import**，pip 走子进程（Windows 必须
   `subprocess.CREATE_NO_WINDOW`，绝不弹黑框）。安装目标是**应用私有目录**

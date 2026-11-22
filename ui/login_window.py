@@ -4,8 +4,8 @@
      |  成绩单透镜         |  登录                                 |
      |  transcript-lens   |  账号  [ 可输入 + 历史用户名下拉 ]     |
      |  v1.0              |  密码  [ ●●●● ]                       |
-     |  把成绩单，变成      |  ☐ 7 天内自动登录                     |
-     |  能坐下来谈的东西    |  [登录] [去注册]                      |
+     |  循分数的脉络        |  ☐ 7 天内自动登录                     |
+     |  见成长的模样        |  [登录] [去注册]                      |
      +--------------------+--------------------------------------+
 
 ★ 三件必须说清楚的事
@@ -97,6 +97,7 @@ from ui.frameless import (
     install_chrome,
 )
 from ui.recovery_code_dialog import show_recovery_code
+from ui.first_run import mark_first_run
 from ui.workers import run_async
 
 __all__ = ["APP_VERSION", "MIN_PASSWORD_LENGTH", "SLOGAN", "LoginWindow"]
@@ -111,7 +112,7 @@ __all__ = ["APP_VERSION", "MIN_PASSWORD_LENGTH", "SLOGAN", "LoginWindow"]
 APP_VERSION = f"v{CURRENT_VERSION}"
 
 #: slogan
-SLOGAN = "把成绩单，变成能坐下来谈的东西"
+SLOGAN = "循分数的脉络，见成长的模样"
 
 #: 密码最短长度（本地单机工具，不做复杂度评分）
 MIN_PASSWORD_LENGTH = 8
@@ -705,6 +706,7 @@ class LoginWindow(QWidget):
             # ③ ★ 立刻生成找回码 —— 库密钥此刻还在手里，
             #    这是唯一能埋下"第二把钥匙"的时机。
             recovery_code = enable_recovery(session, email, store=self._store)
+            mark_first_run(self._store, name)
             delivered = bool(email) and try_send_recovery_mail(
                 email, recovery_code, username=name, root=self._data_root
             )

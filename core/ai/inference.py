@@ -511,6 +511,11 @@ class LocalModelEngine:
         return llama
 
     # ----------------------------------------------------------------- 生成
+    def count_tokens(self, prompt: str) -> int:
+        """使用实际生成模型的分词器计算提示词长度。"""
+        llama = self._require_loaded()
+        return len(llama.tokenize(prompt.encode("utf-8"), add_bos=True, special=True))
+
     def generate(
         self,
         prompt: str,

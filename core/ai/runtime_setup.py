@@ -23,8 +23,10 @@ import importlib.util
 import logging
 import os
 import shutil
+import struct
 import subprocess
 import sys
+import sysconfig
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -61,12 +63,14 @@ __all__ = [
 
 # 安装目录名，相对 core.crypto_store.default_root()。
 RUNTIME_DIR_NAME = "runtime/site"
+WINDOWS_RUNTIME_DIR_NAME = "runtime/windows-cpu"
 
 # 官方包名：pip install llama-cpp-python。
 PIP_PACKAGE = "llama-cpp-python"
 
-# 国内 pip 镜像（阿里云）。默认先走镜像，安装失败时界面提示重试官方源。
-PIP_EXTRA_INDEX = "https://mirrors.aliyun.com/pypi/simple/"
+# llama-cpp-python 项目发布的 CPU 预编译包。
+PIP_EXTRA_INDEX = "https://abetlen.github.io/llama-cpp-python/whl/cpu"
+PIP_INDEX = "https://pypi.org/simple"
 
 # pip install 的总超时（秒）。llama-cpp-python 需要编译，慢机器上可能要几分钟。
 INSTALL_TIMEOUT = 600
@@ -84,8 +88,9 @@ INSTALL_OK_MESSAGE = "推理后端安装成功"
 INSTALL_CANCELLED_MESSAGE = "已取消安装"
 BACKEND_READY_MESSAGE = "推理后端已就绪"
 MISSING_PYTHON_MESSAGE = (
-    "没有找到可用于安装的 Python 解释器（打包版需要本机装有 Python）。"
-    "请复制下面的命令，在命令行里执行后重启本程序。"
+    f"没有找到可用于安装的 Python 解释器。请先安装 Python "
+    f"{sys.version_info.major}.{sys.version_info.minor}（{struct.calcsize('P') * 8} 位，含 pip），"
+    "再重试或在 PowerShell 执行下方命令。"
 )
 
 # Windows 上绝不弹出黑框；其它平台为 0。
@@ -124,12 +129,16 @@ def _path_listed(target: str, entries: Iterable[str]) -> bool:
 
 
 def ensure_runtime_on_path(directory=None) -> bool:
-    """把运行时目录放进 sys.path 的最前面（幂等）。
+    """补充运行时目录，优先复用程序自带的 NumPy 等依赖。
 
     * 目录不存在：返回 False，sys.path 一个字节都不动；
     * 已经在 sys.path 里：返回 True，绝不改变已有条目的顺序；
-    * 否则插到 sys.path[0] 并返回 True。
+    * 否则追加路径并返回 True。
     """
+    if directory is None:
+        managed = Path(default_root()) / WINDOWS_RUNTIME_DIR_NAME
+        if (managed / ENGINE_MODULE).is_dir() and ensure_runtime_on_path(managed):
+            return True
     target = Path(directory) if directory is not None else runtime_dir()
     try:
         if not target.is_dir():
@@ -139,7 +148,7 @@ def ensure_runtime_on_path(directory=None) -> bool:
         return False
     if _path_listed(absolute, sys.path):
         return True
-    sys.path.insert(0, absolute)
+    sys.path.append(absolute)
     return True
 
 
@@ -226,6 +235,11 @@ def _iter_candidate_pythons() -> Iterator[str]:
             found = remember(candidate)
             if found:
                 yield found
+        managed = Path(local_appdata) / "Python" / "pythoncore-*"
+        for candidate in _sorted_glob(str(managed / "python.exe")):
+            found = remember(candidate)
+            if found:
+                yield found
 
     for root in _iter_system_drive_roots():
         for candidate in _sorted_glob(str(root / "Python3*" / "python.exe")):
@@ -233,7 +247,7 @@ def _iter_candidate_pythons() -> Iterator[str]:
             if found:
                 yield found
 
-    anaconda_parents: List[Path] = []
+    anaconda_parents: List[Path] = [Path.home()]
     if local_appdata:
         anaconda_parents.append(Path(local_appdata))
     anaconda_parents.extend(_iter_system_drive_roots())
@@ -254,8 +268,14 @@ def _stop_process_quietly(process) -> None:
 
 
 def _probe_python(path: str, timeout: float = PYTHON_PROBE_TIMEOUT) -> bool:
-    """跑一次 <python> -c "import pip"，返回码为 0 才算可用。"""
-    argv = [path, "-c", "import pip"]
+    """只选与运行程序的 Python 版本、平台及架构一致且带 pip 的解释器。"""
+    signature = (sys.implementation.cache_tag, sysconfig.get_platform(), struct.calcsize("P"))
+    script = (
+        "import struct, sys, sysconfig; "
+        "signature = (sys.implementation.cache_tag, sysconfig.get_platform(), struct.calcsize('P')); "
+        f"sys.exit(1) if signature != {signature!r} else None; import pip"
+    )
+    argv = [path, "-I", "-c", script]
     try:
         process = subprocess.Popen(
             argv,
@@ -291,24 +311,35 @@ def find_system_python() -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
-def _python_for_install(python=None) -> str:
-    """命令行里实际使用的解释器：显式给的 > 自动探测到的 > 默认 python。"""
-    text = str(python).strip() if python else ""
-    if text:
-        return text
-    return find_system_python() or DEFAULT_PYTHON_COMMAND
-
-
 def pip_argv(python=None, *, extra_index: bool = True) -> List[str]:
-    """拼出完整的 pip 安装命令（列表形式，各参数独立成项）。"""
+    """优先使用匹配的解释器，回退到指定版本的 Windows Python 启动器。"""
+    return _pip_argv(python or find_system_python(), extra_index=extra_index)
+
+
+def _pip_argv(python, *, extra_index: bool = True) -> List[str]:
+    executable = [os.fspath(python)] if python else (
+        ["py", f"-{sys.version_info.major}.{sys.version_info.minor}"] if _IS_WINDOWS
+        else [f"python{sys.version_info.major}.{sys.version_info.minor}"]
+    )
     argv = [
-        _python_for_install(python),
+        *executable,
+        "-I",
         "-m",
         "pip",
+        "--isolated",
         "install",
-        "--quiet",
+        "--only-binary=:all:",
+        "--upgrade",
         "--disable-pip-version-check",
         "--no-input",
+        "--progress-bar",
+        "off",
+        "--retries",
+        "2",
+        "--timeout",
+        "15",
+        "--index-url",
+        PIP_INDEX,
         "--target",
         str(runtime_dir()),
     ]
@@ -318,9 +349,29 @@ def pip_argv(python=None, *, extra_index: bool = True) -> List[str]:
     return argv
 
 
-def install_command_text(python=None) -> str:
-    """把 pip 命令拼成一行、可直接复制到 cmd 的文本。"""
-    return subprocess.list2cmdline(pip_argv(python))
+def install_command_text(python=None, *, detect_python: bool = True) -> str:
+    """返回在 PowerShell 可直接执行的完整命令。"""
+    argv = pip_argv(python) if detect_python else _pip_argv(python)
+    if _IS_WINDOWS:
+        return "& " + " ".join("'" + item.replace("'", "''") + "'" for item in argv)
+    from shlex import join
+
+    return join(argv)
+
+
+def _check_installed_engine(python: str) -> bool:
+    """在兼容的 Python 子进程里同时验证 Python 模块和原生 DLL。"""
+    try:
+        result = subprocess.run(
+            [python, "-I", "-c",
+             "import sys; sys.path.insert(0, sys.argv[1]); from llama_cpp import Llama",
+             str(runtime_dir())],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=_CREATE_NO_WINDOW, timeout=PYTHON_PROBE_TIMEOUT, check=False,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +535,7 @@ class BackendInstallThread(threading.Thread):
     def _safe_command(self) -> str:
         """异常兜底时也要能给出可复制的命令。"""
         try:
-            return install_command_text(self._python)
+            return install_command_text(self._python, detect_python=False)
         except Exception:  # noqa: BLE001
             return ""
 
@@ -503,6 +554,25 @@ class BackendInstallThread(threading.Thread):
             )
 
     def _install(self) -> InstallResult:
+        if getattr(sys, "frozen", False) and self._python is None:
+            from core.startup_environment import EnvironmentStatus, install_missing, supports_bundled_engine
+            from core.updater import DownloadCancelled, DownloadError
+
+            if supports_bundled_engine():
+                try:
+                    install_missing(
+                        EnvironmentStatus(needs_engine=True),
+                        progress=lambda message, _percent: self._handle_line(message),
+                        cancel=self._cancel_event.is_set,
+                    )
+                except DownloadCancelled:
+                    return InstallResult(ok=False, message=INSTALL_CANCELLED_MESSAGE, cancelled=True)
+                except (DownloadError, OSError) as exc:
+                    return InstallResult(ok=False, message=str(exc), lines=self._snapshot_lines())
+                ensure_runtime_on_path()
+                return InstallResult(ok=True, message=INSTALL_OK_MESSAGE, lines=self._snapshot_lines())
+
+        self._handle_line("正在查找兼容的 Python…")
         python = self._python
         if not python:
             found = find_system_python()
@@ -511,13 +581,16 @@ class BackendInstallThread(threading.Thread):
                     ok=False,
                     message=MISSING_PYTHON_MESSAGE,
                     lines=[],
-                    command=install_command_text(),
+                    command=install_command_text(detect_python=False),
                 )
             python = found
             self._python = python
 
         argv = pip_argv(python)
         command = install_command_text(python)
+        if self._cancel_event.is_set():
+            return InstallResult(ok=False, message=INSTALL_CANCELLED_MESSAGE, cancelled=True, command=command)
+        self._handle_line("正在准备下载官方预编译包…")
 
         try:
             process = subprocess.Popen(argv, **self._popen_kwargs())
@@ -531,6 +604,8 @@ class BackendInstallThread(threading.Thread):
 
         with self._lock:
             self._process = process
+        if self._cancel_event.is_set():
+            self._stop_process(force=True)
 
         timer = threading.Timer(self._timeout, self._on_timeout)
         timer.daemon = True
@@ -567,11 +642,17 @@ class BackendInstallThread(threading.Thread):
                 command=command,
             )
         if returncode == 0:
+            self._handle_line("正在验证推理核心…")
+            if not _check_installed_engine(python):
+                return InstallResult(
+                    ok=False, message="推理核心已下载，但加载验证失败。请查看安装输出或复制命令排查。",
+                    lines=self._snapshot_lines(), command=command,
+                )
             ensure_runtime_on_path()
             return InstallResult(
                 ok=True,
                 message=INSTALL_OK_MESSAGE,
-                lines=lines,
+                lines=self._snapshot_lines(),
                 command=command,
             )
         tail = "\n".join(_tail_lines(lines))
@@ -659,7 +740,7 @@ def install(*, on_line: Optional[Callable[[str], None]] = None,
 # ---------------------------------------------------------------------------
 
 
-def backend_status() -> tuple[bool, str]:
+def backend_status(*, probe_python: bool = True) -> tuple[bool, str]:
     """返回 (后端是否可用, 中文说明)，直接给界面显示，永远是纯文本。"""
     if is_backend_available():
         return True, BACKEND_READY_MESSAGE
@@ -672,6 +753,8 @@ def backend_status() -> tuple[bool, str]:
         first = f"程序目录里有一个没装完的推理后端（{target}），它现在还不能用，可以重新安装。"
     else:
         first = "程序目录里还没有安装推理后端。"
+    if not probe_python:
+        return False, first
     python = find_system_python()
     if python:
         tail = "本机找到了可用的系统 Python，可以一键安装。"

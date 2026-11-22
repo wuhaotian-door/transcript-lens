@@ -93,6 +93,8 @@ def no_system_python(monkeypatch, tmp_path):
     monkeypatch.setattr(rt.shutil, "which", lambda name: None)
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "missing-localappdata"))
     monkeypatch.setattr(rt, "_iter_system_drive_roots", lambda: iter(()))
+    monkeypatch.setattr(rt.Path, "home", lambda: tmp_path / "missing-home")
+    monkeypatch.setattr(rt, "default_root", lambda: tmp_path)
 
 
 @pytest.fixture()
@@ -112,7 +114,7 @@ def test_constants_match_contract():
     assert rt.ENGINE_MODULE == "llama_cpp"
     assert rt.RUNTIME_DIR_NAME == "runtime/site"
     assert rt.PIP_PACKAGE == "llama-cpp-python"
-    assert rt.PIP_EXTRA_INDEX == "https://mirrors.aliyun.com/pypi/simple/"
+    assert rt.PIP_EXTRA_INDEX == "https://abetlen.github.io/llama-cpp-python/whl/cpu"
     assert rt.INSTALL_TIMEOUT == 600
     assert rt.PYTHON_PROBE_TIMEOUT == 20
     assert rt.INSTALL_OK_MESSAGE == "推理后端安装成功"
@@ -138,14 +140,14 @@ def test_runtime_dir_uses_crypto_store_root(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_ensure_runtime_on_path_inserts_at_front(monkeypatch, tmp_path, isolated_sys_path):
+def test_ensure_runtime_on_path_preserves_precedence_of_bundled_dependencies(monkeypatch, tmp_path, isolated_sys_path):
     target = tmp_path / "runtime" / "site"
     target.mkdir(parents=True)
     monkeypatch.setattr(rt, "default_root", lambda: tmp_path)
 
     assert rt.ensure_runtime_on_path() is True
-    assert sys.path[0] == str(target)
-    assert sys.path[1:] == isolated_sys_path
+    assert sys.path[-1] == str(target)
+    assert sys.path[:-1] == isolated_sys_path
 
 
 def test_ensure_runtime_on_path_is_idempotent(monkeypatch, tmp_path, isolated_sys_path):
@@ -184,7 +186,7 @@ def test_ensure_runtime_on_path_accepts_explicit_directory(tmp_path, isolated_sy
     target.mkdir(parents=True)
 
     assert rt.ensure_runtime_on_path(target) is True
-    assert sys.path[0] == str(target)
+    assert sys.path[-1] == str(target)
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +199,8 @@ def test_pip_argv_targets_package_and_runtime_dir(monkeypatch, tmp_path):
     argv = rt.pip_argv("C:\\Python313\\python.exe")
 
     assert argv[0] == "C:\\Python313\\python.exe"
-    assert argv[1:4] == ["-m", "pip", "install"]
+    assert argv[1:6] == ["-I", "-m", "pip", "--isolated", "install"]
+    assert "--only-binary=:all:" in argv
     assert "--target" in argv
     assert str(tmp_path / "runtime" / "site") in argv
     assert argv[-1] == rt.PIP_PACKAGE
@@ -232,13 +235,14 @@ def test_install_command_text_is_single_line_with_package(monkeypatch, tmp_path)
     assert rt.PIP_PACKAGE in text
     assert rt.PIP_EXTRA_INDEX in text
     assert "\n" not in text
-    assert "-m pip install" in text
+    assert "pip" in text and "--only-binary=:all:" in text
 
 
 def test_install_command_text_quotes_paths_with_spaces(monkeypatch, tmp_path):
     monkeypatch.setattr(rt, "default_root", lambda: tmp_path)
     text = rt.install_command_text("C:\\Program Files\\Python313\\python.exe")
-    assert text.startswith('"C:\\Program Files\\Python313\\python.exe"')
+    prefix = "& 'C:\\Program Files\\Python313\\python.exe'" if rt._IS_WINDOWS else "'C:\\Program Files\\Python313\\python.exe'"
+    assert text.startswith(prefix)
 
 
 # ---------------------------------------------------------------------------
@@ -296,8 +300,10 @@ def test_probe_python_runs_import_pip(monkeypatch):
     monkeypatch.setattr(rt.subprocess, "Popen", FakeProbe)
     assert rt._probe_python("C:\\Python313\\python.exe") is True
     assert captured["argv"][0] == "C:\\Python313\\python.exe"
-    assert captured["argv"][1] == "-c"
-    assert "import pip" in captured["argv"][2]
+    assert captured["argv"][1:3] == ["-I", "-c"]
+    assert "import pip" in captured["argv"][3]
+    assert "sys.implementation.cache_tag" in captured["argv"][3]
+    assert "sysconfig.get_platform()" in captured["argv"][3]
     assert captured["wait_timeout"] == rt.PYTHON_PROBE_TIMEOUT
 
 
@@ -410,6 +416,7 @@ def test_install_thread_success(monkeypatch, tmp_path):
     monkeypatch.setattr(rt, "default_root", lambda: tmp_path)
     fake = FakeProcess(returncode=0, lines=["准备安装", "安装完成"])
     _patch_popen(monkeypatch, fake)
+    monkeypatch.setattr(rt, "_check_installed_engine", lambda _python: True)
     ensured: list[bool] = []
     monkeypatch.setattr(rt, "ensure_runtime_on_path", lambda *a, **k: ensured.append(True) or True)
 
@@ -420,8 +427,8 @@ def test_install_thread_success(monkeypatch, tmp_path):
     assert thread.result is not None
     assert thread.result.ok is True
     assert thread.result.message == "推理后端安装成功"
-    assert shown == ["准备安装", "安装完成"]
-    assert thread.result.lines == ["准备安装", "安装完成"]
+    assert shown[-3:] == ["准备安装", "安装完成", "正在验证推理核心…"]
+    assert thread.result.lines == shown
     assert ensured == [True]
     assert rt.PIP_PACKAGE in thread.result.command
 
@@ -550,7 +557,7 @@ def backend_module():
 
 
 def _stub_status(monkeypatch, available, message, python="C:\\fake\\python.exe"):
-    monkeypatch.setattr(rt, "backend_status", lambda: (available, message))
+    monkeypatch.setattr(rt, "backend_status", lambda **_kwargs: (available, message))
     monkeypatch.setattr(rt, "find_system_python", lambda: python)
 
 
@@ -590,7 +597,13 @@ def test_card_missing_python_state_shows_command(monkeypatch, qapp, backend_modu
     )
     card = backend_module.BackendSetupCard()
 
-    assert card._install_button.isHidden()
+    assert card._install_button.isVisibleTo(card)
+    assert card._command_row.isHidden()
+    card._start_install()
+    assert card._bar.isVisibleTo(card) and card._bar.maximum() == 0
+    card._thread.join(2)
+    card._finish_install()
+    assert card._bar.isHidden()
     assert card._command_row.isVisibleTo(card)
     assert rt.PIP_PACKAGE in card._command_label.text()
     # ★ v1.9.2 终版：命令用 QLabel（不用只读 QLineEdit，后者会被 findChildren 当成
@@ -608,6 +621,9 @@ def test_card_copy_command_writes_clipboard(monkeypatch, qapp, backend_module):
         python=None,
     )
     card = backend_module.BackendSetupCard()
+    card._start_install()
+    card._thread.join(2)
+    card._finish_install()
     card._copy_button.click()
 
     assert qapp.clipboard().text() == card._command_label.text()
@@ -634,13 +650,13 @@ def test_card_install_requires_confirmation(monkeypatch, qapp, backend_module):
     assert calls == ["question"]  # 确认框被问过一次
     assert card._thread is None  # 点了「否」就绝不该启动安装
     assert "llama-cpp-python" in backend_module.INSTALL_QUESTION
-    assert "60MB" in backend_module.INSTALL_QUESTION
+    assert "所需依赖" in backend_module.INSTALL_QUESTION
 
 
 def test_card_install_success_emits_ready(monkeypatch, qapp, backend_module):
     state = {"installed": False}
 
-    def fake_status():
+    def fake_status(**_kwargs):
         if state["installed"]:
             return True, "推理后端已就绪"
         return False, "程序目录里还没有安装推理后端。本机找到了可用的系统 Python，可以一键安装。"

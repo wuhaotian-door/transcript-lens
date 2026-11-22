@@ -92,9 +92,11 @@ from ui.pages.profile_shared import (
     open_student_book,
     record_student_audit,
     store_archive,
+    student_order_key,
 )
 from ui.pages.semester_side_profile import SemesterSideProfilePage
 from ui.pages.student_overview import StudentOverviewPage
+from ui.widgets.grade_trend import GradeTrendChart
 from ui.widgets.profile_reading import profile_scroll
 from ui.workers import run_async
 
@@ -619,6 +621,8 @@ class ArchivePage(QWidget):
         head.addStretch(1)
         box.addLayout(head)
 
+        self._grade_trend = GradeTrendChart(self)
+        box.addWidget(self._grade_trend)
         self._timeline_scroll = QScrollArea()
         self._timeline_scroll.setWidgetResizable(True)
         self._timeline_scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -684,7 +688,7 @@ class ArchivePage(QWidget):
             heading.setFlags(Qt.ItemFlag.ItemIsEnabled)
             heading.setToolTip(title)
             self._list.addItem(heading)
-            for student in sorted(by_class[klass], key=lambda s: (s.student, s.student_id)):
+            for student in sorted(by_class[klass], key=lambda s: student_order_key(s.student_id, s.student)):
                 row = self._list.count()
                 label = (f"{student.student}（{student.student_id}）"
                          if student.student_id else student.student)
@@ -848,6 +852,8 @@ class ArchivePage(QWidget):
                 widget.deleteLater()
 
         series = info.get("series") or []
+        self._grade_trend.set_series((str(point.get("term") or "未标注学期"), point.get("average"))
+                                     for point in series)
         self._timeline_scroll.setFixedHeight(min(330, max(84, 48 * len(series) + 12)))
         self._timeline_scroll.verticalScrollBar().setValue(0)
         if not series:

@@ -467,7 +467,7 @@ def test_roster_without_ids_fills_empty_list(make_page: Any) -> None:
 
     assert page.visible_count == 2
     assert page._list.count() == 2
-    assert [page._list.item(i).text() for i in range(2)] == ["刘一", "陈二"]
+    assert [page._list.item(i).text() for i in range(2)] == ["陈二", "刘一"]
     assert book.records() == [], "没有学号的名单行不该进主档"
 
 

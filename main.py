@@ -2807,6 +2807,11 @@ def _say(text: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
 
+    if args[:1] == ["--probe-local-ai-runtime"]:
+        from core.startup_environment import probe_process
+
+        return probe_process(Path(args[1]) if len(args) > 1 else None)
+
     if "--selfcheck" in args:
         return run_selfcheck()
 
@@ -2865,6 +2870,11 @@ def main(argv: list[str] | None = None) -> int:
     if run_pending_update(flow.root):
         return 0
     run_startup_migration(flow.root)
+    if IS_FROZEN and sys.platform == "win32":
+        from ui.startup_environment import check_before_start
+
+        if not check_before_start():
+            return 1
     flow.start()
     return app.exec()
 

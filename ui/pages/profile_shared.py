@@ -24,11 +24,12 @@ import inspect
 import json
 import logging
 import os
+import re
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Sequence
 
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QCollator, QLocale, QSize, Qt, Signal
 from PySide6.QtGui import QFont, QFontMetrics
 from PySide6.QtWidgets import (
     QApplication,
@@ -71,6 +72,16 @@ RESCUE_TARGET = 85.0
 
 #: 趋势判定的死区：|Δ| 小于这个值就当"平稳"
 TREND_EPS = 0.5
+
+_STUDENT_NAME_ORDER = QCollator(QLocale("zh_CN"))
+
+
+def student_order_key(student_id: str, name: str) -> tuple:
+    """有学号优先，学号按数字段比较，同学号或无学号时按姓名拼音排列。"""
+    sid = str(student_id or "").strip()
+    parts = tuple((0, int(part)) if part.isdecimal() else (1, part.casefold())
+                  for part in re.findall(r"\d+|[^\d]+", sid))
+    return not sid, parts, _STUDENT_NAME_ORDER.sortKey(str(name or "").casefold()), sid
 
 #: 可抢救项最多列几门（列表太长反而看不清重点）
 MAX_RESCUE = 5

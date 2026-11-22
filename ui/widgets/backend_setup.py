@@ -1,6 +1,6 @@
 """本地推理后端的安装卡片（v1.9.2）。
 
-BackendSetupCard 是一个三态卡片：就绪 / 可一键安装 / 缺少系统 Python。
+BackendSetupCard 展示安装、进度、重试和就绪状态。
 模型中心与档案页的 AI 辅导入口共用这一个组件。
 
 约束：
@@ -27,12 +27,15 @@ from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
+    QScrollArea,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
 from core.ai import runtime_setup
+from core.startup_environment import supports_bundled_engine
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +56,7 @@ READY_BADGE_TEXT = "已就绪"
 COPY_HINT_TEXT = "已复制，请在命令行执行后重启程序"
 
 # 只有用户点过确认弹窗，才会联网安装。
-INSTALL_QUESTION = "将联网安装 llama-cpp-python 到本程序目录，约 60MB，确定继续？"
+INSTALL_QUESTION = "将联网下载 llama-cpp-python 和所需依赖，安装到应用的运行时目录。继续吗？"
 CONFIRM_TITLE = "安装推理后端"
 
 # 安装线程结束后回主线程的延迟（毫秒）；0 = 排到事件循环下一轮。
@@ -71,7 +74,7 @@ def _tail_lines(lines: List[str], limit: int = MAX_LINES_SHOWN) -> List[str]:
 
 
 class BackendSetupCard(QFrame):
-    """推理后端安装卡片。三态：ready / installable / missing-python。"""
+    """推理后端安装卡片。"""
 
     ready = Signal()
 
@@ -84,6 +87,7 @@ class BackendSetupCard(QFrame):
         self._queue: "queue.Queue[str]" = queue.Queue()
         self._output: List[str] = []
         self._last_command = ""
+        self._install_failed = False
         self._shutdown = False
 
         layout = QVBoxLayout(self)
@@ -109,10 +113,16 @@ class BackendSetupCard(QFrame):
         self._ready_badge.setObjectName("Notice")
         layout.addWidget(self._ready_badge)
 
+        self._bar = QProgressBar(self)
+        self._bar.setTextVisible(False)
+        self._bar.setFixedHeight(10)
+        self._bar.hide()
+        layout.addWidget(self._bar)
+
         self._progress = QPlainTextEdit(self)
         self._progress.setReadOnly(True)
         self._progress.setMaximumBlockCount(MAX_LINES_SHOWN)
-        self._progress.setMinimumHeight(96)
+        self._progress.setFixedHeight(104)
         self._progress.setPlaceholderText("安装输出会显示在这里。")
         layout.addWidget(self._progress)
 
@@ -121,7 +131,7 @@ class BackendSetupCard(QFrame):
         layout.addWidget(self._result)
 
         self._command_row = QWidget(self)
-        command_layout = QHBoxLayout(self._command_row)
+        command_layout = QVBoxLayout(self._command_row)
         command_layout.setContentsMargins(0, 0, 0, 0)
         command_layout.setSpacing(8)
         # ★ 命令用 QLabel 而不是只读 QLineEdit：只读 QLineEdit 会被
@@ -130,12 +140,13 @@ class BackendSetupCard(QFrame):
         self._command_label = QLabel("", self._command_row)
         self._command_label.setObjectName("Muted")
         self._command_label.setWordWrap(True)
+        self._command_label.setTextFormat(Qt.TextFormat.PlainText)
         self._command_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        command_layout.addWidget(self._command_label, 1)
+        command_layout.addWidget(self._command_label)
         self._copy_button = QPushButton(COPY_BUTTON_TEXT, self._command_row)
-        command_layout.addWidget(self._copy_button)
+        command_layout.addWidget(self._copy_button, alignment=Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(self._command_row)
 
         self._copy_hint = QLabel("", self)
@@ -147,6 +158,7 @@ class BackendSetupCard(QFrame):
         buttons.setContentsMargins(0, 0, 0, 0)
         buttons.setSpacing(8)
         self._install_button = QPushButton(INSTALL_BUTTON_TEXT, self)
+        self._install_button.setObjectName("Primary")
         self._cancel_button = QPushButton(CANCEL_BUTTON_TEXT, self)
         buttons.addWidget(self._install_button)
         buttons.addWidget(self._cancel_button)
@@ -166,16 +178,15 @@ class BackendSetupCard(QFrame):
     # -- 对外接口 -----------------------------------------------------------
 
     def refresh(self) -> None:
-        """重新探测状态并刷新界面；安装进行中时只刷新文案，不动按钮。"""
-        if self._shutdown:
+        """只查询模块状态，兼容解释器由安装线程查找。"""
+        if self._shutdown or self._thread is not None:
             return
         try:
-            available, message = runtime_setup.backend_status()
+            available, message = runtime_setup.backend_status(probe_python=False)
         except Exception:  # noqa: BLE001 - 状态探测失败也必须给出人话
             logger.exception("探测推理后端状态失败")
             available, message = False, "暂时无法判断推理后端的状态，请稍后重试。"
-        python = None if available else self._system_python()
-        self._apply_state(available, message, python)
+        self._apply_state(available, message)
 
     def stop(self) -> None:
         """窗口关闭时调用：停掉轮询并请求取消安装。"""
@@ -196,67 +207,31 @@ class BackendSetupCard(QFrame):
 
     # -- 状态渲染 -----------------------------------------------------------
 
-    @staticmethod
-    def _system_python() -> Optional[str]:
-        try:
-            return runtime_setup.find_system_python()
-        except Exception:  # noqa: BLE001 - 探不到就当没有
-            logger.warning("探测系统 Python 失败", exc_info=True)
-            return None
-
     def _fallback_command(self) -> str:
         try:
-            return runtime_setup.install_command_text()
+            return runtime_setup.install_command_text(detect_python=False)
         except Exception:  # noqa: BLE001
             return ""
 
-    def _apply_state(self, available: bool, message: str, python: Optional[str]) -> None:
-        installing = self._state == "installing"
-        if available:
-            state = "ready"
-        elif python:
-            state = "installable"
-        else:
-            state = "missing-python"
-        if installing and not available:
-            # 安装进行中：保持进度区与取消按钮，只更新标题下的说明。
-            self._state = "installing"
-            self._status.setText(message)
-            return
-        self._state = state
+    def _apply_state(self, available: bool, message: str) -> None:
+        if self._install_failed:
+            available = False
+            message = "本次安装未通过。"
+        self._state = "ready" if available else "installable"
         self._status.setText(message)
-
-        ready = state == "ready"
-        self._ready_badge.setVisible(ready)
-        self._install_button.setVisible(not ready and state == "installable")
-        self._install_button.setEnabled(not ready and state == "installable")
+        failed = self._install_failed and not available
+        self._ready_badge.setVisible(available)
+        self._install_button.setVisible(not available)
+        self._install_button.setEnabled(not available)
+        self._install_button.setText("重试安装" if failed else INSTALL_BUTTON_TEXT)
         self._cancel_button.setVisible(False)
-        self._install_hint.setVisible(state == "installable")
-        if state == "installable":
-            self._install_hint.setText(
-                "本地推理组件未安装，点击一键安装（耗时约10~30秒，无需手动操作）"
-            )
+        self._install_hint.setText("点击一键安装，下载所需的本地推理组件。")
+        self._install_hint.setVisible(not available and not failed)
         self._result.setVisible(bool(self._result.text()))
-
-        if state == "missing-python":
-            if not self._last_command:
-                self._last_command = self._fallback_command()
-            if self._last_command:
-                self._command_label.setText(self._last_command)
-                self._command_row.setVisible(True)
-            else:
-                self._command_row.setVisible(False)
-        elif state == "ready":
-            if self._output:
-                self._progress.setPlainText("\n".join(_tail_lines(self._output)))
-            self._progress.setVisible(bool(self._output))
-            self._command_row.setVisible(False)
-        else:
-            self._progress.setVisible(False)
-            # 上一次失败留下过命令：继续摆着，方便用户复制后重试。
-            show_command = bool(self._last_command) and bool(self._result.text())
-            self._command_row.setVisible(show_command)
-            self._copy_hint.setVisible(False)
+        self._bar.hide()
+        self._progress.setVisible(failed and bool(self._output))
+        self._command_row.setVisible(failed and bool(self._last_command))
+        self._copy_hint.hide()
 
     # -- 安装流程 -----------------------------------------------------------
 
@@ -278,30 +253,23 @@ class BackendSetupCard(QFrame):
     def _start_install(self) -> None:
         if self._thread is not None:
             return
-        python = self._system_python()
-        if not python:
-            # 没有系统 Python：不给「一键安装」这条路，刷新成缺 Python 态。
-            self.refresh()
-            return
         self._output = []
         self._progress.clear()
-        self._progress.setVisible(True)
+        self._progress.hide()
         self._last_command = ""
-        try:
-            self._last_command = runtime_setup.install_command_text(python)
-        except Exception:  # noqa: BLE001
-            self._last_command = ""
-        self._result.setText("正在安装，请不要关闭程序。")
+        self._install_failed = False
+        self._command_row.hide()
+        self._install_hint.hide()
+        self._bar.setRange(0, 0)
+        self._bar.show()
+        self._result.setText("正在准备安装…")
         self._result.setVisible(True)
         self._copy_hint.setVisible(False)
         self._state = "installing"
         self._install_button.setEnabled(False)
         self._cancel_button.setVisible(True)
         self._cancel_button.setEnabled(True)
-        thread = runtime_setup.BackendInstallThread(
-            on_line=self._enqueue_line,
-            python=python,
-        )
+        thread = runtime_setup.BackendInstallThread(on_line=self._enqueue_line)
         self._thread = thread
         self._poll_timer.start()
         thread.start()
@@ -325,6 +293,13 @@ class BackendSetupCard(QFrame):
         self._output.extend(lines)
         for line in lines:
             self._progress.appendPlainText(line)
+            if self._state == "installing" and self._cancel_button.isEnabled():
+                if line.startswith("正在"):
+                    self._result.setText(line)
+                elif line.startswith(("Collecting ", "Downloading ")):
+                    self._result.setText("正在下载推理核心和依赖…")
+                elif line.startswith("Installing collected packages"):
+                    self._result.setText("正在安装推理核心…")
         bar = self._progress.verticalScrollBar()
         bar.setValue(bar.maximum())
 
@@ -360,22 +335,17 @@ class BackendSetupCard(QFrame):
                 lines=[],
                 command=self._last_command,
             )
-        if result.command:
-            self._last_command = result.command
         self._cancel_button.setEnabled(True)
-        self._result.setText(result.message)
+        self._result.setText(result.message.split("\n", 1)[0])
         self._result.setVisible(True)
 
         installed = bool(result.ok)
-        if installed:
-            self._copy_hint.setVisible(False)
-        else:
-            fallback = self._last_command or self._fallback_command()
-            if fallback:
-                self._last_command = fallback
-                self._command_label.setText(fallback)
-                self._command_row.setVisible(True)
-            self._copy_hint.setVisible(False)
+        if not installed and not result.cancelled:
+            self._install_failed = True
+            self._last_command = result.command
+            if not self._last_command and not supports_bundled_engine():
+                self._last_command = self._fallback_command()
+            self._command_label.setText(self._last_command)
         self.refresh()
         if installed:
             self.ready.emit()
@@ -437,7 +407,11 @@ class BackendSetupDialog(QDialog):
         layout.setSpacing(12)
 
         self.card = BackendSetupCard(self)
-        layout.addWidget(self.card)
+        scroll = QScrollArea(self)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.card)
+        layout.addWidget(scroll, 1)
 
         bottom = QHBoxLayout()
         bottom.addStretch(1)
@@ -457,18 +431,14 @@ class BackendSetupDialog(QDialog):
         self._close_btn.style().unpolish(self._close_btn)
         self._close_btn.style().polish(self._close_btn)
 
-    def closeEvent(self, event) -> None:  # noqa: N802
+    def done(self, result: int) -> None:
         self.card.stop()
-        super().closeEvent(event)
+        super().done(result)
 
 
 def open_backend_setup(parent: QWidget | None = None) -> bool:
     """打开本地推理后端安装窗口。返回是否已就绪。"""
     dialog = BackendSetupDialog(parent)
     dialog.exec()
-    try:
-        from core.ai.runtime_setup import is_backend_available
-        return bool(is_backend_available())
-    except Exception:
-        return False
+    return dialog.card._state == "ready"
 

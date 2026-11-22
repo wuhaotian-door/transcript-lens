@@ -422,6 +422,16 @@ class MainWindow(QMainWindow):
         self.show()
         window_fade_in(self, WINDOW_FADE_IN_MS)
         QTimer.singleShot(FADE_IN_FAILSAFE_MS, self, self._ensure_opaque)
+        QTimer.singleShot(FADE_IN_FAILSAFE_MS, self, lambda: self._guide_new_user(username))
+
+    def _guide_new_user(self, username: str) -> None:
+        if username != self._username or not self.isVisible():
+            return
+        from ui.first_run import show_first_run_guide
+
+        if show_first_run_guide(self, self._store, username):
+            self.goto(DEFAULT_PAGE)
+            self.analysis_page._import_btn.click()
 
     def _ensure_opaque(self) -> None:
         """淡入看门狗：**只在明显没到位时**兜底，正常动画不去碰它。"""

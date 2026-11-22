@@ -268,6 +268,8 @@ def test_register_shows_recovery_code_without_email_or_when_delivery_fails(
         assert bool(checked) == (smtp_enabled and with_email)
         assert len(shown) == 1
         assert check_recovery_code(store, "test_registration", shown[0])
+        from core.user_store import load_user_json
+        assert load_user_json(store, "test_registration", "first_run.json.enc")["pending"] is True
         store.login("test_registration", PASSWORD)
     finally:
         window.deleteLater()

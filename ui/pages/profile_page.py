@@ -145,6 +145,7 @@ from ui.pages.profile_shared import (
     same_student_id,
     student_archive_of,
     student_archive_of_key,
+    student_order_key,
     student_semester_rows,
     store_archive,
     term_of_archive,
@@ -966,7 +967,10 @@ class ProfilePage(QWidget):
         all_entries = self._list_entries("")
         self._total_people = len(all_entries)
         entries = self._list_entries(self._search_text)
-        entries.sort(key=lambda entry: (not entry['class_name'], entry['class_name'].casefold()))
+        entries.sort(key=lambda entry: (
+            not entry["class_name"], entry["class_name"].casefold(),
+            student_order_key(entry["sid"], entry["name"]),
+        ))
         self._entries = entries
         self._list.blockSignals(True)
         try:

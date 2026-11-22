@@ -50,6 +50,7 @@ from PySide6.QtWidgets import (
 )
 
 from ui.widgets.profile_reading import ProfileDocument, profile_scroll
+from ui.academic_context import AcademicContext
 from ui.widgets.model_picker import CORE_MISSING_HINT, ModelPicker
 
 from core.ai.inference import (
@@ -213,6 +214,8 @@ class _ChatWorker(QThread):
         max_tokens: int = DEFAULT_MAX_TOKENS,
         temperature: float = DEFAULT_TEMPERATURE,
         stop: Sequence[str] | None = None,
+        academic_context: AcademicContext | None = None,
+        question: str = "",
     ) -> None:
         super().__init__()
         self._engine = engine
@@ -220,6 +223,8 @@ class _ChatWorker(QThread):
         self._max_tokens = max_tokens
         self._temperature = temperature
         self._stop = tuple(stop or ())
+        self._academic_context = academic_context
+        self._question = question
         self._cancelled = False
         #: 已经吐出来的整段回答（**线程侧**自己攒，见 :meth:`ChatDialog._record_partial`）
         self._answer = ""
@@ -249,8 +254,13 @@ class _ChatWorker(QThread):
             self.failed.emit(friendly_error(exc))
             return
         try:
+            prompt = self._prompt
+            if self._academic_context is not None:
+                prompt = self._academic_context.render(
+                    prompt, self._question, engine.n_ctx - self._max_tokens - 16, engine.count_tokens,
+                )
             for piece in engine.stream(
-                self._prompt,
+                prompt,
                 self._max_tokens,
                 self._temperature,
                 stop=self._stop or None,
@@ -330,14 +340,18 @@ class ChatDialog(QDialog):
         models: Sequence[LocalModel] | None = None,
         system_prompt: str | None = None,
         prefer_model: str | None = None,
+        academic_context: AcademicContext | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("AI 谈话助手")
+        self._academic_context = academic_context
+        self.setWindowTitle("全学期 AI 分析" if academic_context else "AI 谈话助手")
         self.resize(980, 640)
         self.setMinimumSize(540, 420)
 
         self._store = store if store is not None else getattr(parent, "_store", None)
         self._username = username or str(getattr(parent, "_username", "") or "")
+        if academic_context is not None:
+            self._store = None
         self._injected_engine = engine
         self._system_prompt = (system_prompt or SYSTEM_PROMPT).strip()
 
@@ -373,9 +387,18 @@ class ChatDialog(QDialog):
         root.setSpacing(12)
         outer.addWidget(profile_scroll(content))
 
-        head = QLabel("AI 谈话助手")
+        head = QLabel(self.windowTitle())
         head.setObjectName("H1")
         root.addWidget(head)
+        if self._academic_context is not None:
+            context = self._academic_context
+            description = QLabel(
+                f"已接入 {len(context.courses)} 个学期的 {context.course_count} 条课程记录。"
+                "可指定学期或课程提问。"
+            )
+            description.setObjectName("Muted")
+            description.setWordWrap(True)
+            root.addWidget(description)
 
         self.history_view = ProfileDocument(conversation=True)
         self.history_view.setReadOnly(True)
@@ -567,7 +590,10 @@ class ChatDialog(QDialog):
                 engine.unload()
             except Exception:  # noqa: BLE001 - 换模型时释放失败不该拦住谈话
                 pass
-        self._engine = LocalModelEngine(model.path)
+        self._engine = (
+            LocalModelEngine(model.path, n_ctx=4096) if self._academic_context is not None
+            else LocalModelEngine(model.path)
+        )
         return self._engine
 
     def _on_model_changed(self, _index: int) -> None:
@@ -793,6 +819,8 @@ class ChatDialog(QDialog):
             max_tokens=DEFAULT_MAX_TOKENS,
             temperature=DEFAULT_TEMPERATURE,
             stop=STOP_WORDS,
+            academic_context=self._academic_context,
+            question=text,
         )
         worker.chunk.connect(self._on_chunk)
         worker.failed.connect(self._on_failed)
