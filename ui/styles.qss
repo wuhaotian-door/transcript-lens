@@ -1,5 +1,5 @@
 /* ============================================================================
-   成绩单透镜 · 全局样式表
+   朝夕工作台 · 全局样式表
    ----------------------------------------------------------------------------
    配色（改这里就是改全局观感）：
      主色    #3B82F6      深色侧栏 #1E293B      背景 #F1F5F9
@@ -744,4 +744,20 @@ QProgressBar {
 QProgressBar::chunk {
     background: #3B82F6;
     border-radius: 5px;
+}
+
+QPushButton#SegmentButton {
+    background-color: #eef3fb;
+    color: #253a54;
+    border: 1px solid #d5e0ef;
+    border-radius: 7px;
+    padding: 5px 16px;
+}
+QPushButton#SegmentButton:checked {
+    background-color: #123558;
+    color: #ffffff;
+    border-color: #123558;
+}
+QPushButton#SegmentButton:focus {
+    border: 2px solid #4485df;
 }

@@ -180,12 +180,16 @@ class ArchivePage(QWidget):
     student_deleted = Signal(str, str)
     class_deleted = Signal(str, object)
     model_settings_requested = Signal()
+    details_requested = Signal(str)
+    interview_requested = Signal(str)
+    import_requested = Signal()
 
     def __init__(self, store: CryptoStore | None = None,
                  parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._store = store if store is not None else CryptoStore()
         self._username = ""
+        self.vault = None
         self._book: StudentBook | None = None
         self._archive: Archive | None = None
         self._current: Any = None
@@ -366,6 +370,11 @@ class ArchivePage(QWidget):
         self._list.setFrameShape(QFrame.Shape.NoFrame)
         self._list.setItemDelegate(_ClassRosterDelegate(self._list))
         self._list.itemClicked.connect(self._on_item_clicked)
+        self._list.itemActivated.connect(self._open_details_from_item)
+        imports = QPushButton("导入学生资料")
+        imports.setObjectName("Ghost")
+        imports.clicked.connect(self.import_requested.emit)
+        holder_box.addWidget(imports)
         self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self._roster_context_menu)
         box.addWidget(self._list, 1)
@@ -491,6 +500,7 @@ class ArchivePage(QWidget):
         else:
             self._list.setCurrentItem(item)
             self._on_item_clicked(item)
+            menu.addAction("打开学生资料", lambda: self._open_details_from_item(item))
             menu.addAction("编辑学生…", self._open_edit_student)
             menu.addAction("删除学生…", self._delete_student)
         menu.aboutToHide.connect(menu.deleteLater)
@@ -561,6 +571,7 @@ class ArchivePage(QWidget):
         self._overview_page.back_requested.connect(self._back_to_archive)
         self._overview_page.semester_requested.connect(self.open_semester_profile)
         self._overview_page.model_settings_requested.connect(self.model_settings_requested.emit)
+        self._overview_page.interview_requested.connect(self._ask_interview)
         self._detail_stack.addWidget(self._overview_page)
         self._detail_stack.currentChanged.connect(self._on_detail_page_changed)
 
@@ -783,6 +794,15 @@ class ArchivePage(QWidget):
             self.reset_view()
         self._count_pill.setText(str(self.visible_count))
         self._update_note_filter()
+
+    def _open_details_from_item(self, item):
+        sid = item.data(_ROLE_ID)
+        if sid and not item.data(_ROLE_CLASS_GROUP):
+            self.details_requested.emit(str(sid))
+
+    def _ask_interview(self):
+        if self._current and self._current.student_id:
+            self.interview_requested.emit(_bare_sid(self._current.student_id))
 
     def _on_item_clicked(self, item: QListWidgetItem) -> None:
         key = self._key_by_row.get(self._list.row(item))
@@ -1062,6 +1082,7 @@ class ArchivePage(QWidget):
         if self._current is None or self._detail_stack is None:
             return
         class_name = self._class_by_sid.get(_bare_sid(self._current.student_id), "")
+        self._overview_page.vault = self.vault
         self._overview_page.set_context(self._store, self._username, self._current, class_name)
         self._detail_stack.setCurrentWidget(self._overview_page)
 
@@ -1073,6 +1094,7 @@ class ArchivePage(QWidget):
         name = getattr(self._current, "student", "") or ""
         from_overview = self._detail_stack.currentWidget() is self._overview_page
         back = self._back_to_overview if from_overview else self._back_to_archive
+        self._semester_page.workbench_vault = self.vault
         try:
             self._semester_page.set_context(
                 self._store,
@@ -1226,6 +1248,22 @@ class ArchivePage(QWidget):
             choice = self._confirm_sid_change(old_sid, new_sid)
             if choice is None:
                 return
+            from core.sensitive_vault import sensitive_filename
+            from core.user_store import user_file
+            from ui.workbench_widgets import unlock
+
+            old_sensitive = user_file(self._store, self._username, sensitive_filename(old_sid))
+            if old_sensitive is not None and old_sensitive.exists():
+                if choice == "info":
+                    QMessageBox.warning(self, "请迁移学生资料", "该生含有敏感资料，请选择迁移全部数据。")
+                    return
+                if not unlock(self, self.vault):
+                    return
+                try:
+                    self.vault.move_student(old_sid, new_sid)
+                except Exception as error:
+                    QMessageBox.warning(self, "未完成学号修改", str(error))
+                    return
             if choice == "info":
                 QMessageBox.information(
                     self,
@@ -1263,8 +1301,9 @@ class ArchivePage(QWidget):
 
         if self._book is not None and old_sid:
             try:
+                editable_id = new_sid if self._book.get(new_sid) is not None else old_sid
                 self._book.update(
-                    old_sid,
+                    editable_id,
                     student_id=new_sid,
                     name=new_name,
                     class_name=values.get("class_name", ""),

@@ -179,7 +179,7 @@ class SplashScreen(QWidget):
 
     def __init__(
         self,
-        title: str = "成绩单透镜",
+        title: str = "朝夕工作台",
         version: str = f"v{CURRENT_VERSION}",
         slogan: str = "把成绩单，变成能坐下来谈的东西",
         *,

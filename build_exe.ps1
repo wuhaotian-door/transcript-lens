@@ -117,12 +117,36 @@ if ((Invoke-Native python -B main.py --selfcheck) -ne 0) {
     throw '源码自检失败，先修好再打包'
 }
 
+# Windows 文件属性和安装向导统一读取版本源。
+$version = & python -B -c 'from core.version import CURRENT_VERSION; print(CURRENT_VERSION)'
+if ($LASTEXITCODE -ne 0 -or $version -notmatch '^\d+\.\d+\.\d+$') { throw '读取构建版本失败' }
+$versionTuple = ($version -replace '\.', ',') + ',0'
+$versionDir = (New-Item -ItemType Directory -Force -Path (Join-Path $Root 'build')).FullName
+$versionResource = Join-Path $versionDir 'workbench-version.txt'
+@"
+VSVersionInfo(
+    ffi=FixedFileInfo(filevers=($versionTuple), prodvers=($versionTuple), mask=0x3f,
+                      flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0,0)),
+    kids=[
+        StringFileInfo([StringTable('080404B0', [
+            StringStruct('FileDescription', '朝夕工作台'),
+            StringStruct('ProductName', '朝夕工作台'),
+            StringStruct('FileVersion', '$version'),
+            StringStruct('ProductVersion', '$version'),
+            StringStruct('OriginalFilename', 'transcript-lens.exe')
+        ])]),
+        VarFileInfo([VarStruct('Translation', [2052,1200])])
+    ]
+)
+"@ | Set-Content -LiteralPath $versionResource -Encoding UTF8
+
 # --- 共享参数 ---------------------------------------------------------------
 $Common = @(
     '-m', 'PyInstaller',
     '--noconfirm',
     '--clean',
     '--log-level', 'WARN',
+    '--version-file', $versionResource,
 
     # 假数据必须进包：界面上的两个演示按钮直接读它们（tests/ 本身不进包）
     '--add-data', 'tests/fixtures/fake_grades.xlsx;tests/fixtures',
@@ -237,7 +261,9 @@ $Common = @(
     '--exclude-module', 'pyarrow',
     '--exclude-module', 'tables',
     '--exclude-module', 'imageio',
-    '--exclude-module', 'cv2',
+    '--collect-all', 'cv2',
+    '--collect-binaries', 'onnxruntime',
+    '--add-data', 'licenses/workbench;licenses/workbench',
     # ★ PIL / Pillow 曾经被排掉、后来又放行（ttkbootstrap 时代它要加载 PNG 素材）。
     #   现在换成 PySide6，Pillow 不再是界面依赖 —— 但**不再排它**：
     #   排掉它收益很小（几 MB），而 pandas 的某些可选路径会 import 它，
@@ -456,11 +482,9 @@ foreach ($probe in @('dist/', 'build/', 'release/', 'transcript-lens.spec')) {
 }
 
 if (($Both -or $Target -eq 'release') -and -not $ShowConsole) {
-    $version = & python -B -c 'from core.version import CURRENT_VERSION; print(CURRENT_VERSION)'
-    if ($LASTEXITCODE -ne 0 -or -not $version) { throw '读取发布版本号失败' }
     $releaseDir = Join-Path $Root 'release'
     New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
-    $releaseExe = Join-Path $releaseDir "成绩单透镜v${version}.exe"
+    $releaseExe = Join-Path $releaseDir "朝夕工作台-${version}.exe"
     Copy-Item -LiteralPath (Join-Path $Root 'dist\transcript-lens.exe') -Destination $releaseExe -Force
     $built += $releaseExe
 }

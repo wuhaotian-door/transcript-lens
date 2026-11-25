@@ -26,7 +26,7 @@ def show_first_run_guide(window, store, username: str) -> bool:
     if not isinstance(state, dict) or state.get("pending") is not True:
         return False
     dialog = QMessageBox(window)
-    dialog.setWindowTitle("开始使用成绩单透镜")
+    dialog.setWindowTitle("开始使用朝夕工作台")
     dialog.setText("三步查看学业分析")
     dialog.setInformativeText(
         "1. 在「智育分析」导入教务系统导出的 Excel 成绩表。\n"

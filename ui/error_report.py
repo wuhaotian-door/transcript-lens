@@ -133,7 +133,7 @@ def build_error_report(
     details_text = (details or "").strip()
 
     lines: list[str] = [
-        "===== 成绩单透镜 错误信息 =====",
+        "===== 朝夕工作台 错误信息 =====",
         f"时间：{stamp}",
         f"版本：v{version_text}",
         f"标题：{title or '（无标题）'}",

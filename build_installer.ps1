@@ -34,7 +34,7 @@ try {
     }
     & $compiler.Source @compilerArgs $script
     if ($LASTEXITCODE -ne 0) { throw '安装向导编译失败。' }
-    $installer = Join-Path $output "成绩单透镜v${version}-安装向导.exe"
+    $installer = Join-Path $output "朝夕工作台-${version}-安装向导.exe"
     Get-Item -LiteralPath $installer
 }
 finally {

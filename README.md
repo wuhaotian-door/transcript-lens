@@ -1,6 +1,6 @@
 <div align="center">
 
-# 成绩单透镜 · transcript-lens
+# 朝夕工作台 · transcript-lens
 
 **给高校辅导员用的成绩与德育分桌面工具**
 
@@ -15,7 +15,7 @@
 以及一堆说不清来源的排名与奖助评定。它们分散在多个 Excel 里，
 每次评奖学金都要重新拉表、手算加权、再对一遍人数。
 
-成绩单透镜把这条链路收进一个桌面程序：**导入一次，之后所有统计都从加密库里取**，
+朝夕工作台把这条链路收进一个桌面程序：**导入一次，之后所有统计都从加密库里取**，
 口径（必修 / 必修+限选 / 全部）固定、可复现，换台电脑就带一个数据目录即可。
 
 ## 功能
@@ -70,8 +70,8 @@
 
 ### 方式一：下载安装包
 
-在 64 位 Windows 10/11 上，双击收到的 `成绩单透镜v<版本号>-安装向导.exe`，按提示选择安装位置。
-可从安装目录启动，也可以在向导中选建开始菜单快捷方式。单文件 `成绩单透镜v<版本号>.exe` 可直接运行。
+在 64 位 Windows 10/11 上，双击收到的 `朝夕工作台-<版本号>-安装向导.exe`，按提示选择安装位置。
+可从安装目录启动，也可以在向导中选建开始菜单快捷方式。单文件 `朝夕工作台-<版本号>.exe` 可直接运行。
 安装或运行遇到错误时，请右键点击对应的 EXE，选择「以管理员身份运行」。
 
 公开附件请以 [GitHub Releases](https://github.com/wuhaotian-door/transcript-lens/releases)
@@ -103,7 +103,7 @@ pip install llama-cpp-python
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build_exe.ps1 -Both
 ```
 
-打包后，`dist\transcript-lens.exe` 是本地运行入口，`release\成绩单透镜v<版本号>.exe` 是单文件分发包。
+打包后，`dist\transcript-lens.exe` 是本地运行入口，`release\朝夕工作台-<版本号>.exe` 是单文件分发包。
 要制作安装向导，参见 [Windows 分发与安装](docs/DISTRIBUTION.md#windows-安装向导)。
 
 单文件版启动时要先把自己解包到临时目录，个别机器的安全软件会拦这一步，报

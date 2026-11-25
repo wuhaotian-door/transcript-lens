@@ -822,8 +822,9 @@ class SemesterSideProfile(QWidget):
         self._save_button.setVisible(ready)
         self._ai_status.setVisible(ready)
         if hasattr(self, "_talk_button"):
-            self._talk_button.setVisible(ready)
-            self._talk_button.setEnabled(bool(models))
+            grounded = getattr(self, "workbench_vault", None) is not None
+            self._talk_button.setVisible(ready or grounded)
+            self._talk_button.setEnabled(bool(models) or grounded)
 
     def _on_setup_core_clicked(self) -> None:
         try:
@@ -864,6 +865,7 @@ class SemesterSideProfilePage(SemesterSideProfile):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         self._gpa_scheme = resolve_scheme(DEFAULT_SCHEME)
+        self.workbench_vault = None
         super().__init__(parent)
         self._on_back: Any = None
         # 允许改字再保存（父类默认只读，任务书要求可编辑）
@@ -967,6 +969,16 @@ class SemesterSideProfilePage(SemesterSideProfile):
     # -- 谈话 -------------------------------------------------------------
     def _talk_to_ai(self) -> None:
         """打开谈话窗口：系统提示词只注入本学期成绩。"""
+        if self.workbench_vault is not None:
+            from ui.academic_context import AcademicContext
+            from ui.grounded_chat_dialog import GroundedChatDialog
+
+            rows = self._term_rows()
+            context = AcademicContext(self._side_prompt(rows), ()) if rows else None
+            dialog = GroundedChatDialog(self, self.workbench_vault, self._student_id(), context,
+                                        self.model_settings_requested.emit)
+            dialog.exec()
+            return
         ready, _ = engine_available()
         if not ready:
             self._refresh_ai_controls()

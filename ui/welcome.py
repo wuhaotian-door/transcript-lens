@@ -139,7 +139,7 @@ class WelcomeWindow(QWidget):
         self._done = False
 
         apply_frameless(self)
-        self.setWindowTitle("成绩单透镜")
+        self.setWindowTitle("朝夕工作台")
         self.resize(_CARD_W + 2 * SHADOW_MARGIN, _CARD_H + 2 * SHADOW_MARGIN)
         self.setWindowOpacity(0.0)
 
@@ -183,7 +183,7 @@ class WelcomeWindow(QWidget):
         bottom.setContentsMargins(0, 0, 0, 0)
         bottom.setSpacing(8)
 
-        hint = QLabel("正在进入成绩单透镜…")
+        hint = QLabel("正在进入朝夕工作台…")
         hint.setObjectName("WelcomeHint")
         bottom.addWidget(hint)
         bottom.addStretch(1)

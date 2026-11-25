@@ -99,6 +99,10 @@ CHECK_MODULES: tuple[str, ...] = (
     "ui.pages.profile_shared",
     "ui.pages.semester_side_profile",
     "ui.pages.archive_page",
+    "ui.pages.mentor_page",
+    "ui.pages.student_details",
+    "ui.knowledge_dialog",
+    "ui.grounded_chat_dialog",
     "ui.pages.scholarship_page",
     "ui.pages.settings_page",
     "ui.pages.account_page",
@@ -918,6 +922,7 @@ def _network_policy_report() -> list[str]:
     #   1) 它真的只用 stdlib，没偷偷引第三方 HTTP 客户端；
     #   2) **import 期绝不联网**（没有自动检查，必须等用户点按钮）；
     #   3) 超时就是 5 秒（不然按钮会卡很久）。
+    lines.extend(_workbench_runtime_report())
     lines.extend(_updater_policy_lines())
     lines.extend(_download_policy_lines())
 
@@ -1156,6 +1161,8 @@ _REVIVED_GATE_STEMS: tuple[str, ...] = (
 _QT_API_IDENTIFIER_ALLOWLIST: frozenset[str] = frozenset(
     {
         "activatewindow",  # QWidget.activateWindow()
+        "itemactivated",  # QListWidget.itemActivated
+        "activated",  # QShortcut.activated
     }
 )
 
@@ -1358,6 +1365,7 @@ DOCS_WHITELIST: tuple[str, ...] = (
     "DISTRIBUTION.md",
     "RELEASE_SOP.md",
     "SGMS_v1.9.2_Dev_Charter.md",
+    "朝夕工作台2.0-开发需求文档.md",
 )
 
 #: 已被合并进总纲并删除的 5 份旧文档。**再被谁提到就是死链接。**
@@ -2143,6 +2151,39 @@ def _qt_platform_plugin_hint() -> str:
     return str(target)
 
 
+def _workbench_runtime_report() -> list[str]:
+    """启动前不用的原生依赖在构建自检中真正加载。"""
+    try:
+        import cv2
+        import onnxruntime
+        from docx import Document
+        from PIL import Image
+        from pypdf import PdfReader
+        from tokenizers import Tokenizer
+        from core.crypto_store import default_root
+        from core.knowledge import Embedder
+        from core.photo_matching import FaceEngine
+        from core.workbench_models import installed
+
+        if "CPUExecutionProvider" not in onnxruntime.get_available_providers():
+            raise RuntimeError("缺少 ONNX CPU 运行组件")
+        if not all((cv2.FaceDetectorYN, cv2.FaceRecognizerSF, Document, Image.open, PdfReader, Tokenizer)):
+            raise RuntimeError("本地工作台组件不完整")
+        root = default_root()
+        checks = ["ok    制度与照片依赖  PDF / DOCX / Pillow / OpenCV / ONNX CPU"]
+        if installed(root, "semantic"):
+            vectors = Embedder(root).encode(["样例制度检索"], query=True)
+            if len(vectors) != 1 or len(vectors[0]) != 512:
+                raise RuntimeError("语义模型输出维度异常")
+            checks.append("ok    中文语义模型  已实际生成 512 维向量")
+        if installed(root, "face"):
+            FaceEngine(root)
+            checks.append("ok    照片匹配模型  已加载 YuNet 和 SFace")
+        return checks
+    except Exception as exc:
+        return [f"FAIL  工作台本地组件：{type(exc).__name__}：{exc}"]
+
+
 def run_selfcheck() -> int:
     """跑自检并把报告写到临时目录（窗口版 exe 没有 stdout，只能落文件）。"""
     import tempfile
@@ -2206,7 +2247,9 @@ def make_app(argv: list[str]):
 
     app = QApplication(argv)
     app.setApplicationName("transcript-lens")
-    app.setApplicationDisplayName("成绩单透镜")
+    from core.version import APP_NAME
+
+    app.setApplicationDisplayName(APP_NAME)
     app.setFont(QFont(UI_FONT_FAMILY, UI_FONT_SIZE))
     app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
     style = load_stylesheet()
@@ -2870,6 +2913,17 @@ def main(argv: list[str] | None = None) -> int:
     #    这里按次序问完，再让开屏出场。
     if run_pending_update(flow.root):
         return 0
+    from PySide6.QtCore import QLockFile
+    from PySide6.QtWidgets import QMessageBox
+    from core.crypto_store import CryptoStore
+
+    data_root = CryptoStore(flow.root).root
+    data_root.mkdir(parents=True, exist_ok=True)
+    instance_lock = QLockFile(str(data_root / "workbench-instance.tmp"))
+    instance_lock.setStaleLockTime(0)
+    if not instance_lock.tryLock(0):
+        QMessageBox.information(None, "朝夕工作台", "已有程序使用此数据目录，或该目录无法写入。")
+        return 1
     run_startup_migration(flow.root)
     if IS_FROZEN and sys.platform == "win32":
         from PySide6.QtWidgets import QMessageBox

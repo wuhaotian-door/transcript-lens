@@ -21,6 +21,7 @@ from core.database import (
     _user_dir,
     safe_student_file,
 )
+from core.sensitive_vault import sensitive_filename
 from core.user_store import ROSTER_WRITE_LOCK, list_user_json, save_user_json
 
 
@@ -133,6 +134,10 @@ def _purge_student(
         if updated != payload:
             changes.append((path, path.read_bytes(), updated))
 
+    from core.workbench_cleanup import account_directories
+    from core.workbench_journal import recover_import
+
+    recover_import(store, username)
     stage(ARCHIVE_PAYLOAD_FILE, lambda payload: _archive_without_student(payload, sid, name))
     if sid:
         keys = {sid, f"sid:{sid}"}
@@ -157,7 +162,16 @@ def _purge_student(
         safe_id = safe_student_file(sid)
         chat = base / CHAT_CACHE_DIR / f"{CHAT_CACHE_PREFIX}{safe_id}.json.enc"
         term_dir = base / "semester_side" / safe_id
+        copies = account_directories(store, StudentStore(store=store, username=username).uid)
+        for copy in copies:
+            photo_record = copy / sensitive_filename(sid)
+            if not photo_record.resolve().is_relative_to(copy.resolve()) or photo_record.is_symlink():
+                raise CryptoError("学生资料路径有重定向。")
+            if photo_record.is_file():
+                changes.append((photo_record, photo_record.read_bytes(), None))
         for path in (chat, *term_dir.glob("*.json.enc")):
+            if not path.resolve().is_relative_to(base.resolve()) or path.is_symlink():
+                raise CryptoError("学生数据路径有重定向。")
             if path.is_file():
                 changes.append((path, path.read_bytes(), None))
 
@@ -225,6 +239,10 @@ def _purge_class(store, username, name, control) -> tuple[bool, tuple[str, ...]]
     if not app_salt_path(store.root).is_file():
         raise CryptoError("本地加密盐文件缺失，无法核对班级数据。")
 
+    from core.workbench_cleanup import account_directories
+    from core.workbench_journal import recover_import
+
+    recover_import(store, username)
     changes: list[tuple[Path, bytes, dict | None]] = []
     owned: set[str] = set()
     shared: set[str] = set()
@@ -315,14 +333,21 @@ def _purge_class(store, username, name, control) -> tuple[bool, tuple[str, ...]]
         transform(GradeHistoryDB.filename, without_grades)
         for filename, field in ((ProfileStore.filename, "profiles"), ("intentions.json.enc", "intentions")):
             transform(filename, lambda p: {**p, field: _remove_keys(p.get(field, {}), keys)})
+        copies = account_directories(store, StudentStore(store=store, username=username).uid)
         for sid in purged:
+            for copy in copies:
+                path = copy / sensitive_filename(sid)
+                if not path.resolve().is_relative_to(copy.resolve()) or path.is_symlink():
+                    raise CryptoError("学生资料路径有重定向。")
+                if path.is_file():
+                    changes.append((path, path.read_bytes(), None))
             safe = safe_student_file(sid)
             cache = base / CHAT_CACHE_DIR / f"{CHAT_CACHE_PREFIX}{safe}.json.enc"
             terms = base / "semester_side" / safe
             if any(part.is_symlink() for part in (cache.parent, terms.parent, terms)):
                 raise CryptoError("班级数据目录中存在重定向文件，删除已取消。")
             for path in (cache, *terms.glob("*.json.enc")):
-                if path.is_symlink():
+                if path.is_symlink() or not path.resolve().is_relative_to(base.resolve()):
                     raise CryptoError("班级数据目录中存在重定向文件，删除已取消。")
                 if path.is_file():
                     changes.append((path, path.read_bytes(), None))

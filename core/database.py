@@ -1908,6 +1908,9 @@ class StudentStore:
                             type(exc).__name__, exc)
 
     def _load(self, *, strict: bool = False) -> dict[str, dict[str, Any]]:
+        from core.workbench_journal import recover_import
+
+        recover_import(self._store, self._username)
         payload = load_user_json(self._store, self._username, self.filename, None, strict=strict)
         if not isinstance(payload, dict):
             return {}

@@ -155,7 +155,7 @@ class RecoverDialog(QDialog):
             if info["email"]:
                 self._email_label.setText(_mask_email(info["email"]))
                 self._hint.setText(
-                    "可从「成绩单透镜」找回码邮件复制找回码，也可以输入你之前保存的找回码。"
+                    "可从「朝夕工作台」找回码邮件复制找回码，也可以输入你之前保存的找回码。"
                 )
             else:
                 self._email_label.setText("（本机未绑定邮箱）")

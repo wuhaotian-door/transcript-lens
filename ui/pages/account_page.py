@@ -65,7 +65,7 @@ __all__ = ["AccountPage"]
 MIN_PASSWORD_LENGTH = 8
 
 _ABOUT = (
-    ("程序", "成绩单透镜"),
+    ("程序", "朝夕工作台"),
     # ★ v1.8 修正：这里原来硬编码 "v1.0"（charter v1.8 第五节点名的旧 bug）。
     ("版本", f"v{CURRENT_VERSION}"),
 )

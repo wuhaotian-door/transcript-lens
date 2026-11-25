@@ -307,6 +307,7 @@ class SettingsPage(QWidget):
     #: ★ 档案页 / 智育分析页接到它就该 ``reload()`` —— 数据层已经干净了，
     #:   界面不刷新会继续显示一份"已经删掉的成绩"（AGENTS §18：一处真源 + 信号刷新）。
     library_cleared = Signal(int, int, int)
+    student_data_cleared = Signal()
     gpa_scheme_changed = Signal(str)
 
     def __init__(
@@ -318,6 +319,7 @@ class SettingsPage(QWidget):
         super().__init__(parent)
         self._store = store if store is not None else CryptoStore(root)
         self._username = ""
+        self.vault = None
         self._gpa_settings = load_settings()
         #: 由主窗口注入：返回当前要导出的记录列表（可能为空）
         self._export_provider: Callable[[], list[dict[str, Any]]] | None = None
@@ -333,35 +335,6 @@ class SettingsPage(QWidget):
 
     def set_export_provider(self, provider: Callable[[], list[dict[str, Any]]]) -> None:
         self._export_provider = provider
-
-    def showEvent(self, event) -> None:  # noqa: N802 - Qt 的命名
-        """每次切到设置页都顺手刷新「删除成绩库」的状态。
-
-        ★ v1.9.2：清完库再切回设置页时，这里必须已经写着「没有成绩库」——
-          判据是 ``grade_history`` 表为空。**只改状态文案**，不动任何数据。
-        """
-        super().showEvent(event)
-        self._refresh_clear_status()
-
-    def _refresh_clear_status(self) -> None:
-        """按 ``grade_history`` 表把「删除成绩库」的状态文案对齐。
-
-        读不到库时**一个字都不改**（页面还没登录 / 还没解锁都属正常）。
-        """
-        label = getattr(self, "_clr_status", None)
-        if label is None or not self._username:
-            return
-        try:
-            inventory = library_inventory(self._store, self._username)
-        except Exception:  # noqa: BLE001 - 只是状态文案，读不到就维持原样
-            return
-        if not inventory.get("account"):
-            return
-        if int(inventory.get("grade_rows") or 0):
-            # 有新成绩了 —— 把上一次"已删除 / 已取消"的旧状态清掉，别让它说谎
-            label.setText("")
-        else:
-            label.setText("没有成绩库：本账户还没有导入过成绩。")
 
     # ---------------------------------------------------------------- 搭界面
     def _build(self) -> None:
@@ -427,24 +400,22 @@ class SettingsPage(QWidget):
         clr.setContentsMargins(24, 20, 24, 20)
         clr.setSpacing(10)
 
-        clr_title = QLabel("删除成绩库")
+        clr_title = QLabel("清除数据")
         clr_title.setObjectName("H2")
         clr.addWidget(clr_title)
-
-        #: 侧写 / 生成物跟着成绩一起清（**默认勾选**，用户可以取消）
-        self._clear_profiles_box = QCheckBox("同时删除侧写与档案快照")
-        self._clear_profiles_box.setChecked(True)
-        self._clear_profiles_box.setToolTip(
-            "不勾选的话只清成绩记录，侧写正文和成长档案快照会留下（它们就对不上了）"
-        )
         clr_row = QHBoxLayout()
-        clr_row.addWidget(self._clear_profiles_box, 1)
-        clear_btn = QPushButton("删除成绩库")
+        clear_note = QLabel("清除当前账户的学生资料、成绩和本机托管副本。")
+        clear_note.setWordWrap(True)
+        clr_row.addWidget(clear_note, 1)
+        clear_btn = QPushButton("清除数据")
         clear_btn.setObjectName("Danger")
         clear_btn.setMinimumHeight(38)
-        clear_btn.clicked.connect(self._do_clear)
+        clear_btn.clicked.connect(self._do_clear_student_data)
         clr_row.addWidget(clear_btn)
         clr.addLayout(clr_row)
+        self._clear_profiles_box = QCheckBox()
+        self._clear_profiles_box.setChecked(True)
+        self._clear_profiles_box.hide()
 
         self._clr_status = QLabel("")
         self._clr_status.setObjectName("Muted")
@@ -452,6 +423,14 @@ class SettingsPage(QWidget):
         clr.addWidget(self._clr_status)
         box.addWidget(self._build_gpa_card())
 
+        from ui.workbench_widgets import button, label
+
+        kb_card = make_card()
+        kb = QHBoxLayout(kb_card)
+        kb.setContentsMargins(24, 16, 24, 16)
+        kb.addWidget(label("规章制度知识库", "H2"), 1)
+        kb.addWidget(button("管理知识库", self._open_knowledge))
+        box.addWidget(kb_card)
         box.addWidget(self._build_update_card())
         box.addWidget(clr_card)
         box.addStretch(1)
@@ -786,6 +765,66 @@ class SettingsPage(QWidget):
 
         self._exp_status.setText(f"已导出 {result.rows} 行 → {result.path}")
         QMessageBox.information(self, "导出完成", f"已写到：\n{result.path}")
+
+    def _open_knowledge(self):
+        from ui.knowledge_dialog import KnowledgeDialog
+
+        if self._username:
+            KnowledgeDialog(self, self._store, self._username).exec()
+
+    def _do_clear_student_data(self):
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QLineEdit
+        from core.workbench_cleanup import clear_all_student_data, clear_inventory
+        from ui.workbench_widgets import TaskDialog, button, label, unlock
+
+        if not unlock(self, self.vault, force=True):
+            return
+        dialog = TaskDialog(self, "清除当前账户学生数据")
+        dialog.setMinimumWidth(550)
+        info = label("")
+        info.setWordWrap(True)
+        dialog.body.addWidget(info)
+        flags = QCheckBox("同时删除奖学金名额")
+        dialog.body.addWidget(flags)
+        warning = label("清除后无法从本机托管副本恢复。请自行处理此前导出的文件。", "Muted")
+        warning.setWordWrap(True)
+        dialog.body.addWidget(warning)
+        confirm = QLineEdit()
+        confirm.setPlaceholderText("输入「清除学生数据」")
+        dialog.body.addWidget(confirm)
+        dialog.body.addWidget(dialog.status)
+
+        def execute():
+            if confirm.text().strip() != "清除学生数据":
+                return
+            quotas = flags.isChecked()
+
+            def work():
+                return clear_all_student_data(self._store, self._username, quotas=quotas)
+
+            def done(report):
+                if report["failed"]:
+                    dialog.status.setText("部分文件仍存在，请检查后重试：\n" + "\n".join(report["failed"]))
+                    return
+                self._clr_status.setText(f"清除完成，共处理 {report['removed']} 个文件。")
+                self.student_data_cleared.emit()
+                dialog.accept()
+            dialog.execute(work, done, "正在清除当前账户的学生数据…")
+
+        run = button("清除学生数据", execute, "Danger")
+        run.setEnabled(False)
+        dialog.body.addWidget(run)
+
+        def ready(counts):
+            info.setText("　".join(f"{name} {value}" for name, value in counts.items()))
+            def allow():
+                run.setEnabled(confirm.text().strip() == "清除学生数据" and not dialog._busy)
+            QTimer.singleShot(2000, dialog, lambda: (confirm.textChanged.connect(allow), allow()))
+
+        dialog.execute(lambda: clear_inventory(self._store, self._username, self.vault),
+                       ready, "正在盘点当前账户…")
+        dialog.exec()
 
     # ---------------------------------------------------------------- 删除成绩库
     def _do_clear(self) -> None:

@@ -1,11 +1,11 @@
 ﻿[Setup]
 AppId={{ED219424-1E91-48F3-80AA-973CF7EFCCF0}
-AppName=成绩单透镜
+AppName=朝夕工作台
 AppVersion={#AppVersion}
-AppPublisher=Transcript Lens
+AppPublisher=朝夕工作台
 AppPublisherURL=https://github.com/wuhaotian-door/transcript-lens
 DefaultDirName={localappdata}\Programs\Transcript Lens
-DefaultGroupName=成绩单透镜
+DefaultGroupName=朝夕工作台
 DisableProgramGroupPage=yes
 DisableWelcomePage=no
 PrivilegesRequired=lowest
@@ -13,7 +13,7 @@ CreateUninstallRegKey=WizardIsTaskSelected('shell')
 MinVersion=10.0
 ArchitecturesAllowed=x64compatible
 OutputDir={#ReleaseDir}
-OutputBaseFilename=成绩单透镜v{#AppVersion}-安装向导
+OutputBaseFilename=朝夕工作台-{#AppVersion}-安装向导
 SetupIconFile={#AppIcon}
 UninstallDisplayIcon={app}\transcript-lens.exe
 WizardStyle=modern
@@ -48,13 +48,17 @@ Name: "shell"; Description: "{cm:ShellIntegration}"; Flags: unchecked
 Name: "shell\desktopicon"; Description: "{cm:CreateDesktopIcon}"; Flags: unchecked dontinheritcheck
 
 [InstallDelete]
-; 创建新版快捷方式时清理同位置的旧名快捷方式。
-Type: files; Name: "{userprograms}\成绩透析镜.lnk"; Tasks: shell
-Type: files; Name: "{userdesktop}\成绩透析镜.lnk"; Tasks: shell\desktopicon
+; 覆盖升级时清理两个历史品牌的快捷方式。
+Type: files; Name: "{userprograms}\成绩单透镜.lnk"
+Type: files; Name: "{userdesktop}\成绩单透镜.lnk"
+Type: files; Name: "{userprograms}\成绩透析镜.lnk"
+Type: files; Name: "{userdesktop}\成绩透析镜.lnk"
+Type: files; Name: "{userprograms}\成绩单透镜\成绩单透镜.lnk"
+Type: files; Name: "{userprograms}\成绩透析镜\成绩透析镜.lnk"
 
 [Icons]
-Name: "{userprograms}\成绩单透镜"; Filename: "{app}\transcript-lens.exe"; WorkingDir: "{app}"; Tasks: shell
-Name: "{userdesktop}\成绩单透镜"; Filename: "{app}\transcript-lens.exe"; WorkingDir: "{app}"; Tasks: shell\desktopicon
+Name: "{userprograms}\朝夕工作台"; Filename: "{app}\transcript-lens.exe"; WorkingDir: "{app}"; Tasks: shell
+Name: "{userdesktop}\朝夕工作台"; Filename: "{app}\transcript-lens.exe"; WorkingDir: "{app}"; Tasks: shell\desktopicon
 
 [Code]
 procedure CurPageChanged(CurPageID: Integer);

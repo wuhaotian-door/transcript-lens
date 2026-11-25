@@ -253,6 +253,11 @@ def _lift_1_9_8_to_1_9_9(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def _lift_1_9_9_to_2_0_0(data: dict[str, Any]) -> dict[str, Any]:
+    """保留旧成绩载荷，敏感数据在按需解锁后创建。"""
+    return data
+
+
 #: 版本链：``(起点, 终点, 变换函数)``。
 #:
 #: ★ 这是"未来版本在此添加分支"的那张表（任务书 2.3）。加一跳只需要
@@ -272,6 +277,7 @@ _STEPS: tuple[tuple[str, str, Callable[[dict[str, Any]], dict[str, Any]]], ...] 
     ("1.9.6", "1.9.7", _lift_1_9_6_to_1_9_7),
     ("1.9.7", "1.9.8", _lift_1_9_7_to_1_9_8),
     ("1.9.8", "1.9.9", _lift_1_9_8_to_1_9_9),
+    ("1.9.9", "2.0.0", _lift_1_9_9_to_2_0_0),
 )
 
 

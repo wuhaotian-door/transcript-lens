@@ -26,11 +26,14 @@ class StudentOverviewPage(QWidget):
     back_requested = Signal()
     semester_requested = Signal(str)
     model_settings_requested = Signal()
+    interview_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._store = None
         self._username = ""
+        self.vault = None
+        self._sid = ""
         self._academic_context: AcademicContext | None = None
         self._terms: list[str] = []
         self._gpa_scheme = resolve_scheme(DEFAULT_SCHEME)
@@ -50,6 +53,11 @@ class StudentOverviewPage(QWidget):
         back.clicked.connect(self.back_requested.emit)
         header.addWidget(back)
         header.addStretch()
+        interviews = QPushButton("谈话记录")
+        interviews.setObjectName("Ghost")
+        interviews.setMinimumHeight(34)
+        interviews.clicked.connect(self.interview_requested.emit)
+        header.addWidget(interviews)
         self._talk = QPushButton("全学期 AI 分析")
         self._talk.setObjectName("Primary")
         self._talk.setMinimumHeight(34)
@@ -135,6 +143,7 @@ class StudentOverviewPage(QWidget):
 
     def set_context(self, store, username: str, student, class_name: str = "") -> None:
         self._store, self._username = store, username
+        self._sid = student.student_id
         identity = [student.student, student.student_id, class_name]
         self._identity.setText("  ·  ".join(part for part in identity if part))
         rows = course_rows_from_archive(student)
@@ -208,7 +217,7 @@ class StudentOverviewPage(QWidget):
                        *context, f"四学期总评：{four}"]),
             tuple(details),
         ) if context else None
-        self._talk.setEnabled(bool(context))
+        self._talk.setEnabled(bool(context) or self.vault is not None)
 
     def _summarize_four_terms(self, table, effective_terms, precision: int) -> str:
         recent = [row for row in table if row[0] in effective_terms and row[2] > 0][-4:]
@@ -239,6 +248,14 @@ class StudentOverviewPage(QWidget):
             self.semester_requested.emit(self._terms[row])
 
     def _open_chat(self) -> None:
+        if self.vault is not None:
+            from ui.grounded_chat_dialog import GroundedChatDialog
+
+            dialog = GroundedChatDialog(self, self.vault, self._sid, self._academic_context,
+                                        self.model_settings_requested.emit)
+            dialog.question.setText("请结合全部已导入学期给出总评和下一阶段建议。")
+            dialog.exec()
+            return
         from ui.chat_dialog import ChatDialog
 
         if self._academic_context is None:

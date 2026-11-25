@@ -1,4 +1,4 @@
-# 成绩单透镜 · 分发与发版手册
+# 朝夕工作台 · 分发与发版手册
 
 > 面向维护者。看完这一页你就知道：**怎么发一版、文件放哪、
 > 程序里那个「检查更新 → 下载 → 重启」是怎么跟发行版对接的。**
@@ -112,10 +112,10 @@ Start-Sleep -Seconds 3          # 句柄释放有延迟，马上重打会被占�
 | 目标 | 路径 | 大小量级 | 给谁 |
 |---|---|---|---|
 | release 本地入口 | `dist\transcript-lens.exe` | ~230MB | 固定路径，供本地启动 |
-| release 发布包 | `release\成绩单透镜v<版本>.exe` | ~230MB | 对外发布，单文件、双击就跑 |
+| release 发布包 | `release\朝夕工作台-<版本>.exe` | ~230MB | 对外发布，单文件、双击就跑 |
 | debug | `dist\transcript-lens-debug\` | ~680MB | 自己排查用（带控制台） |
 
-发布包文件名从 `core/version.py` 读取版本号，例如 `成绩单透镜v1.9.5.exe`。
+发布包文件名从 `core/version.py` 读取版本号，例如 `朝夕工作台-2.0.0.exe`。
 程序窗口和 Windows 可执行文件共用 `ui/assets/app.ico`。
 
 > `dist/`、`build/`、`release/`、`*.spec` 都在 `.gitignore` 里。**绝不要 `git add` 它们** ——
@@ -131,7 +131,7 @@ Start-Sleep -Seconds 3          # 句柄释放有延迟，马上重打会被占�
 ```
 
 `-LanguageFile` 可传入 Inno Setup 对应版本的 `ChineseSimplified.isl`，用来生成中文向导。
-安装包输出为 `release\成绩单透镜v<版本>-安装向导.exe`。适用于 64 位 Windows 10/11，
+安装包输出为 `release\朝夕工作台-<版本>-安装向导.exe`。适用于 64 位 Windows 10/11，
 默认安装在当前用户的程序目录，无需管理员权限。向导默认安装程序文件，可选建开始菜单快捷方式并登记到 Windows 应用列表。
 默认安装完成后，从所选目录启动 `transcript-lens.exe` 或运行 `unins000.exe` 卸载。
 安装或运行遇到错误时，请右键点击对应的 EXE，选择「以管理员身份运行」。
@@ -176,7 +176,7 @@ git push origin v1.9
 
 ### 第 5 步：上传文件到网盘
 
-把 `release\成绩单透镜v<版本>.exe` 传到网盘（任选：蓝奏云 / 阿里云盘 / 奶牛快传 /
+把 `release\朝夕工作台-<版本>.exe` 传到网盘（任选：蓝奏云 / 阿里云盘 / 奶牛快传 /
 对象存储 / 自己的服务器），**拿到直链**。
 
 | 要求 | 为什么 |

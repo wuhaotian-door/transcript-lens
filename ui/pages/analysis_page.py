@@ -1063,11 +1063,13 @@ class AnalysisPage(QWidget):
         #   存不上**不拦界面** —— 成绩已经算完并显示了，存班级只是顺带的事；
         #   真失败会在状态行里明说，不静默。
         self._save_student_roster(class_name)
-        self._save_class(class_name, self._source, source_scope.school_year)
+        class_saved = self._save_class(class_name, self._source, source_scope.school_year)
         # ★ v1.9 二期 D3：这一批写进成绩历史表（覆盖 / 跳过按刚才问的结果）。
         #   **放在最后**：上面那些显示用的状态都落定了，写库失败只影响这一张表，
         #   状态行里明说一句就行（和"班级存不上"同一个待遇，不打断用户看成绩）。
         self._save_grade_history(parsed, results)
+        if class_saved:
+            self.class_saved.emit(class_name)
         # 把名单推给侧写辅导页（它靠这个建左侧列表）
         self.roster_changed.emit(self.roster())
 
@@ -1135,6 +1137,20 @@ class AnalysisPage(QWidget):
         QMessageBox.information(
             self, "成绩历史已保存", conflict_result_text(counts)
         )
+
+    def reset_import_view(self) -> None:
+        self._archive = None
+        self._loaded_class_name = ""
+        self._parsed = None
+        self._results = {}
+        self._flags = {}
+        self._rows = []
+        self._anchor_report = None
+        self._source = ""
+        self._fill_table()
+        self._detail.setText("请导入成绩表。")
+        self._update_status()
+        self.roster_changed.emit(self.roster())
 
     def forget_class(self, name: str, removed: tuple[str, ...]) -> None:
         self._archive = None
@@ -1214,18 +1230,18 @@ class AnalysisPage(QWidget):
             applog.write("import.roster", type(exc).__name__, root=self._store.root)
             self._status.setText(self._status.text() + "\n⚠ 成绩已计算，学生主档未能保存。")
 
-    def _save_class(self, class_name: str, source: str, school_year: str = "") -> None:
+    def _save_class(self, class_name: str, source: str, school_year: str = "") -> bool:
         """把本班成绩快照写进加密库，并广播 ``class_saved``。"""
         if not self._username:
             self._note_class_failure("还没登录，班级数据没地方存")
-            return
+            return False
         try:
             record = self._build_class_record(class_name, source, school_year)
             save_class(self._store, self._username, record)
         except (CryptoError, ValueError, OSError) as exc:
             self._note_class_failure(f"{type(exc).__name__}: {exc}")
-            return
-        self.class_saved.emit(class_name)
+            return False
+        return True
 
     def _note_class_failure(self, reason: str) -> None:
         """班级存不上时，把原因追加到状态行（**不弹窗打断**）。"""

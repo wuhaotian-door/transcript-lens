@@ -49,3 +49,12 @@ pytest>=7.4
 #   AI 推理一节装。
 #
 # llama-cpp-python>=0.2.0
+
+# 朝夕工作台 2.0 的离线资料解析、向量与照片功能。
+numpy>=2,<2.3
+opencv-contrib-python-headless==4.12.0.88
+onnxruntime==1.23.2
+tokenizers==0.22.2
+pypdf==6.12.2
+python-docx==1.2.0
+Pillow==12.2.0

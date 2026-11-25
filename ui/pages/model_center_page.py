@@ -9,6 +9,8 @@ from PySide6.QtWidgets import (
 from core.user_store import load_user_json, save_user_json
 from ui.anim import make_card
 from ui.model_center_dialog import ModelCenterDialog, _backend_available
+from ui.workbench_models_dialog import WorkbenchModelsDialog
+from ui.workbench_widgets import button
 from ui.widgets.backend_setup import open_backend_setup
 from ui.widgets.profile_reading import profile_scroll
 
@@ -27,12 +29,18 @@ class ModelCenterPage(QWidget):
         layout.setSpacing(14)
         title = QLabel("模型中心")
         title.setObjectName("H1")
-        layout.addWidget(title)
+        header = QHBoxLayout()
+        header.addWidget(title, 1)
+        header.addWidget(button("语义检索与照片匹配", self._open_aux_models))
+        layout.addLayout(header)
 
         self._views = QStackedWidget()
         layout.addWidget(self._views, 1)
         self._setup = self._build_setup()
         self._views.addWidget(self._setup)
+
+    def _open_aux_models(self):
+        WorkbenchModelsDialog(self, self._store).exec()
 
     def _build_setup(self) -> QWidget:
         page = QWidget()

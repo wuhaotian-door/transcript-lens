@@ -160,7 +160,7 @@ class MailConfig:
     #: 发信人地址（大多厂商要求与已验证域名一致）
     sender: str = ""
     #: 发信人显示名
-    sender_name: str = "成绩单透镜"
+    sender_name: str = "朝夕工作台"
     #: 厂商特有字段的逃生舱，避免每接一家就要改这个 dataclass
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -189,7 +189,7 @@ class MailConfig:
             endpoint=str(data.get("endpoint", "")),
             api_key=str(data.get("api_key", "")),
             sender=str(data.get("sender", "")),
-            sender_name=str(data.get("sender_name", "成绩单透镜")),
+            sender_name=str(data.get("sender_name", "朝夕工作台")),
             extra=dict(extra) if isinstance(extra, dict) else {},
         )
 
@@ -486,16 +486,16 @@ def send_recovery_mail(
     who = f"{username}　" if username else ""
     message = MailMessage(
         to=to,
-        subject="【成绩单透镜】密码找回码 —— 请长期保留这封邮件",
+        subject="【朝夕工作台】密码找回码 —— 请长期保留这封邮件",
         body=(
             f"{who}你好：\n\n"
-            "这是「成绩单透镜」的密码找回码。将来忘记密码时，它是唯一能\n"
+            "这是「朝夕工作台」的密码找回码。将来忘记密码时，它是唯一能\n"
             "打开你成绩库的东西。\n\n"
             "────────────  找回码  ────────────\n"
             f"{recovery_secret}\n"
             "──────────────────────────────────\n\n"
             "怎么用：\n"
-            "  1. 打开「成绩单透镜」，在登录页点「忘记密码？」\n"
+            "  1. 打开「朝夕工作台」，在登录页点「忘记密码？」\n"
             "  2. 填账号，把这串找回码粘进去\n"
             "  3. 设一个新密码，原来的成绩一条都不会丢\n\n"
             "请务必：\n"
@@ -503,7 +503,7 @@ def send_recovery_mail(
             "  · 不要把找回码发给任何人 —— 拿到它的人就能打开你的成绩库\n\n"
             "说明：本程序不保存你的密码，也没有服务器。找回码在注册时就已生成，\n"
             "只有这封邮件里有。丢了它，忘记密码时数据就再也打不开了。\n\n"
-            "—— 成绩单透镜（本邮件由程序自动发出，请勿回复）"
+            "—— 朝夕工作台（本邮件由程序自动发出，请勿回复）"
         ),
     )
     get_sender(root).send(message)
@@ -542,13 +542,13 @@ def send_verification_mail(
     """
     message = MailMessage(
         to=to,
-        subject=f"【成绩单透镜】{purpose}验证码",
+        subject=f"【朝夕工作台】{purpose}验证码",
         body=(
             f"你的{purpose}验证码是：\n\n"
             f"        {code}\n\n"
             f"（{minutes} 分钟内有效，请勿转发给任何人）\n\n"
             "如果不是你本人操作，忽略本邮件即可，不会产生任何影响。\n\n"
-            "—— 成绩单透镜（本邮件由程序自动发出，请勿回复）"
+            "—— 朝夕工作台（本邮件由程序自动发出，请勿回复）"
         ),
     )
     get_sender(root).send(message)

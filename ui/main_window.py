@@ -44,6 +44,7 @@ import logging
 import traceback
 
 from PySide6.QtCore import QTimer, Qt, Signal
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QButtonGroup,
     QFrame,
@@ -57,7 +58,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.crypto_store import CryptoStore
-from core.version import CURRENT_VERSION
+from core.version import APP_NAME, CURRENT_VERSION
 from ui.anim import StackSwitcher, window_fade_in
 from ui.frameless import (
     SHADOW_MARGIN,
@@ -78,13 +79,16 @@ from ui.pages import (
     SettingsPage,
 )
 
+from core.sensitive_vault import SensitiveVault
+from ui.pages.mentor_page import MentorPage
+from ui.pages.student_details import StudentDetails
+from ui.student_import_dialog import StudentImportDialog
+from ui.workbench_widgets import button, label
+
 __all__ = ["APP_NAME", "MainWindow", "NAV_ITEMS", "PROFILE_NAV_KEY", "TOPBAR_HEIGHT"]
 
 #: 本模块的日志器。补档失败**只记 warning**，绝不影响导入结果、绝不弹窗。
 logger = logging.getLogger(__name__)
-
-#: 程序名（侧栏顶部）
-APP_NAME = "成绩单透镜"
 
 #: 侧栏宽度（Spec 四：固定 190px）
 SIDEBAR_WIDTH = 190
@@ -104,9 +108,9 @@ FADE_IN_FAILSAFE_MS = 900
 
 #: 导航项：``(键, 图标+文字)``。顺序即侧栏顺序。
 NAV_ITEMS: tuple[tuple[str, str], ...] = (
-    ("analysis", "📊  智育分析"),
+    ("analysis", "📊  成绩透析"),
     ("archive", "📈  成长档案"),
-    ("scholarship", "💰  奖学金测算"),
+    ("mentor", "📷  导师自核"),
     ("models", "🧩  模型中心"),
     ("settings", "⚙️  设置"),
     ("account", "👤  个人中心"),
@@ -142,8 +146,10 @@ class MainWindow(QMainWindow):
         self._store = store if store is not None else CryptoStore(root)
         self._data_root = root
         self._username = ""
+        self.vault = None
+        self._details_return_index = ARCHIVE_PAGE_INDEX
 
-        self.setWindowTitle(f"{APP_NAME} · transcript-lens v{CURRENT_VERSION}")
+        self.setWindowTitle(f"{APP_NAME} · v{CURRENT_VERSION}")
         # ★ 无边框 + 透明底必须在 show() 之前设好
         apply_frameless(self)
         # 最小/初始尺寸指**可见部分**，四周另有一圈透明边留给阴影
@@ -184,18 +190,22 @@ class MainWindow(QMainWindow):
         self.scholarship_page = ScholarshipPage(self._store)
         self.model_center_page = ModelCenterPage(self._store)
         self.settings_page = SettingsPage(self._store, self._data_root)
+        self.mentor_page = MentorPage()
+        self.student_details = StudentDetails(self._store)
         self.account_page = AccountPage(self._store, self._data_root)
         self.profile_page = None
 
         for page in (
-            self.analysis_page,
+            self._build_grade_workspace(),
             self.archive_page,
-            self.scholarship_page,
+            self.mentor_page,
             self.model_center_page,
             self.settings_page,
             self.account_page,
         ):
             self._stack.addWidget(page)
+
+        self._stack.addWidget(self.student_details)
 
         # --- 切页动画（淡出 → 换 index → 淡入，带防连点锁）---
         self._switcher = StackSwitcher(self._stack, self)
@@ -208,6 +218,34 @@ class MainWindow(QMainWindow):
             maximizable=True,
             corners=[self._sidebar, self._topbar],
         )
+
+    def _build_grade_workspace(self) -> QWidget:
+        page = QWidget()
+        body = QVBoxLayout(page)
+        body.setContentsMargins(0, 0, 0, 0)
+        row = QHBoxLayout()
+        row.setContentsMargins(22, 14, 22, 0)
+        row.addWidget(label("成绩透析", "H2"))
+        row.addStretch(1)
+        tabs = QButtonGroup(page)
+        views = QStackedWidget(page)
+        for index, (title, content) in enumerate((
+            ("智育分析", self.analysis_page),
+            ("奖学金测算", self.scholarship_page),
+        )):
+            tab = button(title, lambda _=False, i=index: views.setCurrentIndex(i), "SegmentButton")
+            tab.setAccessibleName(title)
+            tab.setCheckable(True)
+            tabs.addButton(tab)
+            row.addWidget(tab)
+            views.addWidget(content)
+            tab.setChecked(index == 0)
+            key = QShortcut(QKeySequence(f"Ctrl+{index + 1}"), page)
+            key.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            key.activated.connect(tab.click)
+        body.addLayout(row)
+        body.addWidget(views, 1)
+        return page
 
     def _build_sidebar(self) -> QFrame:
         side = QFrame()
@@ -226,7 +264,7 @@ class MainWindow(QMainWindow):
         title = QLabel(APP_NAME)
         title.setObjectName("BrandTitle")
         brand_box.addWidget(title)
-        sub = QLabel("transcript-lens")
+        sub = QLabel("辅导员学生工作台")
         sub.setObjectName("BrandSub")
         brand_box.addWidget(sub)
         box.addWidget(brand)
@@ -294,7 +332,15 @@ class MainWindow(QMainWindow):
         # 分析页的名单也给旧侧写入口使用。
         self.analysis_page.roster_changed.connect(self._on_roster_changed)
         # 个人中心「切换账号」
-        self.account_page.switch_account.connect(self.switch_account.emit)
+        self.account_page.switch_account.connect(self._switch_account)
+        self.archive_page.details_requested.connect(self._open_student_details)
+        self.archive_page.interview_requested.connect(self._open_interview)
+        self.archive_page.import_requested.connect(self._import_student_details)
+        self.mentor_page.open_student.connect(self._open_student_details)
+        self.mentor_page.model_center.connect(self._go_model_center)
+        self.student_details.back.connect(self._return_from_details)
+        self.student_details.model_center.connect(self._go_model_center)
+        self.settings_page.student_data_cleared.connect(self._on_all_student_data_cleared)
         # 设置页导出用的数据来自智育分析页（不复制数据，只给个取值函数）
         self.settings_page.set_export_provider(self.analysis_page.export_records)
         # ★ 导入完一个班 → 成长档案 / 奖学金两页立刻能选到它，不用切页重进
@@ -311,7 +357,14 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------- 对外
     def set_user(self, username: str) -> None:
         """设置当前用户并刷新各页的用户相关状态。"""
+        if self.vault is not None:
+            self.vault.lock()
+        self.student_details.forget()
         self._username = username or ""
+        self.vault = SensitiveVault(self._store, self._username)
+        self.mentor_page.set_vault(self.vault)
+        self.settings_page.vault = self.vault
+        self.archive_page.vault = self.vault
         self._user_label.setText(self._username or "（未登录）")
         self.analysis_page.set_user(self._username)
         self.archive_page.set_user(self._username)
@@ -341,6 +394,7 @@ class MainWindow(QMainWindow):
             self.scholarship_page.reload_classes(select=class_name, year=self.analysis_page.term[:2])
         except Exception:  # noqa: BLE001
             traceback.print_exc()
+        self.mentor_page.reload()
         try:
             self.archive_page.reload()
         except Exception:  # noqa: BLE001
@@ -350,10 +404,12 @@ class MainWindow(QMainWindow):
         self.goto(self._stack.indexOf(self.model_center_page))
 
     def _on_class_deleted(self, class_name: str, removed: tuple[str, ...]) -> None:
+        self.mentor_page.reload()
         self.analysis_page.forget_class(class_name, removed)
         self.scholarship_page.reload_classes()
 
     def _on_student_deleted(self, sid: str, name: str) -> None:
+        self.mentor_page.reload()
         self.analysis_page.forget_student(sid, name)
         self.scholarship_page.reload_classes(select=self.scholarship_page.current_class)
 
@@ -399,6 +455,8 @@ class MainWindow(QMainWindow):
 
     def goto(self, index: int) -> None:
         """切到第 ``index`` 页（带动画）。"""
+        if self._stack.currentWidget() is self.student_details and index != self._stack.currentIndex():
+            self.student_details.forget()
         if not self._switcher.switch(index):
             # 被 _busy 锁吃掉或本来就在这页 —— 把选中态拨回去，别让界面说谎
             self._sync_nav(self._stack.currentIndex())
@@ -456,6 +514,53 @@ class MainWindow(QMainWindow):
         """侧栏点击。"""
         self.goto(index)
 
+    def _switch_account(self):
+        if self.vault is not None:
+            self.vault.lock()
+        self.student_details.forget()
+        self.switch_account.emit()
+
+    def _open_student_details(self, sid: str) -> bool:
+        if not sid or self.vault is None:
+            return False
+        if not self.student_details.open_student(self.vault, sid):
+            return False
+        if self._stack.currentWidget() is not self.student_details:
+            self._details_return_index = self._stack.currentIndex()
+        return self._switcher.switch(self._stack.indexOf(self.student_details), animate=False)
+
+    def _return_from_details(self):
+        self.student_details.forget()
+        self._switcher.switch(self._details_return_index, animate=False)
+
+    def _open_interview(self, sid: str):
+        if self._open_student_details(sid):
+            self.student_details.new_interview()
+
+    def _import_student_details(self):
+        if not self.vault or not self.vault.username:
+            return
+        dialog = StudentImportDialog(self, self.vault)
+        dialog.completed.connect(self._on_student_details_imported)
+        dialog.exec()
+
+    def _on_student_details_imported(self, _count: int, sid: str):
+        self.archive_page.reload()
+        self.archive_page._select_student_by_id(sid)
+        self.mentor_page.reload()
+        self.scholarship_page.reload_classes(select=self.scholarship_page.current_class)
+        self.analysis_page._archive = None
+
+    def _on_all_student_data_cleared(self):
+        if self.vault:
+            self.vault.lock()
+        self.student_details.forget()
+        self.archive_page.reset_view()
+        self.archive_page.reload()
+        self.mentor_page.set_vault(self.vault)
+        self.analysis_page.reset_import_view()
+        self.scholarship_page.reload_classes()
+
     def _open_archive_profile(self, payload: dict) -> None:
         """从智育分析页跳成长档案页的个人侧写二级页面。
 
@@ -475,6 +580,8 @@ class MainWindow(QMainWindow):
 
     def _sync_nav(self, index: int) -> None:
         """把侧栏选中态对齐到当前页。"""
+        if self._stack.widget(index) is self.student_details:
+            index = ARCHIVE_PAGE_INDEX
         for position, button in enumerate(self._nav_buttons):
             button.setChecked(position == index)
 

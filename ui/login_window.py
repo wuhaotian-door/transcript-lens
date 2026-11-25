@@ -1,7 +1,7 @@
 """登录 / 注册窗 —— 左侧深色品牌区 + 右侧表单，同一窗口里翻页。
 
      +--------------------+--------------------------------------+
-     |  成绩单透镜         |  登录                                 |
+     |  朝夕工作台         |  登录                                 |
      |  transcript-lens   |  账号  [ 可输入 + 历史用户名下拉 ]     |
      |  v1.0              |  密码  [ ●●●● ]                       |
      |  循分数的脉络        |  ☐ 7 天内自动登录                     |
@@ -143,7 +143,7 @@ class LoginWindow(QWidget):
         #: v1.9.8：本机能不能真发信。决定注册走"邮箱验证"还是"本地找回码"。
         self._mail_ready = mail_configured(self._data_root)
 
-        self.setWindowTitle(f"成绩单透镜 v{CURRENT_VERSION}")
+        self.setWindowTitle(f"朝夕工作台 v{CURRENT_VERSION}")
         # ★ 无边框 + 透明底必须在 show() 之前设好（setWindowFlag 会藏窗口）
         apply_frameless(self)
         # 尺寸是**卡片可见部分**的尺寸，四周还要多留一圈给阴影
@@ -170,7 +170,7 @@ class LoginWindow(QWidget):
 
         # --- 自定义标题栏（系统那圈边框没了，这些都得自己来）---
         self._title_bar = WindowTitleBar(
-            "成绩单透镜 · 登录", minimizable=True, maximizable=False, closable=True
+            "朝夕工作台 · 登录", minimizable=True, maximizable=False, closable=True
         )
         self._title_bar.minimize_requested.connect(self.showMinimized)
         self._title_bar.close_requested.connect(self.close)
@@ -202,7 +202,7 @@ class LoginWindow(QWidget):
         box = QVBoxLayout(brand)
         box.setContentsMargins(26, 34, 26, 30)
 
-        title = QLabel("成绩单透镜")
+        title = QLabel("朝夕工作台")
         title.setObjectName("LoginBrandTitle")
         box.addWidget(title)
 
