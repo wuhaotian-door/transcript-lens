@@ -148,6 +148,7 @@ $Common = @(
     '--hidden-import', 'xlrd',
     # openpyxl 带一堆数据文件（样式表、主题），--collect-all 一起收进来
     '--collect-all', 'openpyxl',
+    '--collect-data', 'certifi',
 
     # 让 PyInstaller 找得到 ui / core / ai 这三个顶层包
     '--paths', '.',
@@ -259,7 +260,6 @@ $Common = @(
     '--exclude-module', 'aiohttp',
     '--exclude-module', 'chardet',
     '--exclude-module', 'charset_normalizer',
-    '--exclude-module', 'certifi',
     '--exclude-module', 'tornado',
     '--exclude-module', 'zmq',
     '--exclude-module', 'anyio',

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from zipfile import ZipFile
 
+from core import applog
 from core.ai.runtime_setup import WINDOWS_RUNTIME_DIR_NAME
 from core.crypto_store import default_root
 from core.updater import DownloadCancelled, DownloadError, download_exe
@@ -52,7 +53,6 @@ _WHEELS = (
 class EnvironmentStatus:
     needs_engine: bool = False
     needs_model: bool = False
-    problem: str = ""
 
 
 def supports_bundled_engine() -> bool:
@@ -104,25 +104,46 @@ def _has_model() -> bool:
     return False
 
 
-def detect_environment() -> EnvironmentStatus:
-    """只检查本机。启动阶段不会访问任何下载源。"""
-    root = default_root()
+def required_environment_problem(root: str | Path | None = None) -> str:
+    """在启动时只检查成绩与账户功能所需的条件。"""
+    root = Path(root) if root is not None else default_root()
     try:
         root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryFile(dir=root):
             pass
     except OSError:
-        return EnvironmentStatus(problem=f"无法写入应用数据目录 {root}。请检查目录权限和磁盘空间后重新启动。")
+        return f"无法写入应用数据目录 {root}。请检查目录权限和磁盘空间后重新启动。"
 
     required = ("PySide6", "pandas", "openpyxl", "xlrd", "cryptography")
     missing = [name for name in required if importlib.util.find_spec(name) is None]
     if missing:
-        return EnvironmentStatus(problem="应用内置组件缺失。请使用完整的安装向导覆盖安装，或重新获取单文件 EXE。")
+        return "应用内置组件缺失。请使用完整的安装向导覆盖安装，或重新获取单文件 EXE。"
+    return ""
 
-    legacy = root / "runtime/site/llama_cpp"
-    bundled = root / WINDOWS_RUNTIME_DIR_NAME / "llama_cpp"
-    has_engine = (legacy.is_dir() or bundled.is_dir()) and probe_backend()
-    return EnvironmentStatus(needs_engine=not has_engine, needs_model=not _has_model())
+
+def _has_engine_files(root: Path) -> bool:
+    return any(
+        (root / directory / "llama_cpp/__init__.py").is_file()
+        for directory in (WINDOWS_RUNTIME_DIR_NAME, "runtime/site")
+    )
+
+
+def initial_ai_setup() -> EnvironmentStatus | None:
+    """在首次进入主界面后判断是否需要推荐可选组件。"""
+    root = default_root()
+    marker = root / "runtime/startup-ai-offered"
+    if marker.exists():
+        return None
+    # 组件启动验证留给安装与实际推理，避免每次打开软件都启动子进程。
+    status = EnvironmentStatus(needs_engine=not _has_engine_files(root), needs_model=not _has_model())
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch(exist_ok=False)
+    except FileExistsError:
+        return None  # 同时打开多个窗口时只提示一次。
+    except OSError as exc:
+        applog.write("environment", f"未能保存 AI 引导状态：{type(exc).__name__}", root=root)
+    return status if status.needs_engine or status.needs_model else None
 
 
 @contextmanager
@@ -212,7 +233,7 @@ def install_missing(status: EnvironmentStatus, *, progress, cancel) -> None:
     """安装已获用户授权的缺项。下载和验证均在调用方的后台线程执行。"""
     _cancel_if_requested(cancel)
     with _install_lock() as root:
-        needs_engine = status.needs_engine and not probe_backend()
+        needs_engine = status.needs_engine and not (_has_engine_files(root.parent) and probe_backend())
         needs_model = status.needs_model and not _has_model()
         download_size = (35 * 1024 * 1024 if needs_engine else 0) + (
             MODEL_BYTES if needs_model else 0

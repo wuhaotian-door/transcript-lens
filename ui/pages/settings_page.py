@@ -56,7 +56,7 @@ from core.gpa import (
 )
 from core.updater import (
     CURRENT_VERSION,
-    GITEE_RELEASES_PAGE,
+    GITHUB_RELEASES_PAGE,
     STATUS_ERROR,
     UpdateCheck,
     check_for_update,
@@ -614,11 +614,18 @@ class SettingsPage(QWidget):
         self._upd_status = QLabel("")
         self._upd_status.setObjectName("Muted")
         self._upd_status.setWordWrap(True)
+        self._upd_status.setTextFormat(Qt.TextFormat.PlainText)
         box.addWidget(self._upd_status)
+        self._release_btn = QPushButton("打开 GitHub 发布页")
+        self._release_btn.setObjectName("Ghost")
+        self._release_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(GITHUB_RELEASES_PAGE)))
+        self._release_btn.hide()
+        box.addWidget(self._release_btn, alignment=Qt.AlignmentFlag.AlignLeft)
         return card
 
     def _set_update_status(self, text: str, *, error: bool = False) -> None:
         self._upd_status.setText(text)
+        self._release_btn.setVisible(error)
         self._upd_status.setObjectName("Danger" if error else "Muted")
         style = self._upd_status.style()
         style.unpolish(self._upd_status)
@@ -659,9 +666,7 @@ class SettingsPage(QWidget):
           **但"不自动下载"这条没变** —— 每一步都要用户点一下。
         """
         if result.status == STATUS_ERROR:
-            self._set_update_status(
-                "检查失败，请手动访问仓库查看是否有新版本。", error=True
-            )
+            self._set_update_status(result.detail, error=True)
             return
         self._set_update_status(result.detail)
         if not result.has_newer:
@@ -681,9 +686,9 @@ class SettingsPage(QWidget):
                 QMessageBox.StandardButton.Ok,
             )
             if answer == QMessageBox.StandardButton.Ok:
-                QDesktopServices.openUrl(QUrl(GITEE_RELEASES_PAGE))
+                QDesktopServices.openUrl(QUrl(GITHUB_RELEASES_PAGE))
                 self._set_update_status(
-                    f"{result.detail} 已打开浏览器：{GITEE_RELEASES_PAGE}"
+                    f"{result.detail} 已打开浏览器：{GITHUB_RELEASES_PAGE}"
                 )
             return
 

@@ -312,7 +312,7 @@ onefile 的 exe 启动时会**再起一个子进程**（bootloader + 真正的�
 |---|---|---|
 | SMTP 发邮件 | 仅找回密码流程，用户点「发送验证码」触发 | `core/email_recovery.py` |
 | 辅导员手动启用云端大模型 | 设置页手动开 + 填 API Key，**只在点「深度评估」时**调用 | `core/ai/`（骨架） |
-| **更新检查** | 用户点「检查更新」→ `urllib.request` 只读一次 Gitee 版本号 | `core/updater.py` |
+| **更新检查** | 用户点「检查更新」→ `urllib.request` 优先读取 GitHub 更新清单，Gitee 备用 | `core/updater.py` |
 | **更新下载 / AI 模型下载** | 用户点「开始下载」并勾选文件 → 流式下载 | `core/updater.download_exe` |
 | **启动环境补装** | 本地检测缺失项，用户确认下载后才访问固定组件地址，并校验 SHA-256 | `core/startup_environment.py` |
 
@@ -935,7 +935,7 @@ parse_excel(path, engine=engine_for(path))   # 调用方传引擎进去
 
 ## 36. ★ 推理后端一键安装（v1.9.2）
 
-* Windows x64 分发版通过 `core/startup_environment.py` 补装。启动检查只访问本机；用户明确确认后下载并校验固定的 CPU 组件和缺失的入门模型。程序自带 Python 和 Excel 依赖，分发版补装无需系统 Python。模型中心也使用同一推理核心安装入口。源码版保留下方的 pip 安装流程。
+* Windows x64 分发版通过 `core/startup_environment.py` 补装。启动时只检查内置依赖和数据目录。进入主界面后可在后台检查可选 AI 组件的文件，缺项只提示一次。原生库的加载验证在安装和使用时执行。用户确认后才下载并校验组件。程序自带 Python 和 Excel 依赖，分发版补装无需系统 Python。模型中心也使用同一推理核心安装入口。源码版保留下方的 pip 安装流程。
 
 * `core/ai/runtime_setup.py`：**零 HTTP import**，pip 走子进程（Windows 必须
   `subprocess.CREATE_NO_WINDOW`，绝不弹黑框）。安装目标是**应用私有目录**

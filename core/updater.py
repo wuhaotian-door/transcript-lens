@@ -84,6 +84,8 @@ import json
 import os
 import re
 import shutil
+import socket
+import ssl
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -104,6 +106,8 @@ __all__ = [
     "GITEE_RAW_MANIFEST",
     "GITEE_RELEASES_API",
     "GITEE_RELEASES_PAGE",
+    "GITHUB_RAW_MANIFEST",
+    "GITHUB_RELEASES_PAGE",
     "MANIFEST_SCHEMA",
     "MIN_EXE_BYTES",
     "ManifestApp",
@@ -138,6 +142,9 @@ __all__ = [
 GITEE_RAW_MANIFEST = (
     "https://gitee.com/wuhaotiansystem/transcript-lens/raw/master/update/manifest.json"
 )
+GITHUB_RAW_MANIFEST = (
+    "https://raw.githubusercontent.com/wuhaotian-door/transcript-lens/master/update/manifest.json"
+)
 
 #: 清单格式版本。不认识的版本一律当"读不懂"处理（退回老路子），**不猜**。
 MANIFEST_SCHEMA = 1
@@ -158,6 +165,7 @@ GITEE_RELEASES_API = (
 
 #: 让用户自己去下载的那个页面（不自动下载，只打开浏览器）
 GITEE_RELEASES_PAGE = "https://gitee.com/wuhaotiansystem/transcript-lens/releases"
+GITHUB_RELEASES_PAGE = "https://github.com/wuhaotian-door/transcript-lens/releases"
 
 #: 默认超时（秒）。charter 7.2 指定 5s。
 DEFAULT_TIMEOUT = 5
@@ -464,7 +472,7 @@ def fetch_manifest(
     """
     status, payload = _get_json(url, timeout)
     if status is None:
-        return None, "连不上服务器（断网或 Gitee 抽风）"
+        return None, payload or "无法连接服务器，请检查网络或代理。"
     if status == 404:
         return None, "远端还没有 update/manifest.json（404 不是故障）"
     if status != 200:
@@ -556,10 +564,39 @@ class UpdateCheck:
         return human_size(self.size)
 
 
+def _open_url(request: urllib.request.Request, timeout: float):
+    """优先使用系统信任库，缺少颁发者时用随包附带的公开根证书重试。"""
+    try:
+        return urllib.request.urlopen(request, timeout=timeout)
+    except (urllib.error.URLError, ssl.SSLCertVerificationError) as exc:
+        reason = getattr(exc, "reason", exc)
+        if (request.type != "https" or not isinstance(reason, ssl.SSLCertVerificationError)
+                or getattr(reason, "verify_code", None) not in (2, 20, 21)):
+            raise
+        try:
+            import certifi
+
+            context = ssl.create_default_context(cafile=certifi.where())
+        except (ImportError, OSError):
+            raise exc from None
+        return urllib.request.urlopen(request, timeout=timeout, context=context)
+
+
+def _network_problem(exc: BaseException) -> str:
+    reason = getattr(exc, "reason", exc)
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return "HTTPS 证书校验失败。请检查系统时间和 Windows 更新，或联系网络管理员核对代理证书。"
+    if isinstance(reason, TimeoutError):
+        return "连接超时。请稍后重试，或检查网络与代理设置。"
+    if isinstance(reason, socket.gaierror):
+        return "无法解析服务器地址。请检查网络与 DNS 设置。"
+    return "无法连接服务器。请检查网络与代理设置。"
+
+
 def _get_json(url: str, timeout: float) -> tuple[int | None, Any]:
     """GET 一次并解析 JSON。**不抛异常**，返回 ``(HTTP 状态码, 解析结果)``。
 
-    状态码 ``None`` = 连都没连上（超时 / DNS / 断网）。
+    状态码 ``None`` 时，第二项为网络故障说明。
     """
     request = urllib.request.Request(
         url,
@@ -567,14 +604,14 @@ def _get_json(url: str, timeout: float) -> tuple[int | None, Any]:
         method="GET",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+        with _open_url(request, timeout) as response:
             status = int(getattr(response, "status", 0) or 0)
             raw = response.read(MAX_RESPONSE_BYTES)
     except urllib.error.HTTPError as exc:
         # HTTPError 是 URLError 的子类，必须**先**接住才有状态码可看
         return int(exc.code), None
-    except (urllib.error.URLError, OSError, ValueError):
-        return None, None
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return None, _network_problem(exc)
     try:
         return status, json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -640,7 +677,7 @@ def check_for_update(
     timeout: float = DEFAULT_TIMEOUT,
     *,
     current: str = CURRENT_VERSION,
-    manifest_url: str = GITEE_RAW_MANIFEST,
+    manifest_url: str | None = None,
 ) -> UpdateCheck:
     """一次完整的更新检查，带**能说清楚**的状态。
 
@@ -648,14 +685,8 @@ def check_for_update(
     "接口通了但仓库里一个发行版都没有"和"根本没连上"必须给用户
     不同的话 —— 前者不是故障，说成"检查失败"是撒谎。
 
-    v1.9 的顺序是**先清单、后正文**：
-
-    1. 读 ``update/manifest.json``（:func:`fetch_manifest`）。拿到一份
-       :meth:`ManifestApp.usable` 的清单就照它给结果 ——
-       版本号来自 ``app.version``，直链/体积/哈希一并带回去；
-    2. 清单拿不到、读不懂、**或者三样关键字段没写全** → 退回老的发行版路线
-       （:func:`_check_from_release`，deprecated）。**行为与 v1.8 完全一致**，
-       所以清单还没发布的那段时间，这个功能不会退化。
+    默认优先读 GitHub 更新清单，读不到可用清单时再尝试 Gitee。
+    显式传入清单地址时保留旧接口的发行版正文兜底行为。
 
     Args:
         timeout: 秒。
@@ -665,10 +696,22 @@ def check_for_update(
     Returns:
         :class:`UpdateCheck`。
     """
-    app, _problem = fetch_manifest(manifest_url, timeout)
-    if app is not None and app.usable:
-        return _from_manifest(app, current)
-    return _check_from_release(timeout, current)
+    if manifest_url is not None:
+        app, _problem = fetch_manifest(manifest_url, timeout)
+        if app is not None and app.usable:
+            return _from_manifest(app, current)
+        return _check_from_release(timeout, current)
+
+    problems = []
+    for name, url in (("GitHub", GITHUB_RAW_MANIFEST), ("Gitee", GITEE_RAW_MANIFEST)):
+        app, problem = fetch_manifest(url, timeout)
+        if app is not None and app.usable:
+            return _from_manifest(app, current)
+        problems.append(f"{name}：{problem}")
+    return UpdateCheck(
+        status=STATUS_ERROR, source=SOURCE_MANIFEST,
+        detail="检查更新失败。\n" + "\n".join(problems),
+    )
 
 
 def _from_manifest(app: ManifestApp, current: str) -> UpdateCheck:
@@ -1145,13 +1188,11 @@ def download_exe(
     request = urllib.request.Request(download_url, headers=headers, method="GET")
 
     try:
-        response = urllib.request.urlopen(request, timeout=timeout)  # noqa: S310
+        response = _open_url(request, timeout)
     except urllib.error.HTTPError as exc:
         raise DownloadError(f"下载失败：服务器返回 HTTP {exc.code}。") from exc
-    except urllib.error.URLError as exc:
-        raise DownloadError(f"下载失败：连不上服务器（{exc.reason}）。") from exc
     except (OSError, ValueError) as exc:
-        raise DownloadError(f"下载失败：{exc}") from exc
+        raise DownloadError(f"下载失败：{_network_problem(exc)}") from exc
 
     mode = "ab"
     checksum = normalize_sha256(expected_sha256)

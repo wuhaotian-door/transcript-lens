@@ -433,6 +433,13 @@ class MainWindow(QMainWindow):
             self.goto(DEFAULT_PAGE)
             self.analysis_page._import_btn.click()
 
+        from core.startup_environment import supports_bundled_engine
+
+        if self.isVisible() and supports_bundled_engine():
+            from ui.startup_environment import offer_startup_ai
+
+            offer_startup_ai(self)
+
     def _ensure_opaque(self) -> None:
         """淡入看门狗：**只在明显没到位时**兜底，正常动画不去碰它。"""
         if self.windowOpacity() < 0.99:

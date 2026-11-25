@@ -583,6 +583,30 @@ def test_清单和Gitee都连不上就是检查失败(monkeypatch: pytest.Monkey
     assert U.GITEE_API in net.calls and U.GITEE_RELEASES_API in net.calls
 
 
+def test_默认更新优先读GitHub并用Gitee备用(monkeypatch: pytest.MonkeyPatch) -> None:
+    with fake_net(monkeypatch, {U.GITHUB_RAW_MANIFEST: (200, GOOD_PAYLOAD)}) as net:
+        result = U.check_for_update(current="1.8")
+    assert result.status == U.STATUS_NEWER
+    assert net.calls == [U.GITHUB_RAW_MANIFEST]
+
+    with fake_net(monkeypatch, {U.GITEE_RAW_MANIFEST: (200, GOOD_PAYLOAD)}) as net:
+        result = U.check_for_update(current="1.8")
+    assert result.status == U.STATUS_NEWER
+    assert net.calls == [U.GITHUB_RAW_MANIFEST, U.GITEE_RAW_MANIFEST]
+
+
+def test_两个清单都打不开时保留具体原因(monkeypatch: pytest.MonkeyPatch) -> None:
+    with fake_net(monkeypatch, {
+        U.GITHUB_RAW_MANIFEST: (None, "HTTPS 证书校验失败。"),
+        U.GITEE_RAW_MANIFEST: (None, "连接超时。"),
+    }) as net:
+        result = U.check_for_update()
+    assert result.status == U.STATUS_ERROR
+    assert "GitHub：HTTPS 证书校验失败" in result.detail
+    assert "Gitee：连接超时" in result.detail
+    assert net.calls == [U.GITHUB_RAW_MANIFEST, U.GITEE_RAW_MANIFEST]
+
+
 def test_清单不通而仓库还没发版说的是没有发行版(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

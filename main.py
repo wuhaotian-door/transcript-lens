@@ -176,6 +176,7 @@ def _selfcheck_report() -> tuple[bool, str]:
     step("import openpyxl", lambda: __import__("openpyxl").__version__)
     # cryptography 是 C 扩展，打包后最容易出现"界面能开、一存盘就崩"
     step("import cryptography", lambda: __import__("cryptography").__version__)
+    step("HTTPS 公开根证书", lambda: Path(__import__("certifi").where()).stat().st_size)
     step("import PySide6", lambda: __import__("PySide6").__version__)
     step(
         "from PySide6.QtWidgets import QApplication",
@@ -2871,10 +2872,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     run_startup_migration(flow.root)
     if IS_FROZEN and sys.platform == "win32":
-        from ui.startup_environment import check_before_start
+        from PySide6.QtWidgets import QMessageBox
+        from core.ai.runtime_setup import ensure_runtime_on_path
+        from core.startup_environment import required_environment_problem
 
-        if not check_before_start():
+        problem = required_environment_problem(flow.root)
+        if problem:
+            applog.write("environment", problem, root=flow.root)
+            QMessageBox.critical(None, "应用环境需要修复", problem)
             return 1
+        try:
+            ensure_runtime_on_path()
+        except OSError as exc:
+            applog.write("environment", f"无法读取本地推理核心：{type(exc).__name__}", root=flow.root)
     flow.start()
     return app.exec()
 

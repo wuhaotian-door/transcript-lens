@@ -33,8 +33,10 @@ Name: "en"; MessagesFile: "compiler:Default.isl"
 [CustomMessages]
 #ifdef ChineseLanguageFile
 zh.ShellIntegration=添加开始菜单快捷方式并登记到 Windows 应用列表
+zh.OpenAfterSetup=点击「完成」退出安装向导。之后可打开下方的程序，或使用安装时添加的开始菜单快捷方式。
 #else
 en.ShellIntegration=Add a Start menu shortcut and register in the Windows app list
+en.OpenAfterSetup=Click Finish to close Setup. Then open the program below, or use the Start menu shortcut if you added one.
 #endif
 
 [Files]
@@ -54,5 +56,14 @@ Type: files; Name: "{userdesktop}\成绩透析镜.lnk"; Tasks: shell\desktopicon
 Name: "{userprograms}\成绩单透镜"; Filename: "{app}\transcript-lens.exe"; WorkingDir: "{app}"; Tasks: shell
 Name: "{userdesktop}\成绩单透镜"; Filename: "{app}\transcript-lens.exe"; WorkingDir: "{app}"; Tasks: shell\desktopicon
 
-[Run]
-Filename: "{app}\transcript-lens.exe"; WorkingDir: "{app}"; Description: "{cm:LaunchProgram,成绩单透镜}"; Flags: nowait postinstall skipifsilent
+[Code]
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if (CurPageID = wpFinished) and not WizardSilent then
+  begin
+    WizardForm.FinishedLabel.Caption :=
+      CustomMessage('OpenAfterSetup') + #13#10 + #13#10 +
+      ExpandConstant('{app}\transcript-lens.exe');
+    WizardForm.AdjustLabelHeight(WizardForm.FinishedLabel);
+  end;
+end;

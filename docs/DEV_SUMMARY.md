@@ -522,6 +522,9 @@ minRamGb, defaultCheck, …} ]}`。
 `run_pending_update()` → `run_startup_migration()` → `flow.start()`。
 "先换程序、再迁数据"这个次序是确定的。
 
+Windows 分发版在开屏前检查内置依赖和数据目录。可选 AI 组件在进入主界面后检查，
+缺项时仅显示一次可关闭的安装提示。用户可随时从模型中心配置本地 AI。
+
 ### 10.3 切页
 
 - `QStackedWidget` + `QPropertyAnimation`；目标 **≤150ms**，现在 ~137ms
