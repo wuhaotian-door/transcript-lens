@@ -181,7 +181,27 @@ def test_gpa_editor_and_switch_refresh_both_profiles(store, monkeypatch):
         assert overview._metrics[2].text() == "3.85"
         assert semester._extra_gpa.text().startswith("GPA 3.70")
         combo = settings._gpa_combo
+        changed = []
+        settings.gpa_scheme_changed.connect(changed.append)
+
+        def decline(dialog):
+            assert dialog.parent() is settings
+            assert "切换" in dialog.windowTitle() and "标准 4.0（四档）" in dialog.text()
+            assert dialog.defaultButton() is dialog.button(QMessageBox.StandardButton.No)
+            assert dialog.escapeButton() is dialog.defaultButton()
+            assert combo.currentData() == DEFAULT_SCHEME
+            return QMessageBox.StandardButton.No
+
+        monkeypatch.setattr(QMessageBox, "exec", decline)
         combo.setCurrentIndex(combo.findData("standard4_band"))
+        assert combo.currentData() == load_settings(store, USER)["scheme"] == DEFAULT_SCHEME
+        assert overview._metrics[2].text() == "3.85"
+        assert semester._extra_gpa.text().startswith("GPA 3.70")
+        assert changed == []
+
+        monkeypatch.setattr(QMessageBox, "exec", lambda self: QMessageBox.StandardButton.Yes)
+        combo.setCurrentIndex(combo.findData("standard4_band"))
+        assert changed == ["standard4_band"]
         assert overview._metrics[2].text() == "3.50"
         assert overview._table.item(0, 3).text() == "3.00"
         assert overview._table.selectedItems()

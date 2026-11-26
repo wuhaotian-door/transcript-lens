@@ -2,9 +2,11 @@
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QDialogButtonBox, QFormLayout, QInputDialog, QLabel, QLineEdit,
+    QAbstractItemView, QDialog, QDialogButtonBox, QFormLayout, QInputDialog, QLabel, QLineEdit,
     QMessageBox, QPushButton, QVBoxLayout,
 )
+
+from shiboken6 import isValid
 
 from core.crypto_store import CryptoError
 from ui.workers import run_async
@@ -24,6 +26,16 @@ def button(text, callback, role="Ghost") -> QPushButton:
     widget.setMinimumHeight(34)
     widget.clicked.connect(callback)
     return widget
+
+
+def review_table(table):
+    table.setAlternatingRowColors(True)
+    table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+    table.verticalHeader().hide()
+    table.setMouseTracking(True)
+    table.viewport().setMouseTracking(True)
 
 
 def fields(parent, title, items):
@@ -75,28 +87,35 @@ class TaskDialog(QDialog):
         self.status = label("", "Muted")
         self.status.setWordWrap(True)
 
-    def execute(self, work, done, message="正在处理…"):
+    def execute(self, work, done, message="正在处理…", *, controls=(), on_error=None):
         if self._busy:
             return
         self._busy = True
         self.status.setText(message)
-        buttons = [b for b in self.findChildren(QPushButton) if b.isEnabled()]
-        for item in buttons:
+        widgets = [w for w in (*self.findChildren(QPushButton), *controls)
+                   if w.window() is self and w.isEnabled()]
+        for item in widgets:
             item.setEnabled(False)
 
         def release():
+            if not isValid(self):
+                return False
             self._busy = False
-            for item in buttons:
-                item.setEnabled(True)
+            for item in widgets:
+                if isValid(item):
+                    item.setEnabled(True)
+            return True
 
         def completed(result):
-            release()
-            self.status.clear()
-            done(result)
+            if release():
+                self.status.clear()
+                done(result)
 
         def failed(error):
-            release()
-            self.status.setText(f"未完成。{error}")
+            if release():
+                self.status.setText(f"未完成。{error}")
+                if on_error is not None:
+                    on_error(error)
 
         run_async(self, work, on_done=completed, on_error=failed)
 

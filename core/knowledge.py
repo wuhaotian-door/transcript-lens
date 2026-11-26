@@ -17,6 +17,66 @@ MISS = "制度库中没有找到明确依据。"
 QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
 
 
+FIELD_TITLES = {"title": "标题", "source": "发布部门或来源", "school": "适用学校", "year": "学年", "version": "版本"}
+FIELD_LENGTHS = {"title": 120, "source": 240, "school": 100, "year": 12, "version": 60}
+
+
+class DocumentValidationError(ValueError):
+    def __init__(self, field: str, message: str):
+        super().__init__(message)
+        self.field = field
+
+
+class DuplicateDocumentError(ValueError):
+    def __init__(self, digest: str, title: str):
+        super().__init__("这份文件已导入。")
+        self.digest = digest
+        self.title = title
+
+
+def _text_field(key: str, value, *, optional: bool = False) -> str:
+    text = value.strip() if isinstance(value, str) else ""
+    field = FIELD_TITLES[key]
+    if not text and not optional:
+        raise DocumentValidationError(key, f"请填写{field}。")
+    limit = FIELD_LENGTHS[key]
+    if len(text) > limit or any(not character.isprintable() for character in text):
+        raise DocumentValidationError(key, f"{field}请使用单行文字，最多 {limit} 字。")
+    return text
+
+
+def validate_scope(school: str, year: str) -> dict[str, str]:
+    school = _text_field("school", school)
+    year = _text_field("year", year).removesuffix("学年").strip()
+    year = year.replace("—", "-").replace("–", "-")
+    if year != "通用":
+        years = re.fullmatch(r"([0-9]{4})-([0-9]{4})", year)
+        if not years or not 1900 <= int(years[1]) < 9999 or int(years[2]) != int(years[1]) + 1:
+            raise DocumentValidationError("year", "学年请选择连续的两个年份，例如 2025-2026，或选择「通用」。")
+    return {"school": school, "year": year}
+
+
+def validate_metadata(metadata: dict) -> dict[str, str]:
+    fields = {key: _text_field(key, metadata.get(key)) for key in ("title", "source")}
+    fields.update(validate_scope(metadata.get("school"), metadata.get("year")))
+    fields["version"] = _text_field("version", metadata.get("version"), optional=True)
+    for key, title in (("start", "生效日期"), ("end", "截止日期")):
+        value = metadata.get(key) or ""
+        if key == "end" and value == "至今":
+            value = ""
+        try:
+            if value:
+                if not isinstance(value, str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+                    raise ValueError
+                value = date.fromisoformat(value).isoformat()
+        except ValueError as error:
+            raise DocumentValidationError(key, f"请选择有效的{title}。") from error
+        fields[key] = value
+    if fields["start"] and fields["end"] and fields["start"] > fields["end"]:
+        raise DocumentValidationError("end", "截止日期不能早于生效日期。")
+    return fields
+
+
 class Embedder:
     def __init__(self, root: Path):
         from onnxruntime import InferenceSession, SessionOptions
@@ -121,33 +181,64 @@ class KnowledgeLibrary:
     def _data(self) -> dict:
         return load_user_json(self.store, self.username, FILE, {"documents": {}, "scope": {}}, strict=True)
 
-    def list(self) -> list[dict]:
-        return [{**{key: value for key, value in doc.items() if key != "chunks"},
-                 "count": len(doc["chunks"])}
-                for doc in self._data()["documents"].values()]
+    def list(self, query: str = "") -> list[dict]:
+        """管理资料时检索所有版本，也包含尚未生效或已过期的文档。"""
+        terms = query.casefold().split()
+        result = []
+        for doc in self._data()["documents"].values():
+            metadata = {key: value for key, value in doc.items() if key != "chunks"}
+            chunks = doc["chunks"]
+            if terms:
+                searchable = " ".join(str(doc.get(key) or "") for key in (
+                    *FIELD_TITLES, "filename", "start", "end"))
+                searchable += " " + " ".join(chunk["text"] for chunk in chunks)
+                searchable = searchable.casefold()
+                if not all(term in searchable for term in terms):
+                    continue
+            result.append({**metadata, "count": len(chunks)})
+        return result
+
+    def edit(self, digest: str, metadata: dict) -> None:
+        cleaned = validate_metadata(metadata)
+        with ROSTER_WRITE_LOCK:
+            data = self._data()
+            doc = data["documents"].get(digest)
+            if doc is None:
+                raise ValueError("这份资料已从知识库移除。")
+            doc.update(cleaned)
+            save_user_json(self.store, self.username, FILE, data)
 
     def scope(self) -> dict:
         return dict(self._data().get("scope", {}))
 
     def set_scope(self, school: str, year: str) -> None:
+        scope = validate_scope(school, year)
         with ROSTER_WRITE_LOCK:
             data = self._data()
-            data["scope"] = {"school": school.strip(), "year": year.strip()}
+            data["scope"] = scope
             save_user_json(self.store, self.username, FILE, data)
 
-    def add(self, path: Path, metadata: dict) -> str:
+    def find_duplicate(self, path: Path) -> dict | None:
+        if path.stat().st_size > 30_000_000:
+            raise ValueError("文件超过 30 MB，请拆分导入。")
+        with path.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        doc = self._data()["documents"].get(digest)
+        return {key: value for key, value in doc.items() if key != "chunks"} if doc else None
+
+    def add(self, path: Path, metadata: dict, *, overwrite_digest: str | None = None) -> str:
+        metadata = validate_metadata(metadata)
         if path.stat().st_size > 30_000_000:
             raise ValueError("文件超过 30 MB，请拆分导入。")
         blob = path.read_bytes()
+        if len(blob) > 30_000_000:
+            raise ValueError("文件超过 30 MB，请拆分导入。")
         digest = hashlib.sha256(blob).hexdigest()
-        if not all(metadata.get(field, "").strip() for field in ("title", "source", "school", "year")):
-            raise ValueError("请填写标题、来源、适用学校和学年（或通用）。")
-        start = date.fromisoformat(metadata["start"]) if metadata.get("start") else None
-        end = date.fromisoformat(metadata["end"]) if metadata.get("end") else None
-        if start and end and start > end:
-            raise ValueError("失效日期不能早于生效日期。")
-        if digest in self._data()["documents"]:
-            raise ValueError("这份文件已导入。")
+        previous = self._data()["documents"].get(digest)
+        if overwrite_digest is not None and digest != overwrite_digest:
+            raise ValueError("文件在确认后已变化，请重新选择。")
+        if previous is not None and overwrite_digest is None:
+            raise DuplicateDocumentError(digest, previous["title"])
         body = _body(path)
         if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
             raise ValueError("文件在读取时发生变动，请重新选择。")
@@ -164,8 +255,11 @@ class KnowledgeLibrary:
             model = MODEL_ID
         with ROSTER_WRITE_LOCK:
             data = self._data()
-            if digest in data["documents"]:
-                raise ValueError("这份文件已导入。")
+            existing = data["documents"].get(digest)
+            if existing is not None and overwrite_digest is None:
+                raise DuplicateDocumentError(digest, existing["title"])
+            if existing is None and overwrite_digest is not None:
+                raise ValueError("原资料已被移除，请重新导入。")
             data["documents"][digest] = {
                 **metadata, "id": digest, "model": model, "chunks": chunks, "filename": path.name,
                 "type": path.suffix.lower(), "size": len(blob), "indexed": date.today().isoformat(),

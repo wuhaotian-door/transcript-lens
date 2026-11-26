@@ -16,13 +16,14 @@ class AcademicContext:
     def course_count(self) -> int:
         return sum(len(rows) for _, rows in self.courses)
 
-    def render(self, prompt: str, question: str, token_limit: int, count: Callable[[str], int]) -> str:
+    def render(self, prompt: str, question: str, token_limit: int, count: Callable[[str], int],
+               *, preamble: str = "") -> str:
         def assemble(rows: list[str], *, complete: bool) -> str:
             coverage = "课程明细为全部记录。" if complete else (
                 "各学期统计为完整结果，下面的课程明细按问题与上下文容量选取。"
                 "仅根据实际提供的课程回答，可请用户注明学期或课程以查询其余明细。"
             )
-            return f"{self.summary}\n{coverage}\n" + "\n".join(rows) + "\n\n" + prompt
+            return f"{preamble}{self.summary}\n{coverage}\n" + "\n".join(rows) + "\n\n" + prompt
 
         all_rows = [detail for _, courses in self.courses for _, detail in courses]
         full = assemble(all_rows, complete=True)

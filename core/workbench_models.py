@@ -1,7 +1,9 @@
 """本地模型的固定来源和完整性检查。"""
 
 import hashlib
+from stat import S_ISREG
 from pathlib import Path
+from threading import Lock
 
 from core.crypto_store import _atomic_write_bytes
 from core.updater import download_exe
@@ -19,6 +21,7 @@ ASSETS = {
                        "48cea5d44424912a6fd1ea647bf4fe50b55ab8b1e5879c3275f80e339e8fae26"),
 }
 GROUPS = {"semantic": ("bge.onnx", "tokenizer.json"), "face": ("yunet.onnx", "sface.onnx")}
+_MODEL_WRITE_LOCK = Lock()
 
 
 def model_directory(root: Path) -> Path:
@@ -26,11 +29,14 @@ def model_directory(root: Path) -> Path:
 
 
 def installed(root: Path, group: str) -> bool:
-    for name in GROUPS[group]:
-        path = model_directory(root) / name
-        if not path.is_file() or path.stat().st_size != ASSETS[name][1]:
-            return False
-    return True
+    try:
+        for name in GROUPS[group]:
+            info = (model_directory(root) / name).stat()
+            if not S_ISREG(info.st_mode) or info.st_size != ASSETS[name][1]:
+                return False
+        return True
+    except OSError:
+        return False
 
 
 def verify_model(path: Path, name: str) -> bytes:
@@ -42,20 +48,46 @@ def verify_model(path: Path, name: str) -> bytes:
     return data
 
 
-def install_models(root: Path, group: str, source: Path | None = None) -> None:
-    dest = model_directory(root)
+def install_models(root: Path, group: str, source: Path | None = None, *, progress=None) -> None:
     names = GROUPS[group]
-    if source is not None:
-        checked = {name: verify_model(source / name, name) for name in names}
-        for name, blob in checked.items():
-            _atomic_write_bytes(dest / name, blob)
-        return
-    for name in names:
-        url, size, digest = ASSETS[name]
-        target = dest / name
-        try:
-            verify_model(target, name)
-            continue
-        except (FileNotFoundError, ValueError):
-            pass
-        download_exe(url, target, expected_sha256=digest, min_bytes=size, resume=False)
+    total = sum(ASSETS[name][1] for name in names)
+    dest = model_directory(root)
+    with _MODEL_WRITE_LOCK:
+        if source is not None:
+            checked = {name: verify_model(source / name, name) for name in names}
+            done = 0
+            for name, blob in checked.items():
+                _atomic_write_bytes(dest / name, blob)
+                done += len(blob)
+                if progress:
+                    progress(name, done, total)
+            return
+        done = 0
+        for name in names:
+            url, size, digest = ASSETS[name]
+            target = dest / name
+            if progress:
+                progress(name, done, total)
+            try:
+                verify_model(target, name)
+            except (FileNotFoundError, ValueError):
+                def report(received, _length, *, offset=done, asset=name, limit=size):
+                    if progress:
+                        progress(asset, offset + min(received, limit), total)
+
+                download_exe(url, target, progress_callback=report, expected_sha256=digest,
+                             min_bytes=size, resume=True)
+            done += size
+            if progress:
+                progress(name, done, total)
+
+
+def uninstall_models(root: Path, group: str) -> None:
+    names = GROUPS[group]
+    with _MODEL_WRITE_LOCK:
+        expected = model_directory(root.resolve())
+        if expected.resolve() != expected:
+            raise OSError("模型目录已重定向，无法自动卸载。")
+        for name in names:
+            for filename in (name, name + ".part"):
+                (expected / filename).unlink(missing_ok=True)

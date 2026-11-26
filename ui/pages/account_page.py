@@ -32,26 +32,33 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
+from shiboken6 import isValid
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFrame,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from core.crypto_store import CryptoError, CryptoStore, WrongPasswordError
+from core.database import StudentStore
 from core.email_recovery import mail_configured, try_send_recovery_mail
 from core.recovery import RecoveryError, enable_recovery, recovery_info
 from core.session_token import clear_token
+from core.user_store import ROSTER_WRITE_LOCK
 from core.version import CURRENT_VERSION
 from ui.anim import make_card
 from ui.recovery_code_dialog import show_recovery_code
+from ui.workbench_widgets import TaskDialog, button, label, review_table
 from ui.workers import run_async
 from ui.widgets.profile_reading import profile_scroll
 
@@ -88,6 +95,7 @@ class AccountPage(QWidget):
     """
 
     switch_account = Signal()
+    archives_changed = Signal()
 
     def __init__(
         self,
@@ -101,12 +109,20 @@ class AccountPage(QWidget):
         #: v1.9.8：没有发信配置时，新找回码直接显示，不寄邮件。
         self._mail_ready = mail_configured(root)
         self._username = ""
+        self._archive_revision = 0
         self._build()
 
     def set_user(self, username: str) -> None:
         self._username = username or ""
         self._user_label.setText(self._username or "未登录")
         self._refresh_recovery()
+        self._archive_count.setText("")
+        self._manage_archive_button.setEnabled(bool(self._username))
+        self.refresh_archives()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.refresh_archives()
 
     # ---------------------------------------------------------------- 搭界面
     def _build(self) -> None:
@@ -169,6 +185,19 @@ class AccountPage(QWidget):
         ))
         box.addWidget(security)
 
+        archive = make_card(shadow=False)
+        archive_row = QHBoxLayout(archive)
+        archive_row.setContentsMargins(22, 16, 22, 16)
+        archive_text = QVBoxLayout()
+        archive_text.addWidget(self._section("归档管理"))
+        self._archive_count = label("", "Muted")
+        archive_text.addWidget(self._archive_count)
+        archive_row.addLayout(archive_text, 1)
+        self._manage_archive_button = button("管理归档", self._open_archives)
+        self._manage_archive_button.setEnabled(False)
+        archive_row.addWidget(self._manage_archive_button)
+        box.addWidget(archive)
+
         about = make_card(shadow=False)
         about_row = QHBoxLayout(about)
         about_row.setContentsMargins(22, 14, 22, 14)
@@ -209,6 +238,31 @@ class AccountPage(QWidget):
         label = QLabel(text)
         label.setObjectName("H2")
         return label
+
+    def refresh_archives(self):
+        self._archive_revision += 1
+        if not self._username or not self.isVisible():
+            return
+        username = self._username
+        revision = self._archive_revision
+        self._archive_count.setText("正在读取…")
+
+        def display(text):
+            if isValid(self) and revision == self._archive_revision:
+                self._archive_count.setText(text)
+
+        run_async(self, lambda: len(_archived_students(self._store, username)),
+                  on_done=lambda count: display(f"已归档 {count} 名学生"),
+                  on_error=lambda _: display("归档记录暂时无法读取。"))
+
+    def _open_archives(self):
+        if not self._username:
+            return
+        dialog = _ArchiveManagementDialog(self, self._store, self._username)
+        dialog.restored.connect(self.archives_changed.emit)
+        dialog.exec()
+        dialog.deleteLater()
+        self.refresh_archives()
 
     # ---------------------------------------------------------------- 状态
     def _refresh_recovery(self) -> None:
@@ -388,6 +442,85 @@ class AccountPage(QWidget):
         self._pwd_status.style().unpolish(self._pwd_status)
         self._pwd_status.style().polish(self._pwd_status)
 
+
+def _archived_students(store, username):
+    with ROSTER_WRITE_LOCK:
+        return StudentStore(store=store, username=username).search(archived_only=True)
+
+
+class _ArchiveManagementDialog(TaskDialog):
+    restored = Signal()
+
+    def __init__(self, parent, store, username):
+        super().__init__(parent, "归档管理")
+        self.resize(700, 500)
+        self._store = store
+        self._username = username
+        self._rows = []
+        self.body.addWidget(label("归档管理", "H2"))
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("搜索姓名、学号或班级")
+        self._search.setClearButtonEnabled(True)
+        self.body.addWidget(self._search)
+        self._table = QTableWidget(0, 3)
+        self._table.setHorizontalHeaderLabels(("姓名", "学号", "班级"))
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._table.verticalHeader().setDefaultSectionSize(34)
+        review_table(self._table)
+        self.body.addWidget(self._table, 1)
+        bottom = QHBoxLayout()
+        bottom.addWidget(self.status, 1)
+        bottom.addWidget(button("关闭", self.reject))
+        self._restore = button("恢复到学生名单", self._restore_selected, "Primary")
+        self._restore.setEnabled(False)
+        bottom.addWidget(self._restore)
+        self.body.addLayout(bottom)
+        self._search.textChanged.connect(self._render)
+        self._table.itemSelectionChanged.connect(self._update_restore)
+        self.execute(lambda: _archived_students(store, username), self._show_rows, "正在读取归档…",
+                     controls=(self._search, self._table))
+
+    def _show_rows(self, rows):
+        self._rows = rows
+        self._render()
+
+    def _render(self):
+        needle = self._search.text().strip().casefold()
+        rows = [(row["name"], row["student_id"].removeprefix("sid:"), row.get("class_name") or "")
+                for row in self._rows]
+        shown = [row for row in rows if any(needle in value.casefold() for value in row)]
+        self._table.clearSelection()
+        self._table.setRowCount(len(shown))
+        for position, row in enumerate(shown):
+            for column, value in enumerate(row):
+                self._table.setItem(position, column, QTableWidgetItem(value or "—"))
+        self._update_restore()
+        self.status.setText(f"显示 {len(shown)} / {len(rows)} 人" if rows else "暂无归档学生。")
+
+    def _update_restore(self):
+        self._restore.setEnabled(bool(self._table.selectedItems()) and not self._busy)
+
+    def _restore_selected(self):
+        if not self._table.selectedItems():
+            return
+        sid = self._table.item(self._table.currentRow(), 1).text()
+
+        def restore():
+            with ROSTER_WRITE_LOCK:
+                students = StudentStore(store=self._store, username=self._username)
+                row = students.get(sid)
+                if row is None:
+                    raise ValueError("该学生已不存在，请关闭窗口后重新打开。")
+                if row.get("archived"):
+                    students.restore(sid)
+            return _archived_students(self._store, self._username)
+
+        def done(rows):
+            self._show_rows(rows)
+            self.status.setText("已恢复到学生名单。")
+            self.restored.emit()
+
+        self.execute(restore, done, "正在恢复…", controls=(self._search, self._table))
 
 class _ChangePasswordDialog(QDialog):
     """改密码的小框：旧密码 / 新密码 / 确认新密码。

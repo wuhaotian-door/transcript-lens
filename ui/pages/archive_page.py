@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QStackedWidget,
+    QStyle,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -132,7 +133,7 @@ def _fmt(value: float | None, digits: int = 2) -> str:
 class _ClassRosterDelegate(StudentItemDelegate):
     def sizeHint(self, option, index):  # noqa: N802 - Qt API
         if index.data(_ROLE_CLASS_GROUP):
-            return QSize(0, 32)
+            return QSize(0, 34)
         return super().sizeHint(option, index)
 
     def paint(self, painter, option, index) -> None:
@@ -141,13 +142,15 @@ class _ClassRosterDelegate(StudentItemDelegate):
             return
         painter.save()
         frame = option.rect.adjusted(10, 5, -10, -2)
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#EAF2FC"))
-        painter.drawRoundedRect(frame, 5, 5)
+        painter.setBrush(QColor("#17466F" if selected else "#D8E9FA" if hovered else "#EAF2FC"))
+        painter.drawRoundedRect(frame, 6, 6)
         font = option.font
         font.setBold(True)
         painter.setFont(font)
-        painter.setPen(QColor("#264F88"))
+        painter.setPen(QColor("#FFFFFF" if selected else "#234873"))
         text = QFontMetrics(font).elidedText(str(index.data()), Qt.TextElideMode.ElideRight, frame.width() - 18)
         painter.drawText(frame.adjusted(9, 0, -9, 0), Qt.AlignmentFlag.AlignVCenter, text)
         painter.restore()
@@ -183,6 +186,7 @@ class ArchivePage(QWidget):
     details_requested = Signal(str)
     interview_requested = Signal(str)
     import_requested = Signal()
+    archives_changed = Signal()
 
     def __init__(self, store: CryptoStore | None = None,
                  parent: QWidget | None = None) -> None:
@@ -366,10 +370,12 @@ class ArchivePage(QWidget):
         self._list.setObjectName("StudentList")
         self._list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
         self._list.setMouseTracking(True)
+        self._list.viewport().setMouseTracking(True)
         self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._list.setFrameShape(QFrame.Shape.NoFrame)
         self._list.setItemDelegate(_ClassRosterDelegate(self._list))
         self._list.itemClicked.connect(self._on_item_clicked)
+        self._list.currentItemChanged.connect(self._on_current_item_changed)
         self._list.itemActivated.connect(self._open_details_from_item)
         imports = QPushButton("导入学生资料")
         imports.setObjectName("Ghost")
@@ -478,11 +484,12 @@ class ArchivePage(QWidget):
         for pos in range(self._list.count()):
             item = self._list.item(pos)
             if item.data(_ROLE_CLASS_GROUP) and item.data(_ROLE_CLASS_NAME) == name and not item.isHidden():
+                self._list.setCurrentItem(item)
                 self._list.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtTop)
                 return
-        search = self._search.text()
-        if search not in (name, f"{ARCHIVED_SEARCH_TEXT} {name}"):
-            self._search.setText(name)
+        search = f"{ARCHIVED_SEARCH_TEXT} {name}" if self._show_archived else name
+        if self._search.text() != search:
+            self._search.setText(search)
             self._jump_to_class(name)
 
     def _roster_context_menu(self, position) -> None:
@@ -494,6 +501,7 @@ class ArchivePage(QWidget):
         if item.data(_ROLE_CLASS_GROUP):
             if not name:
                 return
+            self._list.setCurrentItem(item)
             menu.addAction("定位此班级", lambda: self._jump_to_class(name))
             menu.addSeparator()
             menu.addAction("删除整个班级…", lambda: self._confirm_class_deletion(name))
@@ -696,7 +704,7 @@ class ArchivePage(QWidget):
             heading = QListWidgetItem(title)
             heading.setData(_ROLE_CLASS_GROUP, True)
             heading.setData(_ROLE_CLASS_NAME, klass)
-            heading.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            heading.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             heading.setToolTip(title)
             self._list.addItem(heading)
             for student in sorted(by_class[klass], key=lambda s: student_order_key(s.student_id, s.student)):
@@ -804,6 +812,10 @@ class ArchivePage(QWidget):
         if self._current and self._current.student_id:
             self.interview_requested.emit(_bare_sid(self._current.student_id))
 
+    def _on_current_item_changed(self, current, _previous) -> None:
+        if current is not None and current.data(_ROLE_CLASS_GROUP):
+            self.reset_view()
+
     def _on_item_clicked(self, item: QListWidgetItem) -> None:
         key = self._key_by_row.get(self._list.row(item))
         student = self._archive.get(key) if key and self._archive is not None else None
@@ -824,7 +836,8 @@ class ArchivePage(QWidget):
 
         label = (f"{student.student}（{student.student_id}）"
                  if student.student_id else student.student)
-        self._who.setText(label)
+        record = self._book.get(student.student_id) if self._book and student.student_id else None
+        self._who.setText(f"{label} · {record.gender}" if record and record.gender else label)
         self._cumulative.setText(_fmt(student.cumulative_average))
         self._cum_sub.setText(
             f"{len(student.terms)} 个学期　·　{len(student.records)} 条记录　·　"
@@ -1197,6 +1210,7 @@ class ArchivePage(QWidget):
                 name=name,
                 class_name=values.get("class_name", ""),
                 note=values.get("note", ""),
+                gender=values.get("gender", ""),
             )
         except DuplicateStudentError:
             QMessageBox.critical(
@@ -1308,6 +1322,7 @@ class ArchivePage(QWidget):
                     name=new_name,
                     class_name=values.get("class_name", ""),
                     note=values.get("note", ""),
+                    gender=values.get("gender"),
                 )
             except Exception:
                 logger.exception("编辑学生主档失败")
@@ -1458,6 +1473,7 @@ class ArchivePage(QWidget):
         )
         self.reset_view()
         self.reload()
+        self.archives_changed.emit()
 
     def _confirm_sid_change(self, old_sid: str, new_sid: str) -> str | None:
         if new_sid == old_sid:

@@ -67,12 +67,22 @@ def test_model_center_loads_account_settings_without_exposing_key(monkeypatch, t
     try:
         assert page._cloud.isChecked()
         assert page._key.text() == ""
-        page._local.setChecked(True)
+        assert page._role.toPlainText() == models.DEFAULT_AI_ROLE
+        page._role.setPlainText("你负责解释学校规章。")
         page._save.click()
         actual = load_user_json(store, user, models.AI_SETTINGS_FILE, {})
-        assert {field: actual[field] for field in existing} == {**existing, "local_enabled": True}
+        assert "local_enabled" not in actual
+        assert actual["cloud_enabled"] is True
+        assert actual["api_key"] == "sample"
+        assert actual["role_prompt"] == "你负责解释学校规章。"
         assert page._status.text() == "已保存"
         assert all("sample" not in label.text() for label in page.findChildren(QLabel))
+        store.register("另一账号", "ModelCenter5678")
+        page.set_user("另一账号")
+        assert page._role.toPlainText() == models.DEFAULT_AI_ROLE
+        page.set_user(user)
+        assert page._role.toPlainText() == actual["role_prompt"]
+
     finally:
         page.close()
         app.processEvents()

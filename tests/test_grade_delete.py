@@ -904,9 +904,11 @@ def test_settings_text_has_no_markdown(store: CryptoStore) -> None:
             assert token not in text, f"界面文案里有 Markdown 记号：{text!r}"
 
 
-def test_settings_gpa_combo_can_save_a_new_preset(store: CryptoStore) -> None:
+def test_settings_gpa_combo_can_save_a_new_preset(store: CryptoStore, monkeypatch) -> None:
     pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QMessageBox
 
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: QMessageBox.StandardButton.Yes)
     _, page = _settings_page(store)
     combo = page._gpa_combo
 

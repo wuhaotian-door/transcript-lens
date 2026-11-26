@@ -7,6 +7,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLineEdit, QPlainTextEdit
 
 from core.ai.inference import InferenceUnavailable, LocalModelEngine, engine_available, list_local_models
+from core.ai.settings import role_preamble
 from core.knowledge import MISS, KnowledgeLibrary, policy_context
 from core.photo_matching import search_interviews
 from ui.workbench_widgets import TaskDialog, button, label, unlock
@@ -121,15 +122,18 @@ class GroundedChatDialog(TaskDialog):
                   + f"相关谈话与总结：{private}\n问题：{_redact(question)}\n建议：")
         max_tokens = 288
         budget = engine.n_ctx - max_tokens - 20
+        preamble = role_preamble(store, self.vault.username)
         if self.academic:
             original = prompt
-            prompt = f"成绩事实：\n{self.academic.summary}\n\n{original}"
+            prompt = f"{preamble}成绩事实：\n{self.academic.summary}\n\n{original}"
             if engine.count_tokens(prompt) <= budget:
-                expanded = self.academic.render(original, question, budget, engine.count_tokens)
+                expanded = self.academic.render(original, question, budget, engine.count_tokens, preamble=preamble)
                 if original in expanded:
                     prompt = expanded
+        else:
+            prompt = preamble + prompt
         if engine.count_tokens(prompt) > budget:
-            raise InferenceUnavailable("依据和问题超过此模型的上下文容量。请缩短问题或直接查看制度依据。")
+            raise InferenceUnavailable("依据和问题超过此模型的上下文容量。请缩短问题或角色提示词，也可直接查看制度依据。")
         if include_private and not self.vault.unlocked:
             return "敏感资料已锁定。"
         response = engine.generate(

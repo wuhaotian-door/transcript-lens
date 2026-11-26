@@ -461,7 +461,7 @@ def test_system_prompt_keeps_the_template_wording_verbatim() -> None:
     assert prompt == CHAT_SYSTEM_PROMPT_TEMPLATE.replace(
         "{学生JSON}", '{"学号": "2023001"}'
     )
-    assert prompt.startswith("你是一名高校辅导员助理，正在协助辅导员与一名学生进行谈话。")
+    assert prompt.startswith("当前任务是协助辅导员与一名学生进行谈话。")
     assert prompt.endswith("请根据这些数据提供谈话建议、侧写分析或评语润色。")
     assert "**" not in prompt and "`" not in prompt        # §24：界面文案零 Markdown
 
@@ -501,7 +501,7 @@ def test_page_injects_this_students_json_into_the_system_prompt(
     _show(page, archive)
 
     prompt = page._chat_system_prompt
-    assert prompt.startswith("你是一名高校辅导员助理，")
+    assert prompt.startswith("当前任务是协助辅导员与一名学生进行谈话。")
     assert SIDE_TEXT in prompt
 
     body = prompt.split("以下是该学生的数据：", 1)[1].rsplit("。请根据", 1)[0]

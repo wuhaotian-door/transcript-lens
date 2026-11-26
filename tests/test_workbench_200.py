@@ -215,3 +215,67 @@ def test_photo_candidates_require_consent_then_disappear_on_withdrawal(tmp_path,
     assert face.match_photo(access, tmp_path / "001")[1] == []
     base = backup / store.user_dir(roster.uid).name
     assert "face_vector" not in access._read(sensitive_filename("001"), base)
+
+
+
+def test_knowledge_edit_search_and_duplicate_confirmation(tmp_path, accounts):
+    from core.knowledge import DocumentValidationError, DuplicateDocumentError
+
+    store, access = accounts
+    library = KnowledgeLibrary(store, access.username)
+    other = KnowledgeLibrary(store, "teacher02")
+    path = tmp_path / "政策.txt"
+    path.write_text("经过审批的竞赛获奖证书可参与加分。", encoding="utf-8")
+    fields = {"title": "竞赛奖励", "source": "教务处", "school": "合成学校", "year": "2025-2026"}
+    for invalid, key in (({"source": "  "}, "source"), ({"year": "2025-2027"}, "year"),
+                         ({"title": "字" * 121}, "title"), ({"start": "2026-02-31"}, "start"),
+                         ({"start": "2026-02-02", "end": "2026-02-01"}, "end")):
+        with pytest.raises(DocumentValidationError) as error:
+            library.add(path, {**fields, **invalid})
+        assert error.value.field == key
+        assert not library.list()
+    doc = library.add(path, {**fields, "end": "至今"})
+    assert library.list("加分")[0]["id"] == doc
+    assert not other.list("竞赛奖励")
+    with pytest.raises(DuplicateDocumentError) as duplicate:
+        library.add(path, {**fields, "title": "新标题"})
+    assert duplicate.value.digest == doc and library.list()[0]["title"] == fields["title"]
+    cached = library.excerpts(doc)
+    library.edit(doc, {**fields, "title": "已编辑的奖励办法", "version": "第二版"})
+    assert library.list("奖励办法 合成学校")[0]["version"] == "第二版"
+    assert library.excerpts(doc) == cached
+    assert library.add(path, {**fields, "title": "确认覆盖"}, overwrite_digest=doc) == doc
+    assert len(library.list()) == 1 and library.list()[0]["title"] == "确认覆盖"
+    path.write_text("新文件内容。", encoding="utf-8")
+    with pytest.raises(ValueError, match="已变化"):
+        library.add(path, fields, overwrite_digest=doc)
+    library.delete(doc)
+    assert not library.list("加分")
+
+
+def test_aux_model_progress_and_group_uninstall(tmp_path, monkeypatch):
+    import hashlib
+    from core import workbench_models as models
+
+    payloads = {"bge.onnx": b"test-bge", "tokenizer.json": b"test-tokens",
+                "yunet.onnx": b"test-detector", "sface.onnx": b"test-face"}
+    assets = {name: ("https://example.invalid/" + name, len(raw), hashlib.sha256(raw).hexdigest())
+              for name, raw in payloads.items()}
+    monkeypatch.setattr(models, "ASSETS", assets)
+
+    def download(_url, target, *, progress_callback, expected_sha256, min_bytes, resume):
+        raw = payloads[target.name]
+        assert hashlib.sha256(raw).hexdigest() == expected_sha256 and len(raw) == min_bytes
+        target.parent.mkdir(parents=True, exist_ok=True)
+        progress_callback(1, len(raw))
+        target.write_bytes(raw)
+
+    monkeypatch.setattr(models, "download_exe", download)
+    progress = []
+    models.install_models(tmp_path, "semantic", progress=lambda *value: progress.append(value))
+    assert models.installed(tmp_path, "semantic") and not models.installed(tmp_path, "face")
+    assert progress[-1] == ("tokenizer.json", 19, 19)
+    assert [entry[1] for entry in progress] == sorted(entry[1] for entry in progress)
+    models.install_models(tmp_path, "face")
+    models.uninstall_models(tmp_path, "semantic")
+    assert not models.installed(tmp_path, "semantic") and models.installed(tmp_path, "face")

@@ -472,6 +472,7 @@ def test_prompt_only_contains_current_term(page, fake_engine, sync_worker):
     page._generate_button.click()
 
     prompt = fake_engine.instances[0].prompts[0]
+    assert prompt.startswith("角色设定：")
     assert f"只写 {TERM}" in prompt
     assert "高等数学" in prompt
     assert "线性代数" in prompt

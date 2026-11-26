@@ -11,7 +11,7 @@
     * ``debug``   —— onedir + 控制台。**开发/自测用**：启动快、能看见 traceback，
                      出问题时改一行重打只要几十秒。
     * ``release`` —— onefile + 窗口版。**给别人试用的**：单个 exe，双击就跑，
-                     代价是每次启动都要先把自己解包到 %TEMP%\_MEIxxxx（慢几十秒）。
+                     代价是每次启动都要先把自己解包到 %LOCALAPPDATA%\SGMS_RunCache\_MEIxxxx。
 
     打完自动跑一次 ``--selfcheck``（不弹窗，只把"假数据 → 解析 → 算分 → 锚点校验"
     跑一遍），失败就报错退出。**不要跳过这一步** —— pandas / openpyxl 这类库有一堆
@@ -46,21 +46,9 @@
       指到 %TEMP%、桌面、用户目录根一律失败。结论：**本机安全软件/沙箱策略在拦**，
       不是打包配置问题。
 
-      ★★ 根治办法（2026-11-07 实测）：给单文件包加 ``--runtime-tmpdir``，让启动器
-      **解到 exe 自己所在的目录**，根本不碰 %TEMP%。验证方式：同一个 hello-world
-      单文件包，默认版本在 %TEMP% 和用户目录根都报 ``Could not create temporary
-      directory!``，加了 ``--runtime-tmpdir "."`` 之后**两处都是 exit 0**。
-      所以 release 目标固定带 ``--runtime-tmpdir $RuntimeTmpDir``（默认 ``"."``）。
-
-      ⚠️ 两个必须知道的边界：
-        1. ``--runtime-tmpdir`` 里的相对路径是相对**启动时的工作目录（CWD）**，
-           不是 exe 所在目录。双击启动时 CWD 就是 exe 所在目录（Explorer 的行为），
-           所以正常双击没问题；但从别的目录用命令行启动、或快捷方式把"起始位置"
-           改到别的目录时，解包会落在那个目录里 —— 那里不可写就会失败。
-           交互式排查用 ``dist\launch.bat``（它顺手把 TEMP 指到 dist\_tmp）。
-        2. 路径**不支持环境变量**（写 ``%TEMP%`` 会被当成字面量），
-           而且上级目录必须**已经存在** —— 指 ``_tmp`` 这种不存在的子目录会直接失败。
-
+      Windows 运行时解包到当前用户的 LOCALAPPDATA\SGMS_RunCache。
+      PyInstaller 启动器在运行时展开路径并创建目录，正常退出后删除本次解包目录。
+      应用启动后另行清理有本应用标记的陈旧目录，保留仍由活动进程使用的目录。
 #>
 param(
     [ValidateSet('debug', 'release')]
@@ -69,8 +57,8 @@ param(
     #: release 也带控制台（产物叫 transcript-lens-console.exe），用来查启动崩溃
     [switch]$ShowConsole,
     [switch]$SkipSelfCheck,
-    #: 单文件版的解包根目录。**默认 "."：解到 exe 自己所在目录**（见文件头 NOTES）
-    [string]$RuntimeTmpDir = '.'
+    # Windows PyInstaller 启动器在目标电脑展开 LOCALAPPDATA。
+    [string]$RuntimeTmpDir = '%LOCALAPPDATA%\SGMS_RunCache'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -156,8 +144,8 @@ $Common = @(
     #   漏了的话 exe 里窗口能开、界面全白（main.load_stylesheet 读不到会返回空串，
     #   自检里有一条专门查这个文件在不在）。
     '--add-data', 'ui/styles.qss;ui',
-    '--icon', 'ui/assets/app.ico',
-    '--add-data', 'ui/assets/app.ico;ui/assets',
+    '--icon', 'ui/assets/brand/app_icon_2.0.ico',
+    '--add-data', 'ui/assets/brand/app_icon_2.0.ico;ui/assets/brand',
 
     # pandas 是延迟 import openpyxl 的，静态分析看不到，必须显式带上
     '--hidden-import', 'openpyxl',

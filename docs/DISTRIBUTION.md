@@ -116,7 +116,8 @@ Start-Sleep -Seconds 3          # 句柄释放有延迟，马上重打会被占�
 | debug | `dist\transcript-lens-debug\` | ~680MB | 自己排查用（带控制台） |
 
 发布包文件名从 `core/version.py` 读取版本号，例如 `朝夕工作台-2.0.0.exe`。
-程序窗口和 Windows 可执行文件共用 `ui/assets/app.ico`。
+程序窗口、Windows 可执行文件和安装向导使用新版品牌图标。安装向导页顶部显示新版品牌图片，安装后的快捷方式指向安装目录独立的 ICO 文件。覆盖安装会通知 Windows 刷新受影响的文件。
+单文件的解包目录位于当前用户的 %LOCALAPPDATA%/SGMS_RunCache。正常退出由启动器清理；应用可清理超期且确认进程退出的旧缓存。
 
 > `dist/`、`build/`、`release/`、`*.spec` 都在 `.gitignore` 里。**绝不要 `git add` 它们** ——
 > `build_exe.ps1` 最后一步会显式检查这一点。

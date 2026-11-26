@@ -8,7 +8,7 @@ from uuid import uuid4
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog, QLineEdit,
+    QApplication, QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QInputDialog, QLineEdit,
     QListWidget, QMessageBox, QPlainTextEdit, QSplitter, QVBoxLayout, QWidget,
 )
 
@@ -17,6 +17,56 @@ from core.photo_matching import index_photo, interview_vector, revoke_consent, s
 from core.sensitive_vault import CONTACT_FIELDS, CONTACT_LABELS, mask_phone
 from core.student_import import PHONE, encode_photo
 from ui.workbench_widgets import TaskDialog, button, fields, label, unlock
+
+
+def edit_interview(parent, vault, sid: str, entry=None) -> bool:
+    if not sid or not unlock(parent, vault):
+        return False
+    entry = entry or {}
+    dialog = TaskDialog(parent, "谈话记录")
+    guard = QTimer(dialog, interval=500)
+    guard.timeout.connect(lambda: dialog.reject() if not vault.unlocked else None)
+    guard.start()
+    dialog.resize(570, 420)
+    form = QFormLayout()
+    date_edit = QLineEdit(entry.get("date", datetime.now().isoformat(timespec="minutes", sep=" ")))
+    method = QLineEdit(entry.get("method", "面谈"))
+    method.setMaxLength(40)
+    form.addRow("时间", date_edit)
+    form.addRow("方式", method)
+    dialog.body.addLayout(form)
+    content = QPlainTextEdit(entry.get("content", ""))
+    dialog.body.addWidget(content, 1)
+    dialog.body.addWidget(dialog.status)
+    key = entry.get("id") or uuid4().hex
+
+    def save():
+        try:
+            date_value = datetime.fromisoformat(date_edit.text()).isoformat(timespec="minutes", sep=" ")
+            summary = content.toPlainText().strip()
+            method_text = method.text().strip()
+            if not summary or not method_text or len(summary) > 20000:
+                raise ValueError
+        except ValueError:
+            dialog.status.setText("时间格式为 YYYY-MM-DD HH:mm。请填写方式和谈话内容（最多 20000 字符）。")
+            return
+
+        def write():
+            vector = interview_vector(vault.store.root, summary)
+            record = {"id": key, "date": date_value, "method": method_text,
+                      "content": summary, "vector": vector}
+            def change(data):
+                records = [r for r in data.get("interviews", []) if r["id"] != key]
+                data["interviews"] = [*records, record]
+            vault.update(sid, change)
+            vault.audit("interview_update" if entry else "interview_create", sid)
+
+        dialog.execute(write, lambda _: dialog.accept(), "正在保存谈话…")
+
+    dialog.body.addWidget(button("保存记录", save, "Primary"))
+    accepted = bool(dialog.exec())
+    dialog.deleteLater()
+    return accepted
 
 
 class StudentDetails(QWidget):
@@ -54,7 +104,7 @@ class StudentDetails(QWidget):
         self.contents = QSplitter(Qt.Orientation.Horizontal, self)
         box.addWidget(self.contents, 1)
         left = QWidget()
-        left.setMinimumWidth(326)
+        left.setMinimumWidth(366)
         left_box = QVBoxLayout(left)
         self.photo = label()
         self.photo.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -69,19 +119,27 @@ class StudentDetails(QWidget):
         for field, name in zip(CONTACT_FIELDS, CONTACT_LABELS):
             row = QHBoxLayout()
             hint = label("")
-            hint.setMinimumWidth(106)
+            hint.setMinimumWidth(124)
             hint.setWordWrap(True)
             self.hints[field] = hint
             row.addWidget(hint, 1)
             reveal = button("查看", lambda _=False, f=field: self._reveal(f))
             copy = button("复制", lambda _=False, f=field: self._copy(f))
             for action in (reveal, copy):
-                action.setFixedWidth(54)
+                action.setMinimumWidth(max(70, action.sizeHint().width()))
                 row.addWidget(action)
             contacts.addRow(name, row)
         left_box.addLayout(contacts)
         left_box.addWidget(button("编辑联系方式", self._edit_contacts))
         left_box.addStretch(1)
+        face = QGridLayout()
+        face.addWidget(button("记录照片匹配授权", self._record_consent), 0, 0, 1, 2)
+        face.addWidget(button("撤回授权", self._revoke), 1, 0)
+        face.addWidget(button("生成照片特征", self._index_face), 1, 1)
+        left_box.addLayout(face)
+        self.face_status = label("", "Muted")
+        self.face_status.setWordWrap(True)
+        left_box.addWidget(self.face_status)
         self.contents.addWidget(left)
 
         right = QWidget()
@@ -94,12 +152,7 @@ class StudentDetails(QWidget):
         self.summary.setPlaceholderText("记录辅导员的总结与后续安排")
         self.summary.setMaximumHeight(135)
         right_box.addWidget(self.summary)
-        interview_row = QHBoxLayout()
-        interview_row.addWidget(label("谈话记录", "H2"), 1)
-        interview_row.addWidget(button("新增", self.new_interview, "Primary"))
-        interview_row.addWidget(button("编辑", self._edit_interview))
-        interview_row.addWidget(button("删除", self._remove_interview))
-        right_box.addLayout(interview_row)
+        right_box.addWidget(label("谈话记录", "H2"))
         search = QHBoxLayout()
         self.query = QLineEdit()
         self.query.setPlaceholderText("检索该学生的谈话")
@@ -111,14 +164,12 @@ class StudentDetails(QWidget):
         self.interviews = QListWidget()
         right_box.addWidget(self.interviews, 1)
         self.interviews.itemActivated.connect(lambda _: self._edit_interview())
-        face_row = QHBoxLayout()
-        face_row.addWidget(button("记录照片匹配授权", self._record_consent))
-        face_row.addWidget(button("撤回授权", self._revoke))
-        face_row.addWidget(button("生成照片特征", self._index_face))
-        right_box.addLayout(face_row)
-        self.face_status = label("", "Muted")
-        self.face_status.setWordWrap(True)
-        right_box.addWidget(self.face_status)
+        interview_actions = QHBoxLayout()
+        interview_actions.addStretch(1)
+        interview_actions.addWidget(button("编辑", self._edit_interview))
+        interview_actions.addWidget(button("删除", self._remove_interview))
+        interview_actions.addWidget(button("新增", self.new_interview, "Primary"))
+        right_box.addLayout(interview_actions)
         self.contents.addWidget(right)
         self.contents.setStretchFactor(0, 2)
         self.contents.setStretchFactor(1, 3)
@@ -135,7 +186,8 @@ class StudentDetails(QWidget):
         self.heading.setText(row["name"])
         grade_rows = GradeHistoryDB(store=self.store, username=vault.username).rows()
         terms = {entry["semester"] for entry in grade_rows if entry.get("student_id") in (sid, f"sid:{sid}")}
-        self.fact.setText(f"{sid}　|　{row.get('class_name') or '未分班'}　|　已记录 {len(terms)} 个学期")
+        facts = [sid, row.get("class_name") or "未分班", row.get("gender") or "", f"已记录 {len(terms)} 个学期"]
+        self.fact.setText("　|　".join(part for part in facts if part))
         self.refresh()
         return True
 
@@ -316,50 +368,7 @@ class StudentDetails(QWidget):
                 return
 
     def _edit_record(self, entry):
-        if not unlock(self, self.vault):
-            return
-        dialog = TaskDialog(self, "谈话记录")
-        guard = QTimer(dialog, interval=500)
-        guard.timeout.connect(lambda: dialog.reject() if not self.vault.unlocked else None)
-        guard.start()
-        dialog.resize(570, 420)
-        form = QFormLayout()
-        date_edit = QLineEdit(entry.get("date", datetime.now().isoformat(timespec="minutes", sep=" ")))
-        method = QLineEdit(entry.get("method", "面谈"))
-        method.setMaxLength(40)
-        form.addRow("时间", date_edit)
-        form.addRow("方式", method)
-        dialog.body.addLayout(form)
-        content = QPlainTextEdit(entry.get("content", ""))
-        dialog.body.addWidget(content, 1)
-        dialog.body.addWidget(dialog.status)
-        key = entry.get("id") or uuid4().hex
-
-        def save():
-            try:
-                date_value = datetime.fromisoformat(date_edit.text()).isoformat(timespec="minutes", sep=" ")
-                summary = content.toPlainText().strip()
-                method_text = method.text().strip()
-                if not summary or not method_text or len(summary) > 20000:
-                    raise ValueError
-            except ValueError:
-                dialog.status.setText("时间格式为 YYYY-MM-DD HH:mm。请填写方式和谈话内容（最多 20000 字符）。")
-                return
-
-            def write():
-                vector = interview_vector(self.store.root, summary)
-                record = {"id": key, "date": date_value, "method": method_text,
-                          "content": summary, "vector": vector}
-                def change(data):
-                    records = [r for r in data.get("interviews", []) if r["id"] != key]
-                    data["interviews"] = [*records, record]
-                self.vault.update(self.sid, change)
-                self.vault.audit("interview_update" if entry else "interview_create", self.sid)
-
-            dialog.execute(write, lambda _: dialog.accept(), "正在保存谈话…")
-
-        dialog.body.addWidget(button("保存记录", save, "Primary"))
-        if dialog.exec():
+        if edit_interview(self, self.vault, self.sid, entry):
             self.refresh()
 
     def _remove_interview(self):

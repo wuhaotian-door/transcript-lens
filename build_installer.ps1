@@ -26,7 +26,9 @@ try {
         "/DAppVersion=$version",
         "/DAppFile=$app",
         "/DReleaseDir=$output",
-        "/DAppIcon=$(Join-Path $PSScriptRoot 'ui\assets\app.ico')",
+        "/DAppIcon=$(Join-Path $PSScriptRoot 'ui\assets\brand\app_icon_2.0.ico')",
+        "/DWizardBrand=$(Join-Path $PSScriptRoot 'ui\assets\brand\app_icon_2.0_128.png')",
+        "/DWizardSmallBrand=$(Join-Path $PSScriptRoot 'ui\assets\brand\app_icon_2.0_48.png')",
         "/DLicenseFile=$(Join-Path $PSScriptRoot 'LICENSE')"
     )
     if ($LanguageFile) {

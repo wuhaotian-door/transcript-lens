@@ -31,6 +31,7 @@ from typing import Any, Callable, Sequence
 from PySide6.QtCore import QRect, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QTextCursor
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QButtonGroup,
     QDialog,
@@ -58,6 +59,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.ai.inference import InferenceUnavailable, friendly_error
+from core.ai.settings import role_preamble
 from core.archival import SEMESTER_ORDER, merge_records, partition, semester_rank, trend
 from core.calculator import CalculationScope, weighted_average
 from core.crypto_store import CryptoError, CryptoStore
@@ -1456,6 +1458,7 @@ class ProfilePage(QWidget):
                 name=name,
                 class_name=values.get("class_name", ""),
                 note=values.get("note", ""),
+                gender=values.get("gender", ""),
             )
         except DuplicateStudentError:
             QMessageBox.critical(
@@ -1537,6 +1540,7 @@ class ProfilePage(QWidget):
                 name=name,
                 class_name=values.get("class_name", ""),
                 note=values.get("note", ""),
+                gender=values.get("gender"),
             )
         except Exception:  # noqa: BLE001
             logger.exception("编辑学生失败")
@@ -1849,7 +1853,8 @@ class ProfilePage(QWidget):
         self._grade_tree.setHeaderLabels(list(GRADE_TREE_COLUMNS))
         self._grade_tree.setRootIsDecorated(True)
         self._grade_tree.setUniformRowHeights(True)
-        self._grade_tree.setAlternatingRowColors(False)
+        self._grade_tree.setAlternatingRowColors(True)
+        self._grade_tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         # ★ 从 v1.9.1 起**不再是 NoSelection**：第 4 列那个「删除」按钮要收到
         #   点击事件（选中态只是副作用，真正判命中用 :meth:`on_grade_action` 里的
         #   按钮矩形）。鼠标跟踪打开，悬停时按钮才变色。
@@ -2663,7 +2668,7 @@ class ProfilePage(QWidget):
         if not key or self._side_busy:
             return
 
-        prompt = build_side_text_prompt(
+        prompt = role_preamble(self._store, self._username) + build_side_text_prompt(
             name, student_id, key,
             self._student_grades(key, payload),
             self._student_moral(key),
@@ -3158,7 +3163,7 @@ class ProfilePage(QWidget):
 
         self._remember_chat(CHAT_ROLE_USER, text)
         self._append_chat_line(f"辅导员：{text}")
-        prompt = build_chat_prompt(
+        prompt = role_preamble(self._store, self._username) + build_chat_prompt(
             self._chat_system_prompt or "", self._chat_history
         )
 

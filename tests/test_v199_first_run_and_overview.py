@@ -30,7 +30,7 @@ def test_only_marked_new_account_sees_first_run_guide(tmp_path, monkeypatch):
     app.processEvents()
 
 
-def test_overview_uses_all_terms_but_review_covers_latest_four():
+def test_overview_and_review_cover_all_imported_terms():
     app = QApplication.instance() or QApplication([])
     page = StudentOverviewPage()
     terms = ("大一上", "大一下", "大二上", "大二下", "大三上")
@@ -44,9 +44,10 @@ def test_overview_uses_all_terms_but_review_covers_latest_four():
     try:
         page.set_context(None, "", student)
         assert page.findChild(GradeTrendChart) is None
-        assert "纳入 4/4" in page._four_terms.text()
-        assert "大一上" not in page._four_terms.text()
-        assert "加权均分 72.50" in page._four_terms.text()
+        review = page._review_text.toPlainText()
+        assert "纳入 5 个有成绩学期" in review
+        assert all(term in review for term in terms)
+        assert "加权均分 70.00" in review
         context = page._academic_context
         assert context.course_count == 5
         prompt = context.render("请回答", "课程0", 4000, len)

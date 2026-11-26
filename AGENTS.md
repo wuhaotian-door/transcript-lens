@@ -1005,15 +1005,11 @@ v1.9.2 之后连着报了四个现场：登录卡住、迁移报错、exe 起不
 现在 `FADE_IN_FAILSAFE_MS = 900` 兜底：到点还 < 0.99 就直接补 1 并写日志。
 ★ 任何"先设成不可见/透明、再靠动画出现"的地方，都要按这个模式加看门狗。
 
-### 38e. 单文件 exe 的解包目录：`--runtime-tmpdir`
+### 38e. 单文件 exe 的解包目录
 
-现场 `[PYI-…:ERROR] Could not create temporary directory!` 是 PyInstaller 启动器
-在 Python 起来之前报的，应用层插不上手。实测：`%TEMP%` / 桌面 / 用户目录根全失败，
-**解到 exe 自己所在目录就成功**（同一个 hello-world 包对照验证）。
-
-`build_exe.ps1` 的 release / console 目标因此固定带 `--runtime-tmpdir`（默认 `"."`）。
-★ **两个边界**：① 相对路径按**启动时的 CWD** 解析（双击时 = exe 目录）；
-② 不支持环境变量，且上级目录必须**已存在**（指 `_tmp` 这种不存在的子目录会直接失败）。
+Windows 单文件版通过 --runtime-tmpdir 选择当前用户的 %LOCALAPPDATA%/SGMS_RunCache。
+PyInstaller 正常退出会删除本次解包目录。软件仅清理超过一天且带本应用标记的残留，
+并核对引导和应用的进程已退出。旧发行目录的残留由维护人员单独核实后清理。
 
 ### 38f. 界面"多余线条"这类问题，没有真机截图不要瞎改
 
@@ -1045,4 +1041,4 @@ v1.9.2 之后连着报了四个现场：登录卡住、迁移报错、exe 起不
 * 不再额外保留本项目本地旧 exe 备份；需要旧版时从已发布的发行版获取。
 * 本地入口固定为 `dist/transcript-lens.exe`。对外发布使用 `朝夕工作台-<版本>.exe`，
   例如 `朝夕工作台-2.0.0.exe`。正式打包时读取 `core/version.py` 的 `CURRENT_VERSION`，在 `release/` 生成发布包。
-* Windows 可执行文件和应用窗口共用 `ui/assets/app.ico`。
+* Windows 可执行文件和应用窗口共用 `ui/assets/brand/app_icon_2.0.ico`。

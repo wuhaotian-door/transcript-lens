@@ -15,7 +15,11 @@ ArchitecturesAllowed=x64compatible
 OutputDir={#ReleaseDir}
 OutputBaseFilename=朝夕工作台-{#AppVersion}-安装向导
 SetupIconFile={#AppIcon}
-UninstallDisplayIcon={app}\transcript-lens.exe
+WizardImageFile={#WizardBrand}
+WizardSmallImageFile={#WizardSmallBrand}
+WizardImageStretch=no
+WizardImageBackColor=$3B2610
+UninstallDisplayIcon={app}\ZhaoxiWorkbench-brand.ico
 WizardStyle=modern
 Compression=lzma2/fast
 SolidCompression=yes
@@ -40,6 +44,7 @@ en.OpenAfterSetup=Click Finish to close Setup. Then open the program below, or u
 #endif
 
 [Files]
+Source: "{#AppIcon}"; DestDir: "{app}"; DestName: "ZhaoxiWorkbench-brand.ico"; Flags: ignoreversion
 Source: "{#AppFile}"; DestDir: "{app}"; DestName: "transcript-lens.exe"; Flags: ignoreversion
 Source: "{#LicenseFile}"; DestDir: "{app}"; Flags: ignoreversion
 
@@ -57,10 +62,27 @@ Type: files; Name: "{userprograms}\成绩单透镜\成绩单透镜.lnk"
 Type: files; Name: "{userprograms}\成绩透析镜\成绩透析镜.lnk"
 
 [Icons]
-Name: "{userprograms}\朝夕工作台"; Filename: "{app}\transcript-lens.exe"; WorkingDir: "{app}"; Tasks: shell
-Name: "{userdesktop}\朝夕工作台"; Filename: "{app}\transcript-lens.exe"; WorkingDir: "{app}"; Tasks: shell\desktopicon
+Name: "{userprograms}\朝夕工作台"; Filename: "{app}\transcript-lens.exe"; WorkingDir: "{app}"; IconFilename: "{app}\ZhaoxiWorkbench-brand.ico"; Tasks: shell
+Name: "{userdesktop}\朝夕工作台"; Filename: "{app}\transcript-lens.exe"; WorkingDir: "{app}"; IconFilename: "{app}\ZhaoxiWorkbench-brand.ico"; Tasks: shell\desktopicon
 
 [Code]
+procedure NotifyShellItem(EventId: LongWord; Flags: LongWord; Path: String; Reserved: LongWord);
+  external 'SHChangeNotify@shell32.dll stdcall';
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+  begin
+    { SHCNE_UPDATEITEM, SHCNF_PATHW }
+    NotifyShellItem($00002000, $0005, ExpandConstant('{app}\transcript-lens.exe'), 0);
+    NotifyShellItem($00002000, $0005, ExpandConstant('{app}\ZhaoxiWorkbench-brand.ico'), 0);
+    if FileExists(ExpandConstant('{userprograms}\朝夕工作台.lnk')) then
+      NotifyShellItem($00002000, $0005, ExpandConstant('{userprograms}\朝夕工作台.lnk'), 0);
+    if FileExists(ExpandConstant('{userdesktop}\朝夕工作台.lnk')) then
+      NotifyShellItem($00002000, $0005, ExpandConstant('{userdesktop}\朝夕工作台.lnk'), 0);
+  end;
+end;
+
 procedure CurPageChanged(CurPageID: Integer);
 begin
   if (CurPageID = wpFinished) and not WizardSilent then

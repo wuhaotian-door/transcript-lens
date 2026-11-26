@@ -8,6 +8,7 @@ data/
 # ============ 真实成绩：绝不在仓库出现 ============
 *.xls
 *.xlsx
+/testdata/
 # 例外：仅允许测试假数据
 !tests/fixtures/fake_*.xlsx
 
@@ -68,3 +69,4 @@ subagents/
 
 # 本地临时探针目录（selfcheck / pytest 用）
 .tl_tmp/
+/_icon_work/

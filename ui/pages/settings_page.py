@@ -514,11 +514,30 @@ class SettingsPage(QWidget):
         if index < 0 or not self._username:
             return
         scheme = self._gpa_combo.itemData(index)
+        if scheme == self.load_gpa_scheme():
+            return
+        name = self._gpa_combo.itemText(index)
+        self._sync_gpa_card()
         if scheme is None:
-            self._sync_gpa_card()
             self._edit_gpa_scheme()
-        elif scheme != self.load_gpa_scheme():
+        elif self._confirm_gpa_switch(name):
             self._save_gpa_settings(scheme=scheme)
+
+    def _confirm_gpa_switch(self, name: str) -> bool:
+        old = self._gpa_combo.currentText()
+        dialog = QMessageBox(
+            QMessageBox.Icon.Question, "切换 GPA 方案",
+            f"确认从「{old}」切换为「{name}」？\n确认后将按新规则显示 GPA。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, self,
+        )
+        dialog.button(QMessageBox.StandardButton.Yes).setText("确认切换")
+        cancel = dialog.button(QMessageBox.StandardButton.No)
+        cancel.setText("取消")
+        dialog.setDefaultButton(QMessageBox.StandardButton.No)
+        dialog.setEscapeButton(cancel)
+        accepted = dialog.exec() == QMessageBox.StandardButton.Yes
+        dialog.deleteLater()
+        return accepted
 
     def _edit_gpa_scheme(self, definition: dict[str, Any] | None = None) -> None:
         items = self._gpa_settings["custom"]
@@ -530,6 +549,8 @@ class SettingsPage(QWidget):
             return
         saved = dialog.definition()
         if definition is None:
+            if not self._confirm_gpa_switch(saved["name"]):
+                return
             existing = {item["id"] for item in items}
             while saved["id"] in existing:
                 saved["id"] = custom_id()

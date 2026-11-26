@@ -33,6 +33,7 @@ from PySide6.QtCore import QCollator, QLocale, QSize, Qt, Signal
 from PySide6.QtGui import QFont, QFontMetrics
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDialog,
     QFrame,
     QHBoxLayout,
@@ -57,6 +58,7 @@ from core.database import GradeHistoryDB, ProfileStore, safe_student_file
 from core.gpa import DEFAULT_SCHEME, gpa_of
 from core.parser import Category, strip_blank_marker
 from core.scholarship import list_classes, load_moral, save_moral
+from core.student_import import GENDER_OPTIONS
 from ui.intentions import INTENTION_OPTIONS, KEY_PREFIX_NAME, KEY_PREFIX_SID, student_key
 from core.user_store import (
     delete_user_json,
@@ -116,10 +118,10 @@ DELETE_TERM_PROMPT_TEXT = "该学期已无成绩，是否同时删除学期记�
 #: 学生数据缺失时的占位文字（写进提示词的 JSON 里）。
 NO_MORAL_TEXT = "未录入"
 
-#: AI 辅导页的系统提示词模板。``{学生JSON}`` 由
+#: AI 辅导页的任务说明模板。``{学生JSON}`` 由
 #: :func:`build_student_json` 的结果逐字替换进去 —— **一个字都不许改**。
 CHAT_SYSTEM_PROMPT_TEMPLATE = (
-    "你是一名高校辅导员助理，正在协助辅导员与一名学生进行谈话。"
+    "当前任务是协助辅导员与一名学生进行谈话。"
     "以下是该学生的数据：{学生JSON}。"
     "请根据这些数据提供谈话建议、侧写分析或评语润色。"
 )
@@ -576,6 +578,7 @@ STUDENT_RECORD_FIELDS = (
     "student_id",
     "name",
     "class_name",
+    "gender",
     "note",
     "archived",
     "source",
@@ -609,6 +612,7 @@ class StudentRecord:
     note: str = ""
     archived: bool = False
     source: str = ""
+    gender: str = ""
 
     @property
     def key(self) -> str:
@@ -644,6 +648,7 @@ def normalise_student_record(record: Any) -> StudentRecord:
         note=str(_record_attr(record, "note", "") or ""),
         archived=bool(_record_attr(record, "archived", False)),
         source=str(_record_attr(record, "source", "") or ""),
+        gender=str(_record_attr(record, "gender", "") or ""),
     )
 
 
@@ -865,6 +870,7 @@ class StudentBook:
         name: str,
         class_name: str = "",
         note: str = "",
+        gender: str = "",
     ) -> StudentRecord:
         """新建一条。学号重复抛 :class:`DuplicateStudentError`（**不写盘**）。"""
         sid = _bare_sid(student_id)
@@ -880,6 +886,7 @@ class StudentBook:
             name=display,
             class_name=(class_name or "").strip(),
             note=(note or "").strip(),
+            gender=(gender or "").strip(),
             archived=False,
             source=STUDENT_SOURCE_MANUAL,
         )
@@ -891,6 +898,7 @@ class StudentBook:
                     class_name=record.class_name,
                     note=record.note,
                     source=STUDENT_SOURCE_MANUAL,
+                    **({"gender": record.gender} if record.gender else {}),
                 )
             except Exception as exc:  # noqa: BLE001
                 if _is_duplicate_error(exc):
@@ -909,6 +917,7 @@ class StudentBook:
         name: str,
         class_name: str = "",
         note: str = "",
+        gender: str | None = None,
     ) -> StudentRecord:
         """改一条（学号可能变）。
 
@@ -931,6 +940,7 @@ class StudentBook:
             name=display,
             class_name=(class_name or "").strip(),
             note=(note or "").strip(),
+            gender=(gender or "").strip() if gender is not None else (previous.gender if previous else ""),
             archived=bool(previous.archived) if previous is not None else False,
             source=previous.source if previous is not None else STUDENT_SOURCE_MANUAL,
         )
@@ -948,6 +958,7 @@ class StudentBook:
                     name=record.name,
                     class_name=record.class_name,
                     note=record.note,
+                    **({"gender": record.gender} if gender is not None else {}),
                 )
             except KeyError:
                 # 主档里没有这一行（例如改名没成功）→ 补建
@@ -958,6 +969,7 @@ class StudentBook:
                         class_name=record.class_name,
                         note=record.note,
                         source=record.source,
+                        **({"gender": record.gender} if record.gender else {}),
                     )
                 except Exception:  # noqa: BLE001 - 补建失败也要保住内存那份
                     logger.warning("主档补建失败（%s）", new, exc_info=True)
@@ -1704,6 +1716,7 @@ class StudentDialog(QDialog):
         ("student_id", "学号", "必填，全库唯一"),
         ("name", "姓名", "必填"),
         ("class_name", "班级", "选填，例如 CS2301"),
+        ("gender", "性别", "选填"),
         ("note", "备注", "选填"),
     )
 
@@ -1719,7 +1732,7 @@ class StudentDialog(QDialog):
         self.setModal(True)
         self.setMinimumWidth(420)
         self._record = record
-        self._edits: dict[str, QLineEdit] = {}
+        self._edits: dict[str, QLineEdit | QComboBox] = {}
 
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 18, 20, 16)
@@ -1740,12 +1753,22 @@ class StudentDialog(QDialog):
             caption = QLabel(label, self)
             caption.setObjectName("Muted")
             caption.setFixedWidth(48)
-            edit = QLineEdit(self)
+            value = str(getattr(record, key, "") or "")
+            if key == "gender":
+                edit = QComboBox(self)
+                edit.addItem("未填写", "")
+                for option in GENDER_OPTIONS:
+                    edit.addItem(option, option)
+                if value and edit.findData(value) < 0:
+                    edit.addItem(value, value)
+                edit.setCurrentIndex(max(0, edit.findData(value)))
+            else:
+                edit = QLineEdit(self)
+                edit.setPlaceholderText(placeholder)
+                edit.setText(value)
             edit.setObjectName("FormInput")
-            edit.setPlaceholderText(placeholder)
-            edit.setMinimumHeight(30)
-            if record is not None:
-                edit.setText(str(getattr(record, key, "") or ""))
+            edit.setAccessibleName(label)
+            edit.setMinimumHeight(34)
             row.addWidget(caption)
             row.addWidget(edit, 1)
             root.addLayout(row)
@@ -1771,7 +1794,8 @@ class StudentDialog(QDialog):
     # ------------------------------------------------------------------ API
     def values(self) -> dict[str, str]:
         """表单当前的值（键与 :data:`STUDENT_RECORD_FIELDS` 同名）。"""
-        return {key: edit.text().strip() for key, edit in self._edits.items()}
+        return {key: (edit.currentData() if isinstance(edit, QComboBox) else edit.text().strip())
+                for key, edit in self._edits.items()}
 
     def student_id(self) -> str:
         return self.values().get("student_id", "")

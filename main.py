@@ -73,7 +73,7 @@ FAKE_ANCHOR_FIXTURE = FIXTURES / "fake_grades_with_anchor.xlsx"
 
 #: 全局样式表（Spec 一：写在 ui/styles.qss 里加载）
 QSS_RELATIVE = Path("ui") / "styles.qss"
-APP_ICON_PATH = PROJECT_ROOT / "ui" / "assets" / "app.ico"
+APP_ICON_PATH = PROJECT_ROOT / "ui" / "assets" / "brand" / "app_icon_2.0.ico"
 
 #: 自检要确认能 import 的模块（界面 + 核心 + 本地模板）
 CHECK_MODULES: tuple[str, ...] = (
@@ -100,6 +100,7 @@ CHECK_MODULES: tuple[str, ...] = (
     "ui.pages.semester_side_profile",
     "ui.pages.archive_page",
     "ui.pages.mentor_page",
+    "ui.pages.workbench_page",
     "ui.pages.student_details",
     "ui.knowledge_dialog",
     "ui.grounded_chat_dialog",
@@ -2940,6 +2941,10 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as exc:
             applog.write("environment", f"无法读取本地推理核心：{type(exc).__name__}", root=flow.root)
     flow.start()
+    if IS_FROZEN and sys.platform == "win32":
+        from core.runtime_cache import start_cleanup
+
+        start_cleanup()
     return app.exec()
 
 

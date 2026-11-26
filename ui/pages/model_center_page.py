@@ -2,20 +2,18 @@
 
 from PySide6.QtCore import Qt, QSignalBlocker
 from PySide6.QtWidgets import (
-    QCheckBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QCheckBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
     QStackedWidget, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from core.user_store import load_user_json, save_user_json
+from core.ai.settings import AI_SETTINGS_FILE, DEFAULT_AI_ROLE, MAX_ROLE_LENGTH, configured_ai_role, read_ai_settings, validate_ai_role
+from core.user_store import save_user_json
 from ui.anim import make_card
 from ui.model_center_dialog import ModelCenterDialog, _backend_available
 from ui.workbench_models_dialog import WorkbenchModelsDialog
 from ui.workbench_widgets import button
 from ui.widgets.backend_setup import open_backend_setup
 from ui.widgets.profile_reading import profile_scroll
-
-AI_SETTINGS_FILE = "ai_settings.json.enc"
-
 
 class ModelCenterPage(QWidget):
     def __init__(self, store, parent=None):
@@ -92,15 +90,26 @@ class ModelCenterPage(QWidget):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
-        local = make_card(shadow=False)
-        local_layout = QVBoxLayout(local)
-        local_layout.setContentsMargins(18, 14, 18, 14)
-        local_title = QLabel("本地推理")
-        local_title.setObjectName("H2")
-        local_layout.addWidget(local_title)
-        self._local = QCheckBox("启用本地学习助手")
-        local_layout.addWidget(self._local)
-        layout.addWidget(local)
+        role = make_card(shadow=False)
+        role_layout = QVBoxLayout(role)
+        role_layout.setContentsMargins(18, 14, 18, 14)
+        role_header = QHBoxLayout()
+        role_title = QLabel("AI 角色提示词")
+        role_title.setObjectName("H2")
+        role_header.addWidget(role_title, 1)
+        restore = button("恢复默认", lambda: self._role.setPlainText(DEFAULT_AI_ROLE))
+        role_header.addWidget(restore)
+        role_layout.addLayout(role_header)
+        role_note = QLabel(f"每次 AI 对话和侧写生成前都会读取此设定。最多 {MAX_ROLE_LENGTH} 字。")
+        role_note.setObjectName("Muted")
+        role_note.setWordWrap(True)
+        role_layout.addWidget(role_note)
+        self._role = QPlainTextEdit()
+        self._role.setAccessibleName("AI 角色提示词")
+        self._role.setMinimumHeight(140)
+        self._role.setPlaceholderText("描述 AI 的角色、回答方式和工作重点")
+        role_layout.addWidget(self._role)
+        layout.addWidget(role)
 
         remote = make_card(shadow=False)
         remote_layout = QVBoxLayout(remote)
@@ -158,15 +167,10 @@ class ModelCenterPage(QWidget):
         open_backend_setup(self)
         self.refresh()
 
-    def _read_settings(self) -> dict:
-        if not self._username:
-            return {}
-        data = load_user_json(self._store, self._username, AI_SETTINGS_FILE, {})
-        return data if isinstance(data, dict) else {}
-
     def _load_settings(self) -> None:
-        settings = self._read_settings()
-        self._local.setChecked(bool(settings.get("local_enabled")))
+        settings = read_ai_settings(self._store, self._username)
+        self._role.setPlainText(configured_ai_role(settings))
+        self._role.setEnabled(bool(self._username))
         with QSignalBlocker(self._cloud):
             self._cloud.setChecked(bool(settings.get("cloud_enabled")))
         self._key.clear()
@@ -177,14 +181,21 @@ class ModelCenterPage(QWidget):
 
     def _save_settings(self) -> None:
         try:
-            data = self._read_settings()
+            prompt = validate_ai_role(self._role.toPlainText())
+        except ValueError as error:
+            self._status.setText(str(error))
+            self._role.setFocus()
+            return
+        try:
+            data = read_ai_settings(self._store, self._username, strict=True)
             cloud = self._cloud.isChecked()
             key = self._key.text().strip() or data.get("api_key", "")
             if cloud and not key:
                 self._status.setText("请填写 API Key 后保存。")
                 self._key.setFocus()
                 return
-            data.update(local_enabled=self._local.isChecked(), cloud_enabled=cloud, api_key=key if cloud else "")
+            data.pop("local_enabled", None)
+            data.update(role_prompt=prompt, cloud_enabled=cloud, api_key=key if cloud else "")
             save_user_json(self._store, self._username, AI_SETTINGS_FILE, data)
         except Exception:  # 设置读写失败时保留当前输入，供用户重试。
             QMessageBox.warning(self, "保存失败", "无法保存 AI 设置，请重试。")

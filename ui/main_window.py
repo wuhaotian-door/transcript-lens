@@ -81,7 +81,8 @@ from ui.pages import (
 
 from core.sensitive_vault import SensitiveVault
 from ui.pages.mentor_page import MentorPage
-from ui.pages.student_details import StudentDetails
+from ui.pages.workbench_page import WorkbenchPage
+from ui.pages.student_details import StudentDetails, edit_interview
 from ui.student_import_dialog import StudentImportDialog
 from ui.workbench_widgets import button, label
 
@@ -108,6 +109,7 @@ FADE_IN_FAILSAFE_MS = 900
 
 #: 导航项：``(键, 图标+文字)``。顺序即侧栏顺序。
 NAV_ITEMS: tuple[tuple[str, str], ...] = (
+    ("workbench", "▦  工作台"),
     ("analysis", "📊  成绩透析"),
     ("archive", "📈  成长档案"),
     ("mentor", "📷  导师自核"),
@@ -127,8 +129,8 @@ ARCHIVE_PAGE_INDEX = next(
 PROFILE_NAV_KEY = "archive"
 PROFILE_PAGE_INDEX = ARCHIVE_PAGE_INDEX
 
-#: 默认落在哪一页（Spec 四：默认首页 = 智育分析）
 DEFAULT_PAGE = 0
+GRADES_PAGE_INDEX = next(i for i, (key, _) in enumerate(NAV_ITEMS) if key == "analysis")
 
 
 class MainWindow(QMainWindow):
@@ -185,6 +187,7 @@ class MainWindow(QMainWindow):
         right.addWidget(self._stack, 1)
         body.addLayout(right, 1)
 
+        self.workbench_page = WorkbenchPage(self._store)
         self.analysis_page = AnalysisPage(self._store)
         self.archive_page = ArchivePage(self._store)
         self.scholarship_page = ScholarshipPage(self._store)
@@ -196,6 +199,7 @@ class MainWindow(QMainWindow):
         self.profile_page = None
 
         for page in (
+            self.workbench_page,
             self._build_grade_workspace(),
             self.archive_page,
             self.mentor_page,
@@ -258,15 +262,22 @@ class MainWindow(QMainWindow):
 
         # 品牌区
         brand = QWidget()
-        brand_box = QVBoxLayout(brand)
-        brand_box.setContentsMargins(18, 20, 14, 16)
-        brand_box.setSpacing(2)
+        brand_box = QHBoxLayout(brand)
+        brand_box.setContentsMargins(15, 20, 12, 16)
+        brand_box.setSpacing(8)
+        brand_icon = QLabel()
+        brand_icon.setFixedSize(34, 34)
+        brand_icon.setPixmap(self.windowIcon().pixmap(34, 34))
+        brand_box.addWidget(brand_icon)
+        names = QVBoxLayout()
+        names.setSpacing(2)
         title = QLabel(APP_NAME)
         title.setObjectName("BrandTitle")
-        brand_box.addWidget(title)
+        names.addWidget(title)
         sub = QLabel("辅导员学生工作台")
         sub.setObjectName("BrandSub")
-        brand_box.addWidget(sub)
+        names.addWidget(sub)
+        brand_box.addLayout(names, 1)
         box.addWidget(brand)
 
         # 导航
@@ -333,9 +344,18 @@ class MainWindow(QMainWindow):
         self.analysis_page.roster_changed.connect(self._on_roster_changed)
         # 个人中心「切换账号」
         self.account_page.switch_account.connect(self._switch_account)
+        self.account_page.archives_changed.connect(self._on_archive_restored)
+        self.archive_page.archives_changed.connect(self.account_page.refresh_archives)
+        self.archive_page.archives_changed.connect(self.mentor_page.reload)
+        self.archive_page.archives_changed.connect(self.workbench_page.refresh)
         self.archive_page.details_requested.connect(self._open_student_details)
         self.archive_page.interview_requested.connect(self._open_interview)
         self.archive_page.import_requested.connect(self._import_student_details)
+        self.workbench_page.import_requested.connect(self._import_student_details)
+        self.workbench_page.archive_requested.connect(lambda: self.goto(ARCHIVE_PAGE_INDEX))
+        self.workbench_page.grades_requested.connect(lambda: self.goto(GRADES_PAGE_INDEX))
+        self.workbench_page.models_requested.connect(self._go_model_center)
+        self.workbench_page.knowledge_requested.connect(self._open_workbench_knowledge)
         self.mentor_page.open_student.connect(self._open_student_details)
         self.mentor_page.model_center.connect(self._go_model_center)
         self.student_details.back.connect(self._return_from_details)
@@ -365,6 +385,7 @@ class MainWindow(QMainWindow):
         self.mentor_page.set_vault(self.vault)
         self.settings_page.vault = self.vault
         self.archive_page.vault = self.vault
+        self.workbench_page.set_user(self._username)
         self._user_label.setText(self._username or "（未登录）")
         self.analysis_page.set_user(self._username)
         self.archive_page.set_user(self._username)
@@ -407,6 +428,12 @@ class MainWindow(QMainWindow):
         self.mentor_page.reload()
         self.analysis_page.forget_class(class_name, removed)
         self.scholarship_page.reload_classes()
+
+    def _on_archive_restored(self):
+        self.archive_page.reset_view()
+        self.archive_page.reload()
+        self.mentor_page.reload()
+        self.workbench_page.refresh()
 
     def _on_student_deleted(self, sid: str, name: str) -> None:
         self.mentor_page.reload()
@@ -488,7 +515,7 @@ class MainWindow(QMainWindow):
         from ui.first_run import show_first_run_guide
 
         if show_first_run_guide(self, self._store, username):
-            self.goto(DEFAULT_PAGE)
+            self._switcher.switch(GRADES_PAGE_INDEX, animate=False)
             self.analysis_page._import_btn.click()
 
         from core.startup_environment import supports_bundled_engine
@@ -518,6 +545,7 @@ class MainWindow(QMainWindow):
         if self.vault is not None:
             self.vault.lock()
         self.student_details.forget()
+        self.workbench_page.set_user("")
         self.switch_account.emit()
 
     def _open_student_details(self, sid: str) -> bool:
@@ -534,8 +562,11 @@ class MainWindow(QMainWindow):
         self._switcher.switch(self._details_return_index, animate=False)
 
     def _open_interview(self, sid: str):
-        if self._open_student_details(sid):
-            self.student_details.new_interview()
+        edit_interview(self, self.vault, sid)
+
+    def _open_workbench_knowledge(self):
+        self.settings_page._open_knowledge()
+        self.workbench_page.refresh()
 
     def _import_student_details(self):
         if not self.vault or not self.vault.username:
@@ -543,10 +574,13 @@ class MainWindow(QMainWindow):
         dialog = StudentImportDialog(self, self.vault)
         dialog.completed.connect(self._on_student_details_imported)
         dialog.exec()
+        dialog.deleteLater()
+        self.workbench_page.refresh()
 
     def _on_student_details_imported(self, _count: int, sid: str):
         self.archive_page.reload()
-        self.archive_page._select_student_by_id(sid)
+        if sid:
+            self.archive_page._select_student_by_id(sid)
         self.mentor_page.reload()
         self.scholarship_page.reload_classes(select=self.scholarship_page.current_class)
         self.analysis_page._archive = None

@@ -806,12 +806,70 @@ def test_coerce_prompt_handles_plain_values():
     assert chat._coerce_prompt(42) == "42"  # noqa: SLF001
 
 
-def test_system_prompt_is_verbatim():
-    """系统提示词逐字照任务书给的（改一个字都要先问）。"""
-    assert SYSTEM_PROMPT == (
-        "你是一名高校辅导员助理，擅长学生谈话提纲生成、评语润色、侧写分析。"
-        "请根据对话上下文提供专业建议。"
-    )
+def test_academic_chat_reads_account_role_on_every_send(qapp, modal_calls, tmp_path):
+    from core.ai.settings import AI_SETTINGS_FILE
+    from core.user_store import save_user_json
+    from ui.academic_context import AcademicContext
+
+    class AcademicEngine(_FakeChatEngine):
+        n_ctx = 4096
+        count_tokens = staticmethod(len)
+
+    store = _store(tmp_path)
+    fake = AcademicEngine(("收到",))
+    dialog = ChatDialog(None, store=store, username="tester", engine=fake, models=[_model(tmp_path)],
+                        academic_context=AcademicContext("已有学期成绩", ()))
+    try:
+        for role in ("你负责检查学业风险。", "你负责解释政策。"):
+            save_user_json(store, "tester", AI_SETTINGS_FILE, {"role_prompt": role})
+            assert dialog.submit("分析已导入学期")
+            assert _pump_until(qapp, lambda: dialog._worker is None)
+            assert fake.prompts[-1].startswith(f"角色设定：\n{role}\n")
+            assert "已有学期成绩" in fake.prompts[-1]
+        assert "你负责检查学业风险。" not in fake.prompts[-1]
+    finally:
+        dialog.close()
+
+
+def test_grounded_generation_keeps_the_role_before_retrieved_context(qapp, tmp_path, monkeypatch):
+    from core.ai.settings import AI_SETTINGS_FILE
+    from core.sensitive_vault import SensitiveVault
+    from core.user_store import save_user_json
+    from ui.academic_context import AcademicContext
+    from ui import grounded_chat_dialog as grounded
+
+    prompts = []
+    class Engine:
+        n_ctx = 4096
+        count_tokens = staticmethod(len)
+
+        def load(self):
+            pass
+
+        def generate(self, prompt, **_kwargs):
+            prompts.append(prompt)
+            return "示例回答"
+
+    store = _store(tmp_path)
+    role = "你负责解释学校规章。"
+    save_user_json(store, "tester", AI_SETTINGS_FILE, {"role_prompt": role})
+    monkeypatch.setattr(grounded, "engine_available", lambda: (True, ""))
+    monkeypatch.setattr(grounded, "list_local_models", lambda *_: [])
+    monkeypatch.setattr(grounded, "LocalModelEngine", lambda _path: Engine())
+    dialog = grounded.GroundedChatDialog(None, SensitiveVault(store, "tester"), "", AcademicContext("已有学期成绩", ()))
+    try:
+        dialog._answer("查看依据", False, False)
+        assert not prompts
+        assert dialog._answer("分析成绩", True, False, "mock.gguf").startswith("示例回答")
+        assert prompts[0].startswith(f"角色设定：\n{role}\n")
+        assert "已有学期成绩" in prompts[0]
+    finally:
+        dialog.close()
+
+
+def test_default_chat_task_defers_role_to_configuration():
+    assert "谈话提纲、评语润色或侧写分析" in SYSTEM_PROMPT
+    assert "你是" not in SYSTEM_PROMPT
     assert chat.CHAT_HISTORY_FILE.endswith(".enc")
 
 

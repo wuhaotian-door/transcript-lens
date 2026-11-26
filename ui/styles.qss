@@ -370,7 +370,7 @@ QRadioButton {
 }
 
 /* --------------------------------------------------------------- 表格 */
-QTableWidget, QTableView {
+QTableWidget, QTableView, QTreeWidget#GradeTree {
     background: #FFFFFF;
     alternate-background-color: #F8FAFC;
     border: 1px solid #E2E8F0;
@@ -380,9 +380,20 @@ QTableWidget, QTableView {
     selection-color: #1E3A8A;
     outline: none;
 }
-QTableWidget::item, QTableView::item {
+QTableWidget::item, QTableView::item, QTreeWidget#GradeTree::item {
     padding: 6px 8px;
     border: none;
+}
+QTableView::item:hover:!selected, QTreeWidget#GradeTree::item:hover:!selected {
+    background: #EDF5FF;
+}
+QTableView::item:selected, QTreeWidget#GradeTree::item:selected {
+    background: #D9E9FC;
+    color: #12365E;
+}
+QTableWidget#courseTable::item:selected {
+    background: #CFE4FF;
+    color: #133C68;
 }
 QHeaderView::section {
     background: #F8FAFC;
@@ -753,6 +764,10 @@ QPushButton#SegmentButton {
     border-radius: 7px;
     padding: 5px 16px;
 }
+QPushButton#SegmentButton:hover:!checked {
+    background-color: #e3edf9;
+    border-color: #a8c4e6;
+}
 QPushButton#SegmentButton:checked {
     background-color: #123558;
     color: #ffffff;
@@ -760,4 +775,98 @@ QPushButton#SegmentButton:checked {
 }
 QPushButton#SegmentButton:focus {
     border: 2px solid #4485df;
+}
+
+/* 工作台 */
+QFrame#WorkbenchMasthead {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #0e2038, stop:1 #193858);
+    border-radius: 12px;
+}
+QLabel#WorkbenchHeading { color: #f5d58c; }
+QPushButton#WorkbenchPrimary {
+    color: #142538; background: #ffbf70; border: 1px solid #ffbf70;
+    border-radius: 7px; font-weight: 600; padding: 5px 14px;
+}
+QPushButton#WorkbenchPrimary:hover { background: #ffd295; }
+QPushButton#WorkbenchPrimary:focus { border: 2px solid #fff4e5; }
+QFrame#WorkbenchStrip { background: #fbfdff; border: 1px solid #dbe5ef; border-radius: 10px; }
+QLabel#WorkbenchValue { color: #142539; font-size: 27px; font-weight: 700; }
+QLabel#WorkbenchCaption { color: #4a6279; font-size: 13px; }
+QLabel#WorkbenchLegendLabel { color: #28405b; font-size: 13px; }
+QFrame#WorkbenchLegend { border-radius: 5px; }
+QFrame#WorkbenchLegend:hover { background: #edf4fc; }
+QListWidget#WorkbenchRules, QListWidget#KnowledgeResults, QPlainTextEdit#KnowledgePreview {
+    background: #f8fbff; border: 1px solid #dce6f0; border-radius: 8px;
+}
+QListWidget#WorkbenchRules::item, QListWidget#KnowledgeResults::item {
+    padding: 8px 10px; border-bottom: 1px solid #e9f0f7; color: #1c3553;
+}
+QListWidget#WorkbenchRules::item:hover:!selected, QListWidget#KnowledgeResults::item:hover:!selected {
+    background: #edf5ff;
+}
+QListWidget#WorkbenchRules::item:selected, QListWidget#KnowledgeResults::item:selected {
+    background: #d7e9fd; color: #133b66;
+}
+QLabel#WorkbenchModelName { color: #1d426e; font-size: 15px; font-weight: 600; }
+QPushButton#WorkbenchModelReady:disabled {
+    background: #e5f5ed; border: 1px solid #b8dfca; color: #1b6548; border-radius: 7px;
+    padding: 5px 14px;
+}
+QProgressBar#AuxModelProgress { background: #e6eef9; color: #163b62; }
+QProgressBar#AuxModelProgress::chunk { background: #72b6fa; }
+
+/* 导师自核的选择和答题反馈 */
+QPushButton#MentorTile {
+    background: #ffffff;
+    border: 1px solid #dae4f2;
+    border-radius: 12px;
+}
+QPushButton#MentorTile[tone="verification"] {
+    border-color: #d7e6e0;
+}
+QPushButton#MentorTile:hover:enabled, QPushButton#MentorTile:focus:enabled {
+    background: #f1f6ff;
+    border-color: #6693d8;
+}
+QPushButton#MentorTile[tone="verification"]:hover:enabled,
+QPushButton#MentorTile[tone="verification"]:focus:enabled {
+    background: #eef8f3;
+    border-color: #56a98d;
+}
+QPushButton#MentorTile:pressed:enabled {
+    background: #e4efff;
+}
+QPushButton#MentorTile[tone="verification"]:pressed:enabled {
+    background: #dff2e9;
+}
+QPushButton#MentorTile:disabled {
+    background: #f8fafc;
+    border-color: #e1e7ef;
+}
+QLabel#MentorTileTitle { color: #182b43; font-size: 15px; font-weight: 700; }
+QLabel#MentorTileDescription { color: #526780; font-size: 13px; }
+QLabel#MentorTileTitle:disabled, QLabel#MentorTileDescription:disabled { color: #667890; }
+
+QPushButton#QuizChoice {
+    background: #FFFFFF;
+    color: #183650;
+    border: 1px solid #CAD9E8;
+    border-radius: 8px;
+}
+QPushButton#QuizChoice:hover:enabled, QPushButton#QuizChoice:focus:enabled {
+    background: #EDF5FF;
+    border-color: #7CABDF;
+}
+QPushButton#QuizChoice[answerState="correct"]:disabled {
+    background: #E5F5ED;
+    border: 2px solid #36845F;
+    color: #175F41;
+}
+QPushButton#QuizChoice[answerState="wrong"]:disabled {
+    background: #FFF0EE;
+    border: 2px solid #BE6058;
+    color: #8B332C;
+}
+QPushButton#QuizChoice:checked {
+    font-weight: 700;
 }

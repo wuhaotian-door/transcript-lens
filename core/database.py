@@ -134,6 +134,7 @@ STUDENT_FIELDS = (
     "student_id",
     "name",
     "class_name",
+    "gender",
     "note",
     "archived",
     "source",
@@ -1670,7 +1671,7 @@ class StudentStore:
         return found
 
     def add(self, student_id: str = "", name: str = "", class_name: str = "",
-            note: str = "", *, source: str = "manual",
+            note: str = "", *, gender: str = "", source: str = "manual",
             archived: bool = False) -> dict[str, Any]:
         """新建一个学生（**学号与姓名都必填**），学号重复抛 :class:`DuplicateStudentError`。
 
@@ -1707,6 +1708,7 @@ class StudentStore:
             "name": clean_name,
             "class_name": _clean_text(class_name),
             "note": _clean_text(note),
+            "gender": _clean_text(gender),
             "archived": bool(archived),
             "source": _clean_text(source) or "manual",
             "created_at": stamp,
@@ -1721,7 +1723,7 @@ class StudentStore:
                **changes: Any) -> dict[str, Any]:
         """改一个学生的字段：**只改传进来的那几个**（``None`` 一律视为"没传"）。
 
-        可改：``name`` / ``class_name`` / ``note`` / ``archived`` / ``source``。
+        可改：姓名、班级、性别、备注、归档、来源。
 
         Args:
             student_id: 学号
@@ -1744,7 +1746,7 @@ class StudentStore:
                 and _student_id_of(changes["student_id"]) != key:
             raise ValueError("改学号请调用 migrate_student_id()，它会把关联数据一起迁走")
         updated = dict(row)
-        for field in ("name", "class_name", "note", "source"):
+        for field in ("name", "class_name", "note", "source", "gender"):
             value = changes.get(field)
             if value is None:
                 continue
@@ -1807,7 +1809,7 @@ class StudentStore:
                 if not fields["name"]:
                     raise ValueError("姓名不能为空")
                 updated = {
-                    "student_id": key, **fields, "note": "", "archived": False,
+                    "student_id": key, **fields, "gender": "", "note": "", "archived": False,
                     "created_at": stamp, "updated_at": stamp,
                 }
                 audit.append({"operation": OP_STUDENT_ADD, "student_id": key,

@@ -14,7 +14,7 @@ _VALID = re.compile(r"sensitive/student_[a-f0-9]{64}\.enc")
 
 
 def _replay(base: Path, entries: dict) -> None:
-    if not isinstance(entries, dict) or _ROSTER not in entries:
+    if not isinstance(entries, dict) or not entries.keys() & {_ROSTER, _BATCHES}:
         raise CryptoError("学生导入恢复记录格式错误。")
     targets = []
     for name, encoded in entries.items():

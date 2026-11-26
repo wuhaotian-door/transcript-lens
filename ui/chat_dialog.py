@@ -53,6 +53,7 @@ from ui.widgets.profile_reading import ProfileDocument, profile_scroll
 from ui.academic_context import AcademicContext
 from ui.widgets.model_picker import CORE_MISSING_HINT, ModelPicker
 
+from core.ai.settings import role_preamble
 from core.ai.inference import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_TEMPERATURE,
@@ -71,11 +72,8 @@ __all__ = [
     "open_chat",
 ]
 
-#: 系统提示词 —— **逐字**照任务书给的，一个字都不许改。
-SYSTEM_PROMPT = (
-    "你是一名高校辅导员助理，擅长学生谈话提纲生成、评语润色、侧写分析。"
-    "请根据对话上下文提供专业建议。"
-)
+#: 通用谈话任务说明。角色由模型中心的账号设置统一提供。
+SYSTEM_PROMPT = "请根据对话上下文提供谈话提纲、评语润色或侧写分析等专业建议。"
 
 #: 谈话记录的文件名。放在用户自己的加密目录 ``u_<uid>/`` 下，
 #: 后缀必须是 ``.enc`` —— ``save_encrypted`` 会当场拒绝写成 .json
@@ -216,6 +214,7 @@ class _ChatWorker(QThread):
         stop: Sequence[str] | None = None,
         academic_context: AcademicContext | None = None,
         question: str = "",
+        preamble: str = "",
     ) -> None:
         super().__init__()
         self._engine = engine
@@ -225,6 +224,7 @@ class _ChatWorker(QThread):
         self._stop = tuple(stop or ())
         self._academic_context = academic_context
         self._question = question
+        self._preamble = preamble
         self._cancelled = False
         #: 已经吐出来的整段回答（**线程侧**自己攒，见 :meth:`ChatDialog._record_partial`）
         self._answer = ""
@@ -254,10 +254,11 @@ class _ChatWorker(QThread):
             self.failed.emit(friendly_error(exc))
             return
         try:
-            prompt = self._prompt
+            prompt = self._preamble + self._prompt
             if self._academic_context is not None:
                 prompt = self._academic_context.render(
-                    prompt, self._question, engine.n_ctx - self._max_tokens - 16, engine.count_tokens,
+                    self._prompt, self._question, engine.n_ctx - self._max_tokens - 16, engine.count_tokens,
+                    preamble=self._preamble,
                 )
             for piece in engine.stream(
                 prompt,
@@ -350,6 +351,7 @@ class ChatDialog(QDialog):
 
         self._store = store if store is not None else getattr(parent, "_store", None)
         self._username = username or str(getattr(parent, "_username", "") or "")
+        self._settings_store = self._store
         if academic_context is not None:
             self._store = None
         self._injected_engine = engine
@@ -821,6 +823,7 @@ class ChatDialog(QDialog):
             stop=STOP_WORDS,
             academic_context=self._academic_context,
             question=text,
+            preamble=role_preamble(self._settings_store, self._username),
         )
         worker.chunk.connect(self._on_chunk)
         worker.failed.connect(self._on_failed)

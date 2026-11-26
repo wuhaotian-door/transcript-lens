@@ -68,6 +68,8 @@ from core.ai.inference import (
     friendly_error,
     list_local_models,
 )
+from core.ai.settings import role_preamble
+from core.crypto_store import CryptoStore
 from core.database import ProfileStore
 from core.gpa import DEFAULT_SCHEME, resolve_scheme, scheme_label
 from ui.anim import make_card
@@ -301,6 +303,8 @@ class SemesterSideProfile(QWidget):
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SingleSelection)
         self._table.setAlternatingRowColors(True)
+        self._table.setMouseTracking(True)
+        self._table.viewport().setMouseTracking(True)
         self._table.setWordWrap(False)
         self._table.setMinimumHeight(250)
         self._table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
@@ -706,7 +710,8 @@ class SemesterSideProfile(QWidget):
             )
             return
 
-        prompt = self._side_prompt(rows)
+        store = self._store if isinstance(self._store, CryptoStore) else getattr(self._store, "store", None)
+        prompt = role_preamble(store, self._username) + self._side_prompt(rows)
         self._ai_text.clear()
         self._ai_error = ""
         self._ai_status.setText("正在生成本学期侧写……")
