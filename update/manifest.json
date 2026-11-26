@@ -1,16 +1,16 @@
 {
   "schema": 1,
-  "version": "1.9.9",
-  "published": "2026-11-22",
+  "version": "2.0.0",
+  "published": "2026-11-26",
   "_doc": [
     "GitHub 是主仓库。Gitee master 保存相同的清单，供现有客户端读取。",
     "用顶层 app 段提供经过公开下载验证的程序附件。单文件需要 url、size、sha256。分片时填写整包 size、sha256 和按拼接顺序排列的 parts。",
     "发布后通过公开直链下载并核对字节数与 SHA-256，再提交清单并检查客户端能够发现更新。"
   ],
   "app": {
-    "url": "https://github.com/wuhaotian-door/transcript-lens/releases/download/v1.9.9/transcript-lens-v1.9.9.exe",
-    "size": 241054756,
-    "sha256": "8b70dad7ae6dab573102acbf4a9389d0af5f78c9e14681437a77a61a95de446b",
-    "notes": "启动时检查本地环境。缺少本地 AI 推理核心或模型时，点击「下载并安装」补齐，也可点「暂时跳过」继续使用成绩功能。新增首次登录引导、四学期总评和全学期 AI 分析。已安装的用户也可先退出旧版，再用安装向导覆盖原目录。"
+    "url": "https://github.com/wuhaotian-door/transcript-lens/releases/download/v2.0.0/zhaoxi-workbench-2.0.0.exe",
+    "size": 168161573,
+    "sha256": "bd7dedbb7d5f5847af4215cf9ed75c5cf5a3609a22de7190bb9b952ea40960ef",
+    "notes": "成绩单透镜升级为朝夕工作台。新增工作台、学校规章知识库、学生名册及电话与照片导入、导师自核。GPA 规则切换需确认。已安装的用户可退出旧版后用安装向导覆盖原目录。"
   }
 }
