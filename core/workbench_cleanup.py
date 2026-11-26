@@ -91,6 +91,7 @@ def clear_inventory(store, username: str, vault=None) -> dict:
             elif path.name.startswith("chat_history_"):
                 counts["AI 聊天"] += 1
         if vault is not None:
+            counts["练习记录"] = sum(len(round_["answers"]) for round_ in vault.practice_rounds())
             for row in roster.rows():
                 data = vault.student(row["student_id"])
                 counts["照片"] += bool(data.get("photo"))

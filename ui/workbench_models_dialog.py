@@ -19,11 +19,11 @@ class WorkbenchModelsDialog(TaskDialog):
     progress = Signal(str, int, int)
 
     def __init__(self, parent, store):
-        super().__init__(parent, "语义检索与照片匹配")
+        super().__init__(parent, "辅助模型")
         self.store = store
         self._active = ""
         self.setMinimumWidth(620)
-        self.body.addWidget(label("语义检索与照片匹配", "H2"))
+        self.body.addWidget(label("辅助模型", "H2"))
         self.cards = {}
         for group, (title, model, detail) in MODEL_INFO.items():
             card = make_card(shadow=False, name="WorkbenchStrip")
@@ -42,14 +42,14 @@ class WorkbenchModelsDialog(TaskDialog):
             box.addWidget(hint)
             entry = {"card": card}
             actions = QHBoxLayout()
+            actions.addStretch(1)
             entry["download"] = button("下载", lambda _=False, g=group: self._download(g), "Primary")
             entry["import"] = button("离线导入", lambda _=False, g=group: self._import(g))
             entry["ready"] = button("已安装", lambda: None, "WorkbenchModelReady")
             entry["ready"].setEnabled(False)
             entry["uninstall"] = button("卸载", lambda _=False, g=group: self._uninstall(g))
-            for action in ("download", "import", "ready", "uninstall"):
+            for action in ("ready", "import", "uninstall", "download"):
                 actions.addWidget(entry[action])
-            actions.addStretch(1)
             box.addLayout(actions)
             self.body.addWidget(card)
             self.cards[group] = entry

@@ -306,6 +306,41 @@ def test_按清单group分组且组间有标题和分隔线(center: Any, app: QA
     assert _card(center, "p1").y() > _card(center, "r1").y()
 
 
+def test_内嵌目录每组从第一列开始并把已安装模型放在前面(app: QApplication, monkeypatch) -> None:
+    monkeypatch.setattr(mcd.ModelCenterDialog, "refresh_local_models", lambda self: None)
+    center = mcd.ModelCenterDialog(embedded=True)
+    center._choices = [
+        mcd.ModelChoice(_model("regular1")),
+        mcd.ModelChoice(_model("regular2")),
+        mcd.ModelChoice(_model("regular3")),
+        mcd.ModelChoice(_model("advanced1", group="高级")),
+        mcd.ModelChoice(_model("advanced2", group="高级")),
+        mcd.ModelChoice(_model("installed", group="高级"), state=mcd.STATE_INSTALLED),
+    ]
+    center._populate()
+    try:
+        assert [name for name, _ in center._groups] == ["已安装", "推荐", "高级"]
+        positions = {
+            card.model_id: center._grid.getItemPosition(center._grid.indexOf(card))[:2]
+            for card in center._iter_cards()
+        }
+        assert positions["installed"][1] == positions["regular1"][1] == positions["advanced1"][1] == 0
+        assert positions["regular2"][1] == positions["advanced2"][1] == 1
+        assert positions["regular1"][0] == positions["regular2"][0]
+        assert positions["advanced1"][0] == positions["advanced2"][0]
+        assert positions["regular3"][0] == positions["regular1"][0] + 1
+        center.resize(820, 380)
+        center.show()
+        app.processEvents()
+        headers = center._grid_host.findChildren(mcd.QWidget, "ModelGroupHeader")
+        bounds = [widget.geometry() for widget in (*center._iter_cards(), *headers)]
+        assert all(not left.intersects(right) for i, left in enumerate(bounds) for right in bounds[i + 1:])
+        assert center._scroll.verticalScrollBar().maximum() > 0
+    finally:
+        center.deleteLater()
+        app.processEvents()
+
+
 def test_卡片显示名称大小推荐信息(center: Any, app: QApplication) -> None:
     model = _model(
         "big",

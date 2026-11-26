@@ -1,20 +1,23 @@
-"""导师自核的两种练习和本地照片候选。"""
+"""导师自核、错题重练和本地照片候选。"""
 
 import base64
-import random
-from datetime import datetime
+from binascii import Error as Base64Error
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QComboBox, QFileDialog, QGridLayout, QHeaderView, QHBoxLayout, QListWidget,
     QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from core.database import StudentStore
+from core.mentor_practice import (
+    MODE_LABELS, MODE_NAMES, MODE_PHOTOS, MODE_REVIEW, new_round, regular_targets, review_targets,
+)
 from core.photo_matching import FaceEngine, configure_matching, index_photo, match_photo, valid_consent
 from core.workbench_models import installed
+from ui.mentor_practice_dialog import PracticeDialog, student_caption
 from ui.widgets.profile_reading import profile_scroll
 from ui.workbench_widgets import TaskDialog, button, fields, label, review_table, unlock
 
@@ -25,10 +28,10 @@ _TILE_ICONS = {
               ((3, 18), (9, 11), (13, 16), (17, 12), (22, 17)), ((15, 8), (17, 8))),
     "person": (((7, 10), (7, 5), (10, 2), (14, 2), (17, 5), (17, 10), (14, 13), (10, 13), (7, 10)),
                ((3, 22), (3, 19), (7, 16), (17, 16), (21, 19), (21, 22), (3, 22))),
+    "review": (((20, 7), (16, 3), (8, 3), (4, 7), (4, 14), (8, 19), (16, 19), (20, 15)),
+               ((20, 2), (20, 7), (15, 7)), ((9, 10), (12, 13), (16, 9))),
     "stats": (((3, 2), (3, 21), (22, 21)), ((8, 17), (8, 12)),
               ((13, 17), (13, 8)), ((18, 17), (18, 5))),
-    "models": (((3, 7), (12, 2), (21, 7), (12, 12), (3, 7)),
-               ((3, 12), (12, 17), (21, 12)), ((3, 17), (12, 22), (21, 17))),
     "scan": (((2, 8), (2, 2), (8, 2)), ((16, 2), (22, 2), (22, 8)),
              ((22, 16), (22, 22), (16, 22)), ((8, 22), (2, 22), (2, 16)),
              ((8, 10), (9, 10)), ((15, 10), (16, 10)), ((9, 15), (12, 17), (15, 15))),
@@ -124,10 +127,10 @@ class MentorPage(QWidget):
 
         self.actions = []
         self._add_section(box, "认人练习", "practice", (
-            ("photo", "看照片选名字", "根据学生照片选择姓名", lambda: self._quiz(False)),
-            ("person", "看名字选照片", "根据学生姓名选择照片", lambda: self._quiz(True)),
-            ("stats", "练习统计", "查看答对次数和最近练习", self._history),
-            ("models", "前往模型中心", "安装或管理照片匹配模型", self.model_center.emit),
+            ("photo", "看照片选名字", "看清照片后选择姓名 · 每轮 20 题", lambda: self._quiz(MODE_NAMES)),
+            ("person", "看名字选照片", "从大图中选择对应照片 · 每轮 20 题", lambda: self._quiz(MODE_PHOTOS)),
+            ("review", "错题练习", "重练当前班级认错的学生", lambda: self._quiz(MODE_REVIEW)),
+            ("stats", "练习统计", "按轮查看得分与逐题结果", self._history),
         ))
         self._add_section(box, "照片核对", "verification", (
             ("scan", "照片找人", "从已授权的照片中查找候选", self._match),
@@ -135,6 +138,8 @@ class MentorPage(QWidget):
             ("index", "批量提取照片特征", "处理具备有效授权的照片", self._index),
             ("shield", "配置照片匹配", "设置学校授权和候选阈值", self._configure),
         ))
+        models = button("前往模型中心", self.model_center.emit)
+        box.addWidget(models, alignment=Qt.AlignmentFlag.AlignRight)
         self.status = label("", "Muted")
         self.status.setWordWrap(True)
         box.addWidget(self.status)
@@ -157,8 +162,7 @@ class MentorPage(QWidget):
         for index, (icon, title, summary, callback) in enumerate(actions):
             tile = _tile(icon, title, summary, callback, tone)
             grid.addWidget(tile, index // 2, index % 2)
-            if icon != "models":
-                self.actions.append(tile)
+            self.actions.append(tile)
         layout.addLayout(grid)
 
     def set_vault(self, vault):
@@ -199,13 +203,16 @@ class MentorPage(QWidget):
         name = self.classes.currentText()
         return rows if not name or name == "全部班级" else [row for row in rows if row["class_name"] == name]
 
-    def _private_dialog(self, title):
-        dialog = TaskDialog(self, title)
-        dialog.resize(650, 390)
+    def _watch_vault(self, dialog):
         vault = self.vault
         timer = QTimer(dialog, interval=500)
         timer.timeout.connect(lambda: dialog.reject() if self.vault is not vault or not vault.unlocked else None)
         timer.start()
+
+    def _private_dialog(self, title, parent=None):
+        dialog = TaskDialog(parent or self, title)
+        dialog.resize(650, 390)
+        self._watch_vault(dialog)
         return dialog
 
     def _show_results(self, candidates, message):
@@ -310,125 +317,155 @@ class MentorPage(QWidget):
 
         self._task("批量生成照片特征", work, done)
 
+    @staticmethod
+    def _practice_table(headers, rows):
+        table = QTableWidget(len(rows), len(headers))
+        table.setObjectName("ReviewTable")
+        table.setHorizontalHeaderLabels(headers)
+        review_table(table)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        for i, row in enumerate(rows):
+            for j, value in enumerate(row):
+                item = QTableWidgetItem(str(value))
+                item.setToolTip(item.text())
+                table.setItem(i, j, item)
+        return table
+
     def _history(self):
-        rows = self._rows()
         scope = self.classes.currentText()
+        vault = self.vault
 
         def collect():
-            entries = [(row, self.vault.student(row["student_id"]).get("practice", {})) for row in rows]
-            return [(row, data) for row, data in entries if data.get("attempts")]
+            rounds = vault.practice_rounds()
+            return [round_ for round_ in rounds if scope == "全部班级" or round_["scope"] == scope]
 
-        def done(result):
+        def done(rounds):
             dialog = self._private_dialog("练习统计")
-            dialog.body.addWidget(label(f"{scope} · {len(result)} 名学生有练习记录", "H2"))
-            if result:
-                table = QTableWidget(len(result), 5)
-                table.setObjectName("ReviewTable")
-                table.setHorizontalHeaderLabels(["姓名", "学号", "班级", "答对 / 总次数", "最近练习"])
-                review_table(table)
-                table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-                for index, (row, data) in enumerate(result):
-                    for column, value in enumerate((
-                        row["name"], row["student_id"].removeprefix("sid:"), row.get("class_name", ""),
-                        f"{data.get('correct', 0)} / {data['attempts']}", data.get("last_practiced", ""),
-                    )):
-                        table.setItem(index, column, QTableWidgetItem(str(value)))
-                table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+            dialog.resize(810, 472)
+            dialog.body.addWidget(label(f"{scope} · {len(rounds)} 轮练习", "H2"))
+            controls = QHBoxLayout()
+            controls.addStretch()
+            controls.addWidget(button("关闭", dialog.reject))
+            if rounds:
+                rows = []
+                for round_ in rounds:
+                    answered = len(round_["answers"])
+                    correct = sum(answer["correct"] for answer in round_["answers"])
+                    rows.append((round_["started_at"][:19], MODE_LABELS[round_["kind"]], round_["scope"],
+                                 f"{answered} / {round_['total']}", correct, answered - correct,
+                                 "已完成" if answered == round_["total"] else "未完成"))
+                table = self._practice_table(
+                    ["开始时间", "练习类型", "班级", "已答 / 题量", "答对", "答错", "状态"], rows
+                )
+                header = table.horizontalHeader()
+                for column in (0, 1, 3, 4, 5, 6):
+                    header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
                 dialog.body.addWidget(table, 1)
+
+                def details():
+                    index = table.currentRow()
+                    if index >= 0 and vault.unlocked:
+                        self._practice_details(rounds[index], dialog)
+
+                table.itemActivated.connect(details)
+                controls.addWidget(button("查看逐题结果", details, "Primary"))
+                table.selectRow(0)
             else:
-                dialog.body.addWidget(label("当前班级还没有练习记录。", "Muted"))
+                dialog.body.addWidget(label("这里会显示新版中已答过题的练习轮次。", "Muted"))
                 dialog.body.addStretch()
-            dialog.body.addWidget(button("关闭", dialog.reject), alignment=Qt.AlignmentFlag.AlignRight)
+            dialog.body.addLayout(controls)
             dialog.exec()
             dialog.deleteLater()
 
         self._task("读取练习统计", collect, done)
 
-    def _quiz(self, picture_choices):
-        rows = self._rows()
+    def _practice_details(self, round_, parent=None):
+        vault = self.vault
+        answers = round_["answers"]
+        needed = {answer[key] for answer in answers for key in ("target", "selected")}
 
         def collect():
-            return [(row, photo) for row in rows if (photo := self.vault.student(row["student_id"]).get("photo"))]
+            names = {}
+            rows = StudentStore(store=vault.store, username=vault.username).rows()
+            for row in rows:
+                ref = vault.student(row["student_id"]).get("practice_ref")
+                if ref in needed:
+                    names[ref] = student_caption(row)
+                    if len(names) == len(needed):
+                        break
+            return names
 
-        def start(usable):
-            if len(usable) < 2:
-                self.status.setText("至少需要两名有照片的学生。")
-            else:
-                self._run_quiz(usable, picture_choices)
+        def done(names):
+            dialog = self._private_dialog("本轮逐题结果", parent)
+            dialog.resize(820, 490)
+            right = sum(answer["correct"] for answer in answers)
+            dialog.body.addWidget(label(
+                f"{MODE_LABELS[round_['kind']]} · {round_['scope']} · {round_['started_at'][:19]}", "H2"
+            ))
+            dialog.body.addWidget(label(
+                f"已答 {len(answers)} / {round_['total']} 题 · 答对 {right} 题 · 答错 {len(answers) - right} 题",
+                "Muted",
+            ))
+            missing = "学生资料已移除"
+            table = self._practice_table(["题号", "题型", "你的答案", "正确答案", "结果"], [
+                (index, MODE_LABELS[answer["mode"]], names.get(answer["selected"], missing),
+                 names.get(answer["target"], missing), "正确" if answer["correct"] else "错误")
+                for index, answer in enumerate(answers, 1)
+            ])
+            for column in (0, 1, 4):
+                table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+            dialog.body.addWidget(table, 1)
+            dialog.body.addWidget(button("关闭", dialog.reject), alignment=Qt.AlignmentFlag.AlignRight)
+            dialog.exec()
+            dialog.deleteLater()
+
+        self._task("读取逐题结果", collect, done, parent=parent)
+
+    def _quiz(self, kind):
+        rows = self._rows()
+        vault = self.vault
+        scope = self.classes.currentText()
+
+        def collect():
+            students, ids_by_ref = {}, {}
+            for row in rows:
+                sid = row["student_id"].removeprefix("sid:")
+                data = vault.student(sid)
+                if not data.get("photo"):
+                    continue
+                try:
+                    photo = base64.b64decode(data["photo"], validate=True)
+                except (Base64Error, TypeError, ValueError):
+                    continue
+                if QImage.fromData(photo).isNull():
+                    continue
+                students[sid] = (row, photo)
+                if ref := data.get("practice_ref"):
+                    ids_by_ref[ref] = sid
+            targets = (review_targets(vault.practice_rounds(), ids_by_ref) if kind == MODE_REVIEW
+                       else regular_targets(list(students), kind))
+            return students, targets
+
+        def start(result):
+            students, targets = result
+            if len(students) < 2:
+                self.status.setText("当前班级至少需要两名有可用照片的学生。")
+                return
+            if not targets:
+                self.status.setText("当前班级没有待重练的错题。")
+                return
+            dialog = PracticeDialog(self, vault, new_round(scope, kind, len(targets)), targets, students)
+            self._watch_vault(dialog)
+            finished = dialog.exec()
+            round_ = dialog.round
+            dialog.deleteLater()
+            if finished and self.vault is vault and vault.unlocked:
+                self._practice_details(round_)
 
         self._task("读取练习照片", collect, start)
 
-    def _run_quiz(self, usable, picture_choices):
-        dialog = self._private_dialog("看名字选照片" if picture_choices else "看照片选名字")
-        dialog.resize(650, 490)
-        question = label("", "H2")
-        photo = label()
-        target = [None]
-        dialog.body.addWidget(question)
-        dialog.body.addWidget(photo)
-        options = [button("", lambda _=False, i=i: select(i), "QuizChoice") for i in range(min(4, len(usable)))]
-        for option in options:
-            option.setCheckable(True)
-            dialog.body.addWidget(option)
-        dialog.body.addWidget(dialog.status)
-        dialog.body.addWidget(button("下一题", lambda: advance()))
-
-        def pixmap(photo_text):
-            image = QPixmap()
-            image.loadFromData(base64.b64decode(photo_text))
-            return image.scaled(140, 140, Qt.AspectRatioMode.KeepAspectRatio,
-                                Qt.TransformationMode.SmoothTransformation)
-
-        choices = []
-
-        def state(option, value):
-            option.setProperty("answerState", value)
-            option.style().unpolish(option)
-            option.style().polish(option)
-            option.update()
-
-        def advance():
-            rows = random.sample(usable, k=len(options))
-            choices[:] = rows
-            target[0] = random.randrange(len(rows))
-            row, photo_text = rows[target[0]]
-            question.setText(f"请选择 {row['name']}（{row['student_id'].removeprefix('sid:')}）的照片" if picture_choices else "照片中的学生是谁？")
-            if not picture_choices:
-                photo.setPixmap(pixmap(photo_text))
-            for option, (candidate, pic) in zip(options, choices):
-                option.setText("" if picture_choices else f"{candidate['name']}　{candidate['student_id'].removeprefix('sid:')}")
-                if picture_choices:
-                    option.setIcon(QIcon(pixmap(pic)))
-                    option.setIconSize(QSize(96, 66))
-                option.setChecked(False)
-                option.setEnabled(True)
-                state(option, "")
-            dialog.status.clear()
-
-        def select(index):
-            correct = index == target[0]
-            sid = choices[target[0]][0]["student_id"].removeprefix("sid:")
-            def stats(record):
-                entry = record.setdefault("practice", {"attempts": 0, "correct": 0})
-                entry["attempts"] += 1
-                entry["correct"] += int(correct)
-                entry["last_practiced"] = datetime.now().isoformat(timespec="minutes", sep=" ")
-                mode = "photo" if picture_choices else "name"
-                entry[mode] = int(entry.get(mode, 0)) + 1
-            self.vault.update(sid, stats)
-            for i, option in enumerate(options):
-                option.setChecked(i == index)
-                option.setEnabled(False)
-                state(option, "correct" if i == target[0] else "wrong" if i == index else "")
-            answer = choices[target[0]][0]
-            dialog.status.setText("回答正确。" if correct else f"正确答案是 {answer['name']}（{sid}）。")
-
-        advance()
-        dialog.exec()
-        dialog.deleteLater()
-
-    def _task(self, title, work, finished):
-        dialog = TaskDialog(self, title)
+    def _task(self, title, work, finished, *, parent=None):
+        dialog = TaskDialog(parent or self, title)
         dialog.setMinimumWidth(440)
         dialog.body.addWidget(dialog.status)
         dialog.body.addWidget(button("关闭", dialog.reject))

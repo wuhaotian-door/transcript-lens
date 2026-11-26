@@ -91,6 +91,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -917,12 +918,11 @@ class ModelCenterDialog(QDialog):
         outer.setContentsMargins(margin, margin, margin, margin)
         outer.setSpacing(10)
 
-        intro = QLabel(INTRO_TEXT)
-        intro.setObjectName("Muted")
-        intro.setWordWrap(True)
-        if self._embedded:
-            intro.setText("选择模型后点击「下载选中」。")
-        outer.addWidget(intro)
+        if not self._embedded:
+            intro = QLabel(INTRO_TEXT)
+            intro.setObjectName("Muted")
+            intro.setWordWrap(True)
+            outer.addWidget(intro)
 
         # ★ v1.9.2：推理引擎没装时，在说明文字下方、滚动区上方插一张安装卡片
         #   （AGENTS §36：三态卡片是**唯一**入口；这里不复制安装流程）。
@@ -947,6 +947,7 @@ class ModelCenterDialog(QDialog):
         self._grid.setSpacing(CARD_SPACING)
         if self._embedded:
             self._grid.setAlignment(Qt.AlignmentFlag.AlignTop)
+            self._grid.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         for column in range(self._columns):
             self._grid.setColumnStretch(column, 1)
         # ★ v1.9.2：**不要**再给第 0 行（组标题行）挂 stretch —— 那会让"视口高度一变，
@@ -956,22 +957,32 @@ class ModelCenterDialog(QDialog):
         self._scroll.setWidget(self._grid_host)
         outer.addWidget(self._scroll, 1)
 
+        footer = outer
+        if self._embedded:
+            actions = QFrame()
+            actions.setObjectName("ModelCatalogActions")
+            footer = QVBoxLayout(actions)
+            footer.setContentsMargins(14, 10, 14, 10)
+            footer.setSpacing(7)
+            outer.addWidget(actions)
+
         self._plan = QLabel("")
         self._plan.setObjectName("Muted")
         self._plan.setWordWrap(True)
-        outer.addWidget(self._plan)
+        if not self._embedded:
+            footer.addWidget(self._plan)
 
         self._progress = QProgressBar()
         self._progress.setRange(0, 100)
         self._progress.setValue(0)
         self._progress.setMinimumHeight(22)
         self._progress.setVisible(False)
-        outer.addWidget(self._progress)
+        footer.addWidget(self._progress)
 
         self._status = QLabel("")
         self._status.setObjectName("Muted")
         self._status.setWordWrap(True)
-        outer.addWidget(self._status)
+        footer.addWidget(self._status)
 
         row = QHBoxLayout()
         row.setSpacing(8)
@@ -1005,13 +1016,19 @@ class ModelCenterDialog(QDialog):
         self._close_btn.setMinimumWidth(90)
         self._close_btn.clicked.connect(self._cancel_download if self._embedded else self.reject)
 
-        row.addWidget(self._refresh_btn)
-        row.addWidget(self._download_btn)
-        row.addWidget(self._copy_btn)
-        row.addStretch(1)
+        if self._embedded:
+            row.addWidget(self._plan, 1)
+            row.addWidget(self._refresh_btn)
+            row.addWidget(self._copy_btn)
+            row.addWidget(self._download_btn)
+        else:
+            row.addWidget(self._refresh_btn)
+            row.addWidget(self._download_btn)
+            row.addWidget(self._copy_btn)
+            row.addStretch(1)
         self._close_btn.setVisible(not self._embedded)
         row.addWidget(self._close_btn)
-        outer.addLayout(row)
+        footer.addLayout(row)
 
         self._placeholder: QLabel | None = None
 
@@ -1162,18 +1179,27 @@ class ModelCenterDialog(QDialog):
         self._populating = True
         try:
             self._clear_cards()
-            groups = group_choices(self._choices)
+            if self._embedded:
+                installed = [choice for choice in self._choices if choice.state == STATE_INSTALLED]
+                groups = [("已安装", installed)] if installed else []
+                groups.extend(group_choices(choice for choice in self._choices if choice.state != STATE_INSTALLED))
+            else:
+                groups = group_choices(self._choices)
             self._groups = groups
             if not groups:
                 self._add_placeholder()
-            else:
-                for group_name, items in groups:
-                    self._add_group(group_name)
-                    for choice in items:
-                        self._add_card(choice)
+            for group_name, items in groups:
+                self._add_group(group_name)
+                for index, choice in enumerate(items):
+                    row, column = divmod(index, self._columns)
+                    self._add_card(choice, self._grid_row + row, column)
+                self._grid_row += (len(items) + self._columns - 1) // self._columns
         finally:
             self._populating = False
 
+        if self._embedded:
+            self._grid.invalidate()
+            self._grid_host.updateGeometry()
         self._seen_ids |= {choice.model.id for choice in self._choices}
         self._enforce_all_states()
         # ★ 把"这一轮真正选中的"记回 _checked_ids：重画（清单刷新 / 那次迟到的
@@ -1249,10 +1275,11 @@ class ModelCenterDialog(QDialog):
         self._grid.addWidget(header, self._grid_row, 0, 1, self._columns)
         self._grid_row += 1
 
-    def _add_card(self, choice: ModelChoice) -> None:
+    def _add_card(self, choice: ModelChoice, row: int, column: int) -> None:
         card = ModelCard(self, choice)
         if self._embedded:
-            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+            card.setMinimumHeight(144)
+            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         model_id = choice.model.id
 
         # 选中态：出现过的听用户的（_checked_ids），第一次出现的听清单的。
@@ -1264,12 +1291,7 @@ class ModelCenterDialog(QDialog):
         #   事件到不了卡片自己，必须由对话框转发（见 eventFilter）。
         self._watch_children(card)
 
-        # 卡片按固定列数排；组标题各占一整行，所以行号自己数最稳
-        # （别用 self._grid.count()，那里面还混着标题和占位行）。
-        index = len(self._card_order)
-        if index and index % self._columns == 0:
-            self._grid_row += 1
-        self._grid.addWidget(card, self._grid_row, index % self._columns)
+        self._grid.addWidget(card, row, column)
         self._card_map[model_id] = card
         self._card_order.append(card)
 

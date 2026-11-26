@@ -7,6 +7,7 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
+from uuid import UUID, uuid4
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
@@ -165,6 +166,58 @@ class SensitiveVault:
                 old_file: None,
                 roster.filename: app_fernet(self.store.root).encrypt(json.dumps(payload).encode("utf-8")),
             })
+
+    def practice_rounds(self) -> list[dict]:
+        directory = "sensitive/practice"
+        with ROSTER_WRITE_LOCK:
+            self._require_key()
+            base = self.store.user_dir(self._uid)
+            rounds = [self._read(f"{directory}/{path.name}", base)
+                      for path in (base / directory).glob("*.enc")]
+            return sorted((item for item in rounds if item), key=lambda item: item["started_at"], reverse=True)
+
+    def _practice_ref(self, sid: str) -> str:
+        filename = sensitive_filename(sid)
+        data = self._read(filename)
+        if not data.get("practice_ref"):
+            # 记录仅引用随机标记。这个标记随学号更正移动，随学生资料删除。
+            data["practice_ref"] = uuid4().hex
+            _atomic_write_bytes(self.store.user_dir(self._uid) / filename, self._encode(filename, data))
+        return data["practice_ref"]
+
+    def record_practice_answer(self, round_: dict, number: int, mode: str, target: str, selected: str) -> dict:
+        from core.database import StudentStore
+        from core.mentor_practice import MODE_NAMES, MODE_PHOTOS, ROUND_LENGTH
+        from core.workbench_journal import recover_import
+
+        round_id = UUID(round_["id"]).hex
+        if mode not in (MODE_NAMES, MODE_PHOTOS) or not 1 <= number <= round_["total"] <= ROUND_LENGTH:
+            raise ValueError("题号或题型无效。")
+        filename = f"sensitive/practice/{round_id}.enc"
+        with ROSTER_WRITE_LOCK:
+            self._require_key()
+            recover_import(self.store, self.username)
+            stored = self._read(filename) or {**round_, "answers": []}
+            answers = stored["answers"]
+            if len(answers) == number:
+                return stored
+            if len(answers) != number - 1:
+                raise CryptoError("答题进度已变化，请重新开始练习。")
+            active_ids = {row["student_id"].removeprefix("sid:") for row in
+                          StudentStore(store=self.store, username=self.username).rows(include_archived=False)}
+            target, selected = target.removeprefix("sid:"), selected.removeprefix("sid:")
+            if target not in active_ids or selected not in active_ids:
+                raise CryptoError("名单已变更，请返回后重新开始练习。")
+            target_ref = self._practice_ref(target)
+            correct = target == selected
+            answers.append({
+                "at": datetime.now().isoformat(sep=" ", timespec="microseconds"),
+                "mode": mode, "target": target_ref,
+                "selected": target_ref if correct else self._practice_ref(selected),
+                "correct": correct,
+            })
+            _atomic_write_bytes(self.store.user_dir(self._uid) / filename, self._encode(filename, stored))
+            return stored
 
     def options(self) -> dict:
         with ROSTER_WRITE_LOCK:

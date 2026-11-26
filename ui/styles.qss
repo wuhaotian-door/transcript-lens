@@ -807,6 +807,11 @@ QListWidget#WorkbenchRules::item:hover:!selected, QListWidget#KnowledgeResults::
 QListWidget#WorkbenchRules::item:selected, QListWidget#KnowledgeResults::item:selected {
     background: #d7e9fd; color: #133b66;
 }
+QFrame#ModelCatalogActions {
+    background: #f8fbff;
+    border: 1px solid #dbe5ef;
+    border-radius: 10px;
+}
 QLabel#WorkbenchModelName { color: #1d426e; font-size: 15px; font-weight: 600; }
 QPushButton#WorkbenchModelReady:disabled {
     background: #e5f5ed; border: 1px solid #b8dfca; color: #1b6548; border-radius: 7px;
@@ -846,6 +851,26 @@ QPushButton#MentorTile:disabled {
 QLabel#MentorTileTitle { color: #182b43; font-size: 15px; font-weight: 700; }
 QLabel#MentorTileDescription { color: #526780; font-size: 13px; }
 QLabel#MentorTileTitle:disabled, QLabel#MentorTileDescription:disabled { color: #667890; }
+
+QLabel#MentorQuizCounter {
+    background: #e3edfb;
+    color: #254875;
+    padding: 6px 12px;
+    border-radius: 10px;
+    font-weight: 700;
+}
+QLabel#MentorQuizPhoto { padding: 4px; }
+QProgressBar#MentorQuizProgress {
+    background-color: #dae6f3;
+    border: 0;
+    border-radius: 3px;
+    min-height: 6px;
+    max-height: 6px;
+}
+QProgressBar#MentorQuizProgress::chunk {
+    background-color: #376cba;
+    border-radius: 3px;
+}
 
 QPushButton#QuizChoice {
     background: #FFFFFF;

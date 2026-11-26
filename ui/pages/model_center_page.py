@@ -29,7 +29,9 @@ class ModelCenterPage(QWidget):
         title.setObjectName("H1")
         header = QHBoxLayout()
         header.addWidget(title, 1)
-        header.addWidget(button("语义检索与照片匹配", self._open_aux_models))
+        auxiliary = button("辅助模型", self._open_aux_models)
+        auxiliary.setToolTip("管理规章语义检索与照片匹配所需模型")
+        header.addWidget(auxiliary)
         layout.addLayout(header)
 
         self._views = QStackedWidget()
@@ -38,7 +40,9 @@ class ModelCenterPage(QWidget):
         self._views.addWidget(self._setup)
 
     def _open_aux_models(self):
-        WorkbenchModelsDialog(self, self._store).exec()
+        dialog = WorkbenchModelsDialog(self, self._store)
+        dialog.exec()
+        dialog.deleteLater()
 
     def _build_setup(self) -> QWidget:
         page = QWidget()
@@ -79,7 +83,7 @@ class ModelCenterPage(QWidget):
         content.setContentsMargins(14, 14, 14, 14)
         self._catalog = ModelCenterDialog(library, embedded=True)
         content.addWidget(self._catalog)
-        self._tabs.addTab(library, "模型库")
+        self._tabs.addTab(library, "对话模型")
         self._tabs.addTab(self._build_configuration(), "AI 配置")
         self._views.addWidget(self._tabs)
         self._load_settings()
