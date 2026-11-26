@@ -8,9 +8,9 @@
     "发布后通过公开直链下载并核对字节数与 SHA-256，再提交清单并检查客户端能够发现更新。"
   ],
   "app": {
-    "url": "https://github.com/wuhaotian-door/transcript-lens/releases/download/v2.0.0/zhaoxi-workbench-2.0.0.exe",
-    "size": 168161573,
-    "sha256": "bd7dedbb7d5f5847af4215cf9ed75c5cf5a3609a22de7190bb9b952ea40960ef",
-    "notes": "成绩单透镜升级为朝夕工作台。新增工作台、学校规章知识库、学生名册及电话与照片导入、导师自核。GPA 规则切换需确认。已安装的用户可退出旧版后用安装向导覆盖原目录。"
+    "url": "https://github.com/wuhaotian-door/transcript-lens/releases/download/v2.0.0/zhaoxi-workbench-2.0.0-r2.exe",
+    "size": 168173943,
+    "sha256": "ee30473dafd4356a869b5f5a1aad67da848e906361db3e3cb325685d35dc248f",
+    "notes": "导师自核新增大图、每轮 20 题、错题练习与按轮统计。模型中心把已安装、推荐和高级对话模型分组展示。已使用 2.0.0 的用户可退出后用安装向导覆盖安装，或手动更换单文件 EXE。"
   }
 }
